@@ -56,16 +56,23 @@ jobs:
         run: |
           set -eu
           db_dir="$RUNNER_TEMP/clamav-db"
-          mkdir -p "$db_dir"
-          # Run unprivileged: as root, freshclam switches to the clamav user,
-          # which cannot traverse /home/runner, and reports the directory as
-          # missing. The runner user owns $RUNNER_TEMP and can write here.
-          # The packaged freshclam.conf points UpdateLogFile at /var/log/clamav,
-          # which this user cannot open; write our own log and surface it on
-          # failure instead.
           log="$RUNNER_TEMP/freshclam.log"
+          conf="$RUNNER_TEMP/freshclam.conf"
+          mkdir -p "$db_dir"
+
+          # A generated config, rather than /etc/clamav/freshclam.conf: the
+          # packaged one writes its log to /var/log/clamav and hands ownership
+          # to the clamav user, neither of which works for an unprivileged run
+          # under /home/runner.
+          {
+            echo "DatabaseDirectory $db_dir"
+            echo "UpdateLogFile $log"
+            echo "DatabaseMirror database.clamav.net"
+            echo "ConnectTimeout 30"
+          } >"$conf"
+
           for attempt in 1 2 3; do
-            if freshclam --datadir="$db_dir" --log="$log" --quiet; then
+            if freshclam --config-file="$conf" --quiet; then
               break
             fi
             echo "freshclam attempt $attempt failed; retrying"

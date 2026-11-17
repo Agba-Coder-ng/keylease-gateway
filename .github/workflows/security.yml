@@ -44,14 +44,24 @@ jobs:
           set -eu
           db_dir=/var/lib/clamav
           sudo mkdir -p "$db_dir"
+
+          # freshclam exits 1 when NotifyClamd cannot reach a clamd that this
+          # job never starts, even after a successful download, so the
+          # database itself decides whether the update worked.
+          have_db() {
+            [ -n "$(sudo find "$db_dir" -maxdepth 1 \\( -name '*.cvd' -o -name '*.cld' \\) -print -quit)" ]
+          }
+
           for attempt in 1 2 3; do
-            if sudo freshclam --stdout; then
+            sudo freshclam --stdout || true
+            if have_db; then
               break
             fi
             echo "freshclam attempt $attempt failed; retrying"
             sleep $((attempt * 10))
           done
-          if ! sudo ls "$db_dir"/*.cvd "$db_dir"/*.cld >/dev/null 2>&1; then
+
+          if ! have_db; then
             echo "::error::ClamAV signature database is missing after update"
             exit 1
           fi
@@ -64,7 +74,7 @@ jobs:
           mkdir -p "$report_dir"
 
           set +e
-          clamscan \
+          sudo clamscan \
             --recursive \
             --infected \
             --no-summary \

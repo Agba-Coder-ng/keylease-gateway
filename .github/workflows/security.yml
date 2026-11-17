@@ -49,7 +49,7 @@ jobs:
           # job never starts, even after a successful download, so the
           # database itself decides whether the update worked.
           have_db() {
-            [ -n "$(sudo find "$db_dir" -maxdepth 1 \\( -name '*.cvd' -o -name '*.cld' \\) -print -quit)" ]
+            [ -n "$(sudo find "$db_dir" -maxdepth 1 \( -name '*.cvd' -o -name '*.cld' \) -print -quit)" ]
           }
 
           for attempt in 1 2 3; do

@@ -60,8 +60,10 @@ jobs:
           # Run unprivileged: as root, freshclam switches to the clamav user,
           # which cannot traverse /home/runner, and reports the directory as
           # missing. The runner user owns $RUNNER_TEMP and can write here.
+          # --stdout overrides the packaged UpdateLogFile in /var/log/clamav,
+          # which this user cannot open, and surfaces errors in the job log.
           for attempt in 1 2 3; do
-            if freshclam --datadir="$db_dir" --quiet; then
+            if freshclam --datadir="$db_dir" --stdout; then
               break
             fi
             echo "freshclam attempt $attempt failed; retrying"

@@ -331,6 +331,8 @@ keylease-gateway/
 │       └── src/{index,server,verifier,quota,cache}.ts
 ├── deployments.json                   # testnet contract ids + tx hashes
 ├── .github/workflows/ci.yml           # TS: lint/build/tsc/test · Rust: cargo test + wasm
+├── .github/workflows/security.yml     # PR malware scan (ClamAV) + dependency review
+├── .github/workflows/binary-guard.yml # reject PRs that commit binaries or executables
 ├── package.json                       # pnpm scripts: build / test / lint / typecheck / deploy
 ├── pnpm-workspace.yaml
 ├── tsconfig.base.json

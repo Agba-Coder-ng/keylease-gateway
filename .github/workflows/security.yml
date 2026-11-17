@@ -1,0 +1,152 @@
+name: Security
+
+# Runs on every pull request so untrusted changes are scanned before merge,
+# plus a weekly sweep of main to catch signatures published after the fact.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  malware-scan:
+    name: malware · clamav
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Weekly cache key: signature updates are immutable per key, so a fresh
+      # key each ISO week keeps the DB current without re-downloading ~250 MB
+      # on every PR.
+      - name: Week stamp
+        id: week
+        run: echo "value=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ClamAV signature cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/clamav-db
+          key: clamav-db-${{ steps.week.outputs.value }}
+          restore-keys: |
+            clamav-db-
+
+      - name: Install ClamAV
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clamav
+          # The packaged updater writes to /var/lib/clamav; this job manages its
+          # own database directory instead.
+          sudo systemctl stop clamav-freshclam.service || true
+
+      - name: Update virus signatures
+        run: |
+          set -eu
+          db_dir="$RUNNER_TEMP/clamav-db"
+          mkdir -p "$db_dir"
+          for attempt in 1 2 3; do
+            if sudo freshclam --datadir="$db_dir" --quiet; then
+              break
+            fi
+            echo "freshclam attempt $attempt failed; retrying"
+            sleep $((attempt * 10))
+          done
+          sudo chmod -R a+rX "$db_dir"
+          if ! ls "$db_dir"/*.cvd "$db_dir"/*.cld >/dev/null 2>&1; then
+            echo "::error::ClamAV signature database is missing after update"
+            exit 1
+          fi
+
+      - name: Scan repository
+        run: |
+          set -eu
+          report_dir="$RUNNER_TEMP/scan-report"
+          report="$report_dir/clamav.log"
+          mkdir -p "$report_dir"
+
+          set +e
+          clamscan \
+            --recursive \
+            --infected \
+            --no-summary \
+            --database="$RUNNER_TEMP/clamav-db" \
+            --max-filesize=50M \
+            --max-scansize=200M \
+            --max-files=50000 \
+            --exclude-dir='^\.git$' \
+            --exclude-dir='^node_modules$' \
+            --exclude-dir='^dist$' \
+            --exclude-dir='^coverage$' \
+            --exclude-dir='^target$' \
+            --exclude-dir='^test_snapshots$' \
+            --exclude-dir='^\.pnpm-store$' \
+            . >"$report" 2>&1
+          status=$?
+          set -e
+
+          if [ -s "$report" ]; then
+            tail -n 50 "$report"
+          fi
+
+          case "$status" in
+            0)
+              echo "No malware signatures detected."
+              ;;
+            1)
+              while IFS= read -r line; do
+                file="${line%%: *}"
+                echo "::error file=${file}::Malware signature detected: ${line#*: }"
+              done <"$report"
+              echo "::error::ClamAV detected malware in this change; refusing to pass CI"
+              exit 1
+              ;;
+            *)
+              echo "::error::ClamAV scan failed with exit code $status"
+              exit "$status"
+              ;;
+          esac
+
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clamav-report
+          path: ${{ runner.temp }}/scan-report
+          if-no-files-found: ignore
+          retention-days: 30
+
+  dependency-review:
+    name: dependencies · review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Blocks a PR that introduces a high/critical advisory or a dependency
+      # that does not match a known package from a public registry.
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure

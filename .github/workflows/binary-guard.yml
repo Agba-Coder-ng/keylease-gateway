@@ -1,0 +1,118 @@
+name: Binary guard
+
+# Blocks PRs that add or modify committed executables or binary blobs.
+# The ClamAV scan in security.yml catches known malware; this guard catches the
+# payloads signatures miss (a fresh implant, a dropped ELF, a shell script with
+# the executable bit) by refusing the change and pointing at the file.
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  no-binaries:
+    name: no committed binaries or stray executables
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Inspect changed files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Committed executables that are intentional, one glob per line.
+          ALLOWED_EXECUTABLES: |
+            scripts/*.sh
+            .husky/*
+        run: |
+          set -euo pipefail
+
+          base="${BASE_SHA:-}"
+          head="${HEAD_SHA:-HEAD}"
+          if [ -z "$base" ]; then
+            base="$(git rev-list --max-parents=0 "$head" | tail -n 1)"
+          fi
+
+          # Added or modified files only; deletions cannot introduce a payload.
+          mapfile -t changed < <(git diff --name-only --diff-filter=AM "$base" "$head")
+          if [ "${#changed[@]}" -eq 0 ]; then
+            echo "No added or modified files."
+            exit 0
+          fi
+
+          is_allowed() {
+            local path="$1" pattern
+            while IFS= read -r pattern; do
+              [ -n "$pattern" ] || continue
+              # shellcheck disable=SC2053 # intentional glob match
+              if [[ "$path" == $pattern ]]; then return 0; fi
+            done <<< "$ALLOWED_EXECUTABLES"
+            return 1
+          }
+
+          failures=0
+
+          for path in "${changed[@]}"; do
+            if [ ! -f "$path" ]; then continue; fi
+            reason=""
+
+            # Magic bytes of executable formats, independent of the file name
+            # so a renamed payload cannot slip through.
+            magic="$(head -c 4 -- "$path" | od -An -tx1 | tr -d ' \n')"
+            case "$magic" in
+              7f454c46|cafebabe|feedface|feedfacf|cffaedfe|4d5a)
+                reason="Executable file format detected (magic $magic)"
+                ;;
+            esac
+
+            if [ -z "$reason" ]; then
+              case "${path,,}" in
+                *.exe|*.dll|*.dylib|*.so|*.bin|*.node|*.msi|*.scr|*.com|*.jar|*.apk|*.dmg|*.pkg|*.wasm)
+                  reason="Suspicious file extension for a source repository"
+                  ;;
+              esac
+            fi
+
+            if [ -z "$reason" ]; then
+              encoding="$(file --brief --mime-encoding -- "$path")"
+              if [ "$encoding" = "binary" ]; then
+                case "${path,,}" in
+                  *.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) ;;
+                  *) reason="Binary content in a text/source file" ;;
+                esac
+              fi
+            fi
+
+            # Added files that arrive already executable: legitimate for a few
+            # known script locations, suspicious anywhere else.
+            if [ -z "$reason" ]; then
+              mode="$(git ls-tree "$head" -- "$path" | awk '{print $1}')"
+              if [ "$mode" = "100755" ] && ! is_allowed "$path"; then
+                reason="Committed with the executable bit set; remove it or allowlist the path"
+              fi
+            fi
+
+            if [ -n "$reason" ]; then
+              echo "::error file=$path::$reason"
+              failures=$((failures + 1))
+            fi
+          done
+
+          if [ "$failures" -gt 0 ]; then
+            echo "::error::$failures suspicious file(s); see the annotations above"
+            exit 1
+          fi
+
+          echo "Checked ${#changed[@]} file(s); no committed binaries or unexpected executables."

@@ -57,14 +57,16 @@ jobs:
           set -eu
           db_dir="$RUNNER_TEMP/clamav-db"
           mkdir -p "$db_dir"
+          # Run unprivileged: as root, freshclam switches to the clamav user,
+          # which cannot traverse /home/runner, and reports the directory as
+          # missing. The runner user owns $RUNNER_TEMP and can write here.
           for attempt in 1 2 3; do
-            if sudo freshclam --datadir="$db_dir" --quiet; then
+            if freshclam --datadir="$db_dir" --quiet; then
               break
             fi
             echo "freshclam attempt $attempt failed; retrying"
             sleep $((attempt * 10))
           done
-          sudo chmod -R a+rX "$db_dir"
           if ! ls "$db_dir"/*.cvd "$db_dir"/*.cld >/dev/null 2>&1; then
             echo "::error::ClamAV signature database is missing after update"
             exit 1

@@ -15,6 +15,7 @@
  *   KEYLEASE_QUOTA_BATCH     calls buffered before a commit (default: 50)
  *   KEYLEASE_QUOTA_FLUSH_MS  periodic commit interval (default: 10000)
  *   KEYLEASE_CACHE_TTL_MS    lease-state cache TTL (default: 30000)
+ *   KEYLEASE_MAX_BODY_BYTES  maximum request body size in bytes (default: 33554432)
  *   KEYLEASE_FORWARD_AUTH    "true" to forward the caller's bearer token
  *   PORT / HOST              listen address (default: 8080 / 0.0.0.0)
  */
@@ -40,6 +41,7 @@ export interface ProxyEnv {
   KEYLEASE_QUOTA_FLUSH_MS?: string | undefined;
   KEYLEASE_CACHE_TTL_MS?: string | undefined;
   KEYLEASE_FORWARD_AUTH?: string | undefined;
+  KEYLEASE_MAX_BODY_BYTES?: string | undefined;
   PORT?: string | undefined;
   HOST?: string | undefined;
 }
@@ -60,7 +62,11 @@ export interface ResolvedConfig {
   gatewaySecret: string | null;
   quotaBatch: number;
   quotaFlushMs: number;
+  maxBodyBytes: number;
 }
+
+export const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024; // 32 MiB
+export const MAX_BODY_BYTES_LIMIT = 1024 * 1024 * 1024; // 1 GiB
 
 function positiveInt(raw: string | undefined, fallback: number, name: string): number {
   if (raw === undefined) return fallback;
@@ -95,6 +101,17 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     );
   }
 
+  const maxBodyBytes = positiveInt(
+    env.KEYLEASE_MAX_BODY_BYTES,
+    DEFAULT_MAX_BODY_BYTES,
+    'KEYLEASE_MAX_BODY_BYTES',
+  );
+  if (maxBodyBytes > MAX_BODY_BYTES_LIMIT) {
+    throw new ProxyConfigError(
+      `KEYLEASE_MAX_BODY_BYTES "${env.KEYLEASE_MAX_BODY_BYTES}" exceeds maximum allowed limit of 1 GiB (${MAX_BODY_BYTES_LIMIT} bytes)`,
+    );
+  }
+
   return {
     upstream,
     host: env.HOST ?? '0.0.0.0',
@@ -104,6 +121,7 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     gatewaySecret: env.KEYLEASE_GATEWAY_SECRET ?? null,
     quotaBatch: positiveInt(env.KEYLEASE_QUOTA_BATCH, 50, 'KEYLEASE_QUOTA_BATCH'),
     quotaFlushMs: positiveInt(env.KEYLEASE_QUOTA_FLUSH_MS, 10_000, 'KEYLEASE_QUOTA_FLUSH_MS'),
+    maxBodyBytes,
   };
 }
 
@@ -168,6 +186,7 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
     upstream: config.upstream,
     verifier,
     forwardAuthorization: config.forwardAuthorization,
+    maxBodyBytes: config.maxBodyBytes,
     logger: true,
   });
 

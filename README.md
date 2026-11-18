@@ -259,6 +259,7 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `KEYLEASE_QUOTA_BATCH` | no | `50` | Buffered calls before committing on chain |
 | `KEYLEASE_QUOTA_FLUSH_MS` | no | `10000` | Periodic quota commit interval |
 | `KEYLEASE_CACHE_TTL_MS` | no | `30000` | Lease-state cache TTL |
+| `KEYLEASE_MAX_BODY_BYTES` | no | `33554432` (32 MiB) | Maximum allowed request body size in bytes |
 | `KEYLEASE_FORWARD_AUTH` | no | `false` | Forward the caller's bearer token upstream |
 | `PORT` / `HOST` | no | `8080` / `0.0.0.0` | Listen address |
 
@@ -273,6 +274,7 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed) |
 
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
+Forwarded upstream requests also receive these headers set exclusively by the proxy; any client-supplied `x-keylease-*` headers are stripped to prevent spoofing.
 
 ---
 

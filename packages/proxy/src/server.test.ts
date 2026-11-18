@@ -8,6 +8,7 @@ import {
   resolveUpstreamUrl,
 } from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
+import { resolveConfig, ProxyConfigError } from './index.js';
 
 const consumer = Keypair.random();
 const NOW = Math.floor(Date.now() / 1000);
@@ -113,6 +114,16 @@ describe('buildUpstreamHeaders', () => {
     expect(out['x-multi']).toBe('a, b');
     expect(out['cookie']).toBe('a=1; b=2');
   });
+
+  it('drops inbound headers starting with x-keylease-', () => {
+    const out = buildUpstreamHeaders({
+      'x-keylease-calls-remaining': '999999',
+      'X-KeyLease-Custom': 'spoofed',
+      'x-keylease-lease-id': 'fake',
+      'content-type': 'application/json',
+    });
+    expect(out).toEqual({ 'content-type': 'application/json' });
+  });
 });
 
 describe('proxy routing', () => {
@@ -144,6 +155,35 @@ describe('proxy routing', () => {
     expect(res.statusCode).toBe(401);
     expect(res.json()).toMatchObject({ error: 'invalid_token' });
     expect(calls).toHaveLength(0);
+    await app.close();
+  });
+
+  it('strips client-supplied x-keylease-* headers and sets legitimate values', async () => {
+    const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/resource',
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        'x-keylease-calls-remaining': '999999',
+        'x-keylease-custom': 'spoofed-value',
+        'X-KeyLease-Evil': 'attacker',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(calls).toHaveLength(1);
+    const forwardedHeaders = calls[0]?.init?.headers as Record<string, string>;
+    expect(forwardedHeaders['x-keylease-calls-remaining']).toBe('9');
+    expect(forwardedHeaders['x-keylease-lease-id']).toBe('lease-1');
+    expect(forwardedHeaders['x-keylease-custom']).toBeUndefined();
+    expect(forwardedHeaders['x-keylease-evil']).toBeUndefined();
     await app.close();
   });
 
@@ -415,5 +455,106 @@ describe('proxy routing', () => {
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe('');
     await app.close();
+  });
+
+  describe('request body limits', () => {
+    it('rejects a body one byte over the limit with 413 payload_too_large before verification', async () => {
+      const maxBodyBytes = 100;
+      const { impl } = stubFetch(async () => okJson({ ok: true }));
+      const verifier = makeVerifier({ getLeaseState: async () => leaseState() });
+      const verifySpy = vi.spyOn(verifier, 'verifyAuthorization');
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier,
+        fetchImpl: impl,
+        maxBodyBytes,
+      });
+
+      const overLimitBody = Buffer.alloc(maxBodyBytes + 1, 'a');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/upload',
+        headers: {
+          authorization: `Bearer ${mintToken()}`,
+          'content-type': 'application/octet-stream',
+        },
+        payload: overLimitBody,
+      });
+
+      expect(res.statusCode).toBe(413);
+      const json = res.json();
+      expect(json.error).toBe('payload_too_large');
+      expect(json.message).toBeDefined();
+      expect(verifySpy).not.toHaveBeenCalled();
+      await app.close();
+    });
+
+    it('forwards a body at the limit', async () => {
+      const maxBodyBytes = 100;
+      let forwardedBody: Buffer | undefined;
+      const { impl } = stubFetch(async (_url, init) => {
+        forwardedBody = init?.body as Buffer;
+        return okJson({ ok: true });
+      });
+      const verifier = makeVerifier({ getLeaseState: async () => leaseState() });
+      const verifySpy = vi.spyOn(verifier, 'verifyAuthorization');
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier,
+        fetchImpl: impl,
+        maxBodyBytes,
+      });
+
+      const atLimitBody = Buffer.alloc(maxBodyBytes, 'b');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/upload',
+        headers: {
+          authorization: `Bearer ${mintToken()}`,
+          'content-type': 'application/octet-stream',
+        },
+        payload: atLimitBody,
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(verifySpy).toHaveBeenCalled();
+      expect(forwardedBody).toEqual(atLimitBody);
+      await app.close();
+    });
+  });
+});
+
+describe('resolveConfig KEYLEASE_MAX_BODY_BYTES', () => {
+  const baseEnv = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
+
+  it('defaults to 32 MiB', () => {
+    const config = resolveConfig(baseEnv);
+    expect(config.maxBodyBytes).toBe(32 * 1024 * 1024);
+  });
+
+  it('parses valid positive integer', () => {
+    const config = resolveConfig({ ...baseEnv, KEYLEASE_MAX_BODY_BYTES: '1048576' });
+    expect(config.maxBodyBytes).toBe(1048576);
+  });
+
+  it('rejects invalid or non-positive values', () => {
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_MAX_BODY_BYTES: '0' })).toThrow(
+      ProxyConfigError,
+    );
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_MAX_BODY_BYTES: '-10' })).toThrow(
+      ProxyConfigError,
+    );
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_MAX_BODY_BYTES: 'abc' })).toThrow(
+      ProxyConfigError,
+    );
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_MAX_BODY_BYTES: '12.34' })).toThrow(
+      ProxyConfigError,
+    );
+  });
+
+  it('rejects values exceeding sane upper bound of 1 GiB', () => {
+    expect(() =>
+      resolveConfig({ ...baseEnv, KEYLEASE_MAX_BODY_BYTES: String(1024 * 1024 * 1024 + 1) }),
+    ).toThrow(ProxyConfigError);
   });
 });

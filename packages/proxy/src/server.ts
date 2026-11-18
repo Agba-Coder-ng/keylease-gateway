@@ -32,6 +32,8 @@ export interface ProxyOptions {
   forwardAuthorization?: boolean;
   /** Per-request upstream timeout in milliseconds. Defaults to 15s; 0 disables it. */
   requestTimeoutMs?: number;
+  /** Maximum request body size in bytes. Defaults to 32 MiB. */
+  maxBodyBytes?: number;
 }
 
 export interface ForwardedRequestInit {
@@ -64,6 +66,7 @@ export function buildUpstreamHeaders(
     const lower = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
     if (lower === 'authorization' && options.forwardAuthorization !== true) continue;
+    if (lower.startsWith('x-keylease-')) continue;
     out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
   }
   return out;
@@ -107,10 +110,28 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   const requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
 
   // Parse every payload as a buffer so the proxy forwards bodies untouched.
-  const app = Fastify({ logger: options.logger ?? false, bodyLimit: 32 * 1024 * 1024 });
+  const maxBodyBytes = options.maxBodyBytes ?? 32 * 1024 * 1024;
+  const app = Fastify({ logger: options.logger ?? false, bodyLimit: maxBodyBytes });
   app.removeAllContentTypeParsers();
   app.addContentTypeParser('*', { parseAs: 'buffer' }, (_request, body, done) => {
     done(null, body);
+  });
+
+  app.setErrorHandler((error, _request, reply) => {
+    const err =
+      typeof error === 'object' && error !== null
+        ? (error as { statusCode?: number; code?: string; message?: string })
+        : null;
+    if (err?.statusCode === 413 || err?.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+      return reply
+        .code(413)
+        .type('application/json; charset=utf-8')
+        .send({
+          error: 'payload_too_large',
+          message: err.message ?? 'request body exceeds the configured limit',
+        });
+    }
+    return reply.send(error);
   });
 
   const handler = async (request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> => {

@@ -10,7 +10,7 @@
  * request increments it, and a lease is refused once its quota is spent.
  */
 import { TokenVerificationError, verifySessionToken, type SessionTokenPayload } from '@keylease/cli/token';
-import type { LeaseState } from '@keylease/cli/soroban';
+import { LeaseNotFoundError, type LeaseState } from '@keylease/cli/soroban';
 import { DEFAULT_TTL_MS, TtlCache } from './cache.js';
 import type { QuotaSink } from './quota.js';
 
@@ -50,6 +50,8 @@ export interface VerifierOptions {
   cacheTtlMs?: number;
   /** Share a pre-built cache (e.g. to reuse metrics) instead. */
   cache?: TtlCache<LeaseState>;
+  /** Share a pre-built denial cache instead. */
+  denialCache?: TtlCache<true>;
   maxCacheEntries?: number;
   /** Clock in milliseconds. Defaults to `Date.now`. */
   clock?: () => number;
@@ -64,6 +66,8 @@ export interface VerifierOptions {
 
 export interface VerifierStats {
   cache: ReturnType<TtlCache<LeaseState>['stats']>;
+  /** Stats for the terminal lease denial cache (cached LeaseNotFoundError outcomes). */
+  denials: ReturnType<TtlCache<true>['stats']>;
   rpcCalls: number;
   counters: number;
 }
@@ -85,18 +89,33 @@ function nowSeconds(clock: () => number): number {
 export class LeaseVerifier {
   private readonly provider: LeaseStateProvider;
   private readonly cache: TtlCache<LeaseState>;
+  /**
+   * Denials for missing leases (LeaseNotFoundError) are cached for a short TTL
+   * capped at min(cacheTtlMs, 5000) so unknown leases do not burn RPC quota.
+   */
+  private readonly denialCache: TtlCache<true>;
+  private readonly cacheTtlMs: number;
   private readonly clock: () => number;
   private readonly maxCounters: number;
   private readonly quotaSink: QuotaSink | undefined;
   private readonly calls = new Map<string, number>();
+  private readonly inFlight = new Map<string, Promise<LeaseState>>();
   private rpcCalls = 0;
 
   constructor(options: VerifierOptions) {
     this.provider = options.provider;
+    this.cacheTtlMs = options.cacheTtlMs ?? DEFAULT_TTL_MS;
     this.cache =
       options.cache ??
       new TtlCache<LeaseState>({
-        ttlMs: options.cacheTtlMs ?? DEFAULT_TTL_MS,
+        ttlMs: this.cacheTtlMs,
+        maxEntries: options.maxCacheEntries ?? 1_000,
+        clock: options.clock ?? Date.now,
+      });
+    this.denialCache =
+      options.denialCache ??
+      new TtlCache<true>({
+        ttlMs: Math.min(this.cacheTtlMs, 5_000),
         maxEntries: options.maxCacheEntries ?? 1_000,
         clock: options.clock ?? Date.now,
       });
@@ -211,22 +230,55 @@ export class LeaseVerifier {
 
   /** Drops the local counter for a lease (admin/testing hook). */
   resetCalls(leaseId?: string): void {
-    if (leaseId === undefined) this.calls.clear();
-    else this.calls.delete(leaseId);
+    if (leaseId === undefined) {
+      this.calls.clear();
+      this.inFlight.clear();
+    } else {
+      this.calls.delete(leaseId);
+      this.inFlight.delete(leaseId);
+    }
   }
 
   stats(): VerifierStats {
-    return { cache: this.cache.stats(), rpcCalls: this.rpcCalls, counters: this.calls.size };
+    return {
+      cache: this.cache.stats(),
+      denials: this.denialCache.stats(),
+      rpcCalls: this.rpcCalls,
+      counters: this.calls.size,
+    };
   }
 
   private async resolveLease(leaseId: string): Promise<LeaseState> {
     const cached = this.cache.get(leaseId);
     if (cached !== undefined) return cached;
 
-    this.rpcCalls += 1;
-    const lease = await this.provider.getLeaseState(leaseId);
-    this.cache.set(leaseId, lease);
-    return lease;
+    if (this.denialCache.get(leaseId) !== undefined) {
+      throw new LeaseNotFoundError(leaseId);
+    }
+
+    const inFlightPromise = this.inFlight.get(leaseId);
+    if (inFlightPromise !== undefined) {
+      return inFlightPromise;
+    }
+
+    const flight = (async () => {
+      this.rpcCalls += 1;
+      try {
+        const lease = await this.provider.getLeaseState(leaseId);
+        this.cache.set(leaseId, lease);
+        return lease;
+      } catch (error) {
+        if (isLeaseNotFound(error)) {
+          this.denialCache.set(leaseId, true, Math.min(this.cacheTtlMs, 5_000));
+        }
+        throw error;
+      } finally {
+        this.inFlight.delete(leaseId);
+      }
+    })();
+
+    this.inFlight.set(leaseId, flight);
+    return flight;
   }
 
   private consume(leaseId: string, used: number): void {

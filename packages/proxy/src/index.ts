@@ -17,12 +17,14 @@
  *   KEYLEASE_CACHE_TTL_MS    lease-state cache TTL (default: 30000)
  *   KEYLEASE_MAX_BODY_BYTES  maximum request body size in bytes (default: 33554432)
  *   KEYLEASE_FORWARD_AUTH    "true" to forward the caller's bearer token
+ *   KEYLEASE_METRICS_ENABLED "true" to expose Prometheus metrics on /metrics (default: false)
+ *   KEYLEASE_SHUTDOWN_TIMEOUT_MS shutdown drain timeout in ms (default: 10000)
  *   PORT / HOST              listen address (default: 8080 / 0.0.0.0)
  */
 import { pathToFileURL } from 'node:url';
 import { Keypair } from '@stellar/stellar-sdk';
 import { SorobanClient } from '@keylease/cli/soroban';
-import { buildProxyServer } from './server.js';
+import { buildProxyServer, drainProxyServer } from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
 import { OnChainQuota, type QuotaSink } from './quota.js';
 
@@ -41,6 +43,8 @@ export interface ProxyEnv {
   KEYLEASE_QUOTA_FLUSH_MS?: string | undefined;
   KEYLEASE_CACHE_TTL_MS?: string | undefined;
   KEYLEASE_FORWARD_AUTH?: string | undefined;
+  KEYLEASE_METRICS_ENABLED?: string | undefined;
+  KEYLEASE_SHUTDOWN_TIMEOUT_MS?: string | undefined;
   KEYLEASE_MAX_BODY_BYTES?: string | undefined;
   PORT?: string | undefined;
   HOST?: string | undefined;
@@ -59,6 +63,8 @@ export interface ResolvedConfig {
   port: number;
   cacheTtlMs: number;
   forwardAuthorization: boolean;
+  metricsEnabled: boolean;
+  shutdownTimeoutMs: number;
   gatewaySecret: string | null;
   quotaBatch: number;
   quotaFlushMs: number;
@@ -118,6 +124,12 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     port,
     cacheTtlMs,
     forwardAuthorization: env.KEYLEASE_FORWARD_AUTH === 'true',
+    metricsEnabled: env.KEYLEASE_METRICS_ENABLED === 'true',
+    shutdownTimeoutMs: positiveInt(
+      env.KEYLEASE_SHUTDOWN_TIMEOUT_MS,
+      10_000,
+      'KEYLEASE_SHUTDOWN_TIMEOUT_MS',
+    ),
     gatewaySecret: env.KEYLEASE_GATEWAY_SECRET ?? null,
     quotaBatch: positiveInt(env.KEYLEASE_QUOTA_BATCH, 50, 'KEYLEASE_QUOTA_BATCH'),
     quotaFlushMs: positiveInt(env.KEYLEASE_QUOTA_FLUSH_MS, 10_000, 'KEYLEASE_QUOTA_FLUSH_MS'),
@@ -168,9 +180,52 @@ export function quotaSinkFrom(
   });
 }
 
+export function attachSignalHandlers(
+  drain: () => Promise<'drained' | 'timed_out'>,
+  options: {
+    logger?: { info: (msg: string) => void };
+    exit?: (code: number) => void;
+    processObj?: Pick<NodeJS.Process, 'on' | 'removeListener'>;
+  } = {},
+): () => void {
+  const proc = options.processObj ?? process;
+  const exit = options.exit ?? ((code: number) => process.exit(code));
+  let shuttingDown = false;
+
+  const onSignal = async (signal: string) => {
+    if (shuttingDown) {
+      options.logger?.info(`received second ${signal}; forcing immediate exit`);
+      exit(1);
+      return;
+    }
+    shuttingDown = true;
+    options.logger?.info(`received ${signal}; draining in-flight requests...`);
+    try {
+      const outcome = await drain();
+      options.logger?.info(`shutdown complete: ${outcome}`);
+      exit(outcome === 'drained' ? 0 : 1);
+    } catch {
+      options.logger?.info('shutdown failed with error');
+      exit(1);
+    }
+  };
+
+  const onSigterm = () => void onSignal('SIGTERM');
+  const onSigint = () => void onSignal('SIGINT');
+
+  proc.on('SIGTERM', onSigterm);
+  proc.on('SIGINT', onSigint);
+
+  return () => {
+    proc.removeListener('SIGTERM', onSigterm);
+    proc.removeListener('SIGINT', onSigint);
+  };
+}
+
 /** Starts the proxy; resolves once the socket is listening. */
 export async function startProxy(env: ProxyEnv = process.env): Promise<{
   close: () => Promise<void>;
+  drain: (timeoutMs?: number) => Promise<'drained' | 'timed_out'>;
   url: string;
   verifier: LeaseVerifier;
 }> {
@@ -186,15 +241,32 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
     upstream: config.upstream,
     verifier,
     forwardAuthorization: config.forwardAuthorization,
+    metricsEnabled: config.metricsEnabled,
     maxBodyBytes: config.maxBodyBytes,
     logger: true,
   });
 
   const address = await app.listen({ host: config.host, port: config.port });
+  app.log.info(`listening on ${address}`);
+
+  const drain = async (timeoutMs = config.shutdownTimeoutMs): Promise<'drained' | 'timed_out'> => {
+    const outcome = await drainProxyServer(app, timeoutMs);
+    await quotaSink?.close();
+    return outcome;
+  };
+
+  const removeSignalHandlers = attachSignalHandlers(drain, {
+    logger: {
+      info: (msg) => app.log.info(msg),
+    },
+  });
+
   return {
     url: address,
     verifier,
+    drain,
     close: async () => {
+      removeSignalHandlers();
       await quotaSink?.close();
       await app.close();
     },

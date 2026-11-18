@@ -437,3 +437,62 @@ describe('LeaseVerifier RPC caching', () => {
     expect(provider.getLeaseState).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('deterministic quota-exhaustion race tests', () => {
+  it('fires N concurrent requests against a lease with calls_limit = M < N and asserts exactly M succeed', async () => {
+    const M = 5;
+    const N = 20;
+    const lease = leaseState({ callsLimit: M, callsUsed: 0 });
+    const { verifier } = makeVerifier({ lease });
+
+    const token = tokenFor('lease-1');
+    const results = await Promise.all(
+      Array.from({ length: N }, () => verifier.verifyAuthorization(`Bearer ${token}`)),
+    );
+
+    const allowed = results.filter((r) => r.ok);
+    const denied = results.filter((r) => !r.ok);
+
+    expect(allowed).toHaveLength(M);
+    expect(denied).toHaveLength(N - M);
+    for (const d of denied) {
+      expect(d).toMatchObject({ ok: false, status: 403, reason: 'quota_exhausted' });
+    }
+    expect(verifier.localCalls('lease-1')).toBe(M);
+  });
+
+  it('denies requests when on-chain calls_used exceeds or equals limit even if local counter is lower (max rule)', async () => {
+    const lease = leaseState({ callsLimit: 10, callsUsed: 10 });
+    const { verifier } = makeVerifier({ lease });
+    expect(verifier.localCalls('lease-1')).toBe(0);
+
+    const result = await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('quota_exhausted');
+  });
+
+  it('is stable across 20 repeated runs of concurrent dispatch', async () => {
+    const M = 4;
+    const N = 15;
+
+    for (let run = 0; run < 20; run += 1) {
+      const lease = leaseState({ callsLimit: M, callsUsed: 0 });
+      const { verifier } = makeVerifier({ lease });
+
+      const token = tokenFor('lease-1');
+      const results = await Promise.all(
+        Array.from({ length: N }, () => verifier.verifyAuthorization(`Bearer ${token}`)),
+      );
+
+      const allowed = results.filter((r) => r.ok);
+      const denied = results.filter((r) => !r.ok);
+
+      expect(allowed).toHaveLength(M);
+      expect(denied).toHaveLength(N - M);
+      for (const d of denied) {
+        expect(d).toMatchObject({ ok: false, status: 403, reason: 'quota_exhausted' });
+      }
+      expect(verifier.localCalls('lease-1')).toBe(M);
+    }
+  });
+});

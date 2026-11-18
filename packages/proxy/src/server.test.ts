@@ -6,9 +6,10 @@ import {
   buildProxyServer,
   buildUpstreamHeaders,
   resolveUpstreamUrl,
+  drainProxyServer,
 } from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
-import { resolveConfig, ProxyConfigError } from './index.js';
+import { resolveConfig, attachSignalHandlers, ProxyConfigError } from './index.js';
 
 const consumer = Keypair.random();
 const NOW = Math.floor(Date.now() / 1000);
@@ -520,6 +521,259 @@ describe('proxy routing', () => {
       expect(verifySpy).toHaveBeenCalled();
       expect(forwardedBody).toEqual(atLimitBody);
       await app.close();
+    });
+  });
+
+  describe('health and readiness endpoints', () => {
+    it('returns 200 on /healthz without authentication and never proxies upstream', async () => {
+      const { impl, calls } = stubFetch(() => okJson({ upstream: true }));
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+        fetchImpl: impl,
+      });
+
+      const res = await app.inject({ method: 'GET', url: '/healthz' });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ status: 'ok' });
+      expect(calls).toHaveLength(0);
+      await app.close();
+    });
+
+    it('returns 200 on /readyz when verifier has a cached reachable state', async () => {
+      const { impl, calls } = stubFetch(() => okJson({ upstream: true }));
+      const verifier = makeVerifier({ getLeaseState: async () => leaseState() });
+      await verifier.verifyAuthorization(`Bearer ${mintToken()}`);
+
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier,
+        fetchImpl: impl,
+      });
+
+      const res = await app.inject({ method: 'GET', url: '/readyz' });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ status: 'ok' });
+      expect(calls).toHaveLength(0);
+      await app.close();
+    });
+
+    it('returns 503 verification_unavailable on /readyz when RPC is down / cold', async () => {
+      const { impl, calls } = stubFetch(() => okJson({ upstream: true }));
+      const verifier = makeVerifier({
+        getLeaseState: async () => {
+          throw new Error('ECONNREFUSED');
+        },
+      });
+
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier,
+        fetchImpl: impl,
+      });
+
+      const res = await app.inject({ method: 'GET', url: '/readyz' });
+      expect(res.statusCode).toBe(503);
+      expect(res.json()).toMatchObject({ error: 'verification_unavailable' });
+      expect(calls).toHaveLength(0);
+      await app.close();
+    });
+  });
+
+  describe('Prometheus metrics endpoint', () => {
+    it('is not registered when metricsEnabled is false or unset', async () => {
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      });
+
+      const res = await app.inject({ method: 'GET', url: '/metrics' });
+      expect(res.statusCode).toBe(401);
+      await app.close();
+    });
+
+    it('exposes Prometheus metrics and increments allow/deny counters and latency', async () => {
+      const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+        fetchImpl: impl,
+        metricsEnabled: true,
+      });
+
+      const initial = await app.inject({ method: 'GET', url: '/metrics' });
+      expect(initial.statusCode).toBe(200);
+      expect(initial.headers['content-type']).toContain('text/plain');
+      expect(initial.body).toContain('keylease_requests_total 0');
+      expect(initial.body).toContain('keylease_requests_allowed_total 0');
+      expect(calls).toHaveLength(0);
+
+      await app.inject({
+        method: 'GET',
+        url: '/v1/data',
+        headers: { authorization: `Bearer ${mintToken()}` },
+      });
+
+      await app.inject({
+        method: 'GET',
+        url: '/v1/data',
+        headers: { authorization: 'Bearer bad-token' },
+      });
+
+      const updated = await app.inject({ method: 'GET', url: '/metrics' });
+      expect(updated.statusCode).toBe(200);
+      expect(updated.body).toContain('keylease_requests_total 2');
+      expect(updated.body).toContain('keylease_requests_allowed_total 1');
+      expect(updated.body).toContain('keylease_requests_denied_total{error="invalid_token"} 1');
+      expect(updated.body).toContain('keylease_upstream_latency_seconds_count 1');
+      expect(updated.body).toContain('keylease_cache_hits_total');
+      expect(updated.body).toContain('keylease_cache_misses_total');
+      await app.close();
+    });
+
+    it('resolves KEYLEASE_METRICS_ENABLED in config', () => {
+      expect(
+        resolveConfig({ KEYLEASE_UPSTREAM_URL: 'https://api.example.com' }).metricsEnabled,
+      ).toBe(false);
+      expect(
+        resolveConfig({
+          KEYLEASE_UPSTREAM_URL: 'https://api.example.com',
+          KEYLEASE_METRICS_ENABLED: 'true',
+        }).metricsEnabled,
+      ).toBe(true);
+    });
+  });
+
+  describe('graceful shutdown and connection draining', () => {
+    it('waits for in-flight requests before closing', async () => {
+      let resolveUpstream;
+      const upstreamPromise = new Promise((resolve) => {
+        resolveUpstream = resolve;
+      });
+
+      let onFetchStarted;
+      const fetchStartedPromise = new Promise((resolve) => {
+        onFetchStarted = resolve;
+      });
+
+      const { impl } = stubFetch(() => {
+        onFetchStarted();
+        return upstreamPromise;
+      });
+
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+        fetchImpl: impl,
+      });
+
+      let requestFinished = false;
+      const requestPromise = app
+        .inject({
+          method: 'GET',
+          url: '/v1/data',
+          headers: { authorization: `Bearer ${mintToken()}` },
+        })
+        .then((res) => {
+          requestFinished = true;
+          return res;
+        });
+
+      await fetchStartedPromise;
+      const drainPromise = drainProxyServer(app, 5000);
+      expect(requestFinished).toBe(false);
+
+      resolveUpstream(okJson({ done: true }));
+      const [res, outcome] = await Promise.all([requestPromise, drainPromise]);
+
+      expect(res.statusCode).toBe(200);
+      expect(requestFinished).toBe(true);
+      expect(outcome).toBe('drained');
+    });
+
+    it('returns timed_out when in-flight requests exceed timeout', async () => {
+      const neverResolves = new Promise(() => {});
+      let onFetchStarted;
+      const fetchStartedPromise = new Promise((resolve) => {
+        onFetchStarted = resolve;
+      });
+
+      const { impl } = stubFetch(() => {
+        onFetchStarted();
+        return neverResolves;
+      });
+
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+        fetchImpl: impl,
+      });
+
+      void app.inject({
+        method: 'GET',
+        url: '/v1/data',
+        headers: { authorization: `Bearer ${mintToken()}` },
+      });
+
+      await fetchStartedPromise;
+      const outcome = await drainProxyServer(app, 50);
+      expect(outcome).toBe('timed_out');
+      await app.close();
+    });
+
+    it('handles SIGTERM and forces exit on second signal', async () => {
+      const listeners = {};
+      const fakeProcess = {
+        on: (sig, fn) => {
+          listeners[sig] = fn;
+          return fakeProcess;
+        },
+        removeListener: (sig) => {
+          delete listeners[sig];
+          return fakeProcess;
+        },
+      };
+
+      const exitCalls = [];
+      const logs = [];
+      let drainCalled = false;
+
+      const detach = attachSignalHandlers(
+        async () => {
+          drainCalled = true;
+          return 'drained';
+        },
+        {
+          processObj: fakeProcess,
+          exit: (code) => exitCalls.push(code),
+          logger: { info: (msg) => logs.push(msg) },
+        },
+      );
+
+      expect(listeners['SIGTERM']).toBeDefined();
+
+      listeners['SIGTERM']();
+      expect(logs).toContain('received SIGTERM; draining in-flight requests...');
+      expect(drainCalled).toBe(true);
+
+      listeners['SIGTERM']();
+      expect(logs.some((l) => l.includes('second SIGTERM'))).toBe(true);
+      expect(exitCalls).toContain(1);
+
+      detach();
+      expect(listeners['SIGTERM']).toBeUndefined();
+    });
+
+    it('parses KEYLEASE_SHUTDOWN_TIMEOUT_MS in config', () => {
+      expect(
+        resolveConfig({ KEYLEASE_UPSTREAM_URL: 'https://api.example.com' }).shutdownTimeoutMs,
+      ).toBe(10_000);
+      expect(
+        resolveConfig({
+          KEYLEASE_UPSTREAM_URL: 'https://api.example.com',
+          KEYLEASE_SHUTDOWN_TIMEOUT_MS: '5000',
+        }).shutdownTimeoutMs,
+      ).toBe(5_000);
     });
   });
 });

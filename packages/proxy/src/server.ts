@@ -117,6 +117,29 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
     done(null, body);
   });
 
+  let inFlightRequests = 0;
+  const drainWaiters = new Set<() => void>();
+
+  app.addHook('onRequest', async () => {
+    inFlightRequests += 1;
+  });
+
+  app.addHook('onResponse', async () => {
+    inFlightRequests -= 1;
+    if (inFlightRequests <= 0) {
+      for (const waiter of drainWaiters) {
+        waiter();
+      }
+      drainWaiters.clear();
+    }
+  });
+
+  (app as unknown as { drainInFlight: () => Promise<void> }).drainInFlight = async () => {
+    if (inFlightRequests > 0) {
+      await new Promise<void>((resolve) => drainWaiters.add(resolve));
+    }
+  };
+
   const metrics = {
     requestsTotal: 0,
     requestsAllowed: 0,
@@ -291,4 +314,32 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   }
 
   return app;
+}
+
+/**
+ * Gracefully drains in-flight requests and closes the Fastify instance within timeoutMs.
+ */
+export async function drainProxyServer(
+  app: FastifyInstance,
+  timeoutMs = 10_000,
+): Promise<'drained' | 'timed_out'> {
+  let timer: NodeJS.Timeout;
+  const timeoutPromise = new Promise<'timed_out'>((resolve) => {
+    timer = setTimeout(() => resolve('timed_out'), timeoutMs);
+  });
+
+  const closePromise = (async (): Promise<'drained'> => {
+    if (typeof (app as unknown as { drainInFlight?: () => Promise<void> }).drainInFlight === 'function') {
+      await (app as unknown as { drainInFlight: () => Promise<void> }).drainInFlight();
+    }
+    await app.close();
+    return 'drained';
+  })();
+
+  try {
+    const outcome = await Promise.race([closePromise, timeoutPromise]);
+    return outcome;
+  } finally {
+    clearTimeout(timer!);
+  }
 }

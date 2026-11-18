@@ -6,9 +6,10 @@ import {
   buildProxyServer,
   buildUpstreamHeaders,
   resolveUpstreamUrl,
+  drainProxyServer,
 } from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
-import { resolveConfig } from './index.js';
+import { resolveConfig, attachSignalHandlers } from './index.js';
 
 const consumer = Keypair.random();
 const NOW = Math.floor(Date.now() / 1000);
@@ -535,6 +536,139 @@ describe('proxy routing', () => {
           KEYLEASE_METRICS_ENABLED: 'true',
         }).metricsEnabled,
       ).toBe(true);
+    });
+  });
+
+  describe('graceful shutdown and connection draining', () => {
+    it('waits for in-flight requests before closing', async () => {
+      let resolveUpstream!: (res: Response) => void;
+      const upstreamPromise = new Promise<Response>((resolve) => {
+        resolveUpstream = resolve;
+      });
+
+      let onFetchStarted!: () => void;
+      const fetchStartedPromise = new Promise<void>((resolve) => {
+        onFetchStarted = resolve;
+      });
+
+      const { impl } = stubFetch(() => {
+        onFetchStarted();
+        return upstreamPromise;
+      });
+
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+        fetchImpl: impl,
+      });
+
+      let requestFinished = false;
+      const requestPromise = app
+        .inject({
+          method: 'GET',
+          url: '/v1/data',
+          headers: { authorization: `Bearer ${mintToken()}` },
+        })
+        .then((res) => {
+          requestFinished = true;
+          return res;
+        });
+
+      await fetchStartedPromise;
+      const drainPromise = drainProxyServer(app, 5000);
+      expect(requestFinished).toBe(false);
+
+      resolveUpstream(okJson({ done: true }));
+      const [res, outcome] = await Promise.all([requestPromise, drainPromise]);
+
+      expect(res.statusCode).toBe(200);
+      expect(requestFinished).toBe(true);
+      expect(outcome).toBe('drained');
+    });
+
+    it('returns timed_out when in-flight requests exceed timeout', async () => {
+      const neverResolves = new Promise<Response>(() => {});
+      let onFetchStarted!: () => void;
+      const fetchStartedPromise = new Promise<void>((resolve) => {
+        onFetchStarted = resolve;
+      });
+
+      const { impl } = stubFetch(() => {
+        onFetchStarted();
+        return neverResolves;
+      });
+
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+        fetchImpl: impl,
+      });
+
+      void app.inject({
+        method: 'GET',
+        url: '/v1/data',
+        headers: { authorization: `Bearer ${mintToken()}` },
+      });
+
+      await fetchStartedPromise;
+      const outcome = await drainProxyServer(app, 50);
+      expect(outcome).toBe('timed_out');
+      await app.close();
+    });
+
+    it('handles SIGTERM and forces exit on second signal', async () => {
+      const listeners: Record<string, () => void> = {};
+      const fakeProcess = {
+        on: (sig: string, fn: () => void) => {
+          listeners[sig] = fn;
+          return fakeProcess;
+        },
+        removeListener: (sig: string) => {
+          delete listeners[sig];
+          return fakeProcess;
+        },
+      };
+
+      const exitCalls: number[] = [];
+      const logs: string[] = [];
+      let drainCalled = false;
+
+      const detach = attachSignalHandlers(
+        async () => {
+          drainCalled = true;
+          return 'drained';
+        },
+        {
+          processObj: fakeProcess,
+          exit: (code) => exitCalls.push(code),
+          logger: { info: (msg) => logs.push(msg) },
+        },
+      );
+
+      expect(listeners['SIGTERM']).toBeDefined();
+
+      listeners['SIGTERM']!();
+      expect(logs).toContain('received SIGTERM; draining in-flight requests...');
+      expect(drainCalled).toBe(true);
+
+      listeners['SIGTERM']!();
+      expect(logs.some((l) => l.includes('second SIGTERM'))).toBe(true);
+      expect(exitCalls).toContain(1);
+
+      detach();
+      expect(listeners['SIGTERM']).toBeUndefined();
+    });
+
+    it('parses KEYLEASE_SHUTDOWN_TIMEOUT_MS in config', () => {
+      expect(
+        resolveConfig({ KEYLEASE_UPSTREAM_URL: 'https://api.example.com' }).shutdownTimeoutMs,
+      ).toBe(10_000);
+      expect(
+        resolveConfig({
+          KEYLEASE_UPSTREAM_URL: 'https://api.example.com',
+          KEYLEASE_SHUTDOWN_TIMEOUT_MS: '5000',
+        }).shutdownTimeoutMs,
+      ).toBe(5_000);
     });
   });
 });

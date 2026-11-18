@@ -266,13 +266,15 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 
 | Status | Meaning |
 | --- | --- |
+| `200` | Health check (`/healthz`) or readiness probe (`/readyz`) |
 | `401 missing_token` / `invalid_token` / `token_expired` | Bearer token absent, malformed, forged or expired |
 | `403 lease_not_found` / `lease_inactive` / `lease_expired` / `consumer_mismatch` | On-chain lease does not permit this call |
 | `403 quota_exhausted` | The lease's call limit has been spent (on chain, locally, or both) |
-| `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) |
+| `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) or `/readyz` has no reachable state |
 | `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed) |
 
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
+`/healthz` and `/readyz` endpoints provide health and readiness probes without requiring bearer tokens and are never forwarded upstream.
 
 ---
 

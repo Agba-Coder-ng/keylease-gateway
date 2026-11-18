@@ -182,6 +182,24 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
     return reply.send(buffer);
   };
 
+  app.get('/healthz', async (_request, reply) => {
+    return reply.code(200).type('application/json; charset=utf-8').send({ status: 'ok' });
+  });
+
+  app.get('/readyz', async (_request, reply) => {
+    const ready = await verifier.isReady();
+    if (ready) {
+      return reply.code(200).type('application/json; charset=utf-8').send({ status: 'ok' });
+    }
+    return reply
+      .code(503)
+      .type('application/json; charset=utf-8')
+      .send({
+        error: 'verification_unavailable',
+        message: 'verifier has no cached, reachable state',
+      });
+  });
+
   // Fastify auto-exposes a HEAD route for every GET route; registering HEAD
   // explicitly as well would duplicate it.
   const methods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] as const;

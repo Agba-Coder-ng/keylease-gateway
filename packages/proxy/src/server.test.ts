@@ -416,4 +416,60 @@ describe('proxy routing', () => {
     expect(res.body).toBe('');
     await app.close();
   });
+
+  describe('health and readiness endpoints', () => {
+    it('returns 200 on /healthz without authentication and never proxies upstream', async () => {
+      const { impl, calls } = stubFetch(() => okJson({ upstream: true }));
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+        fetchImpl: impl,
+      });
+
+      const res = await app.inject({ method: 'GET', url: '/healthz' });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ status: 'ok' });
+      expect(calls).toHaveLength(0);
+      await app.close();
+    });
+
+    it('returns 200 on /readyz when verifier has a cached reachable state', async () => {
+      const { impl, calls } = stubFetch(() => okJson({ upstream: true }));
+      const verifier = makeVerifier({ getLeaseState: async () => leaseState() });
+      await verifier.verifyAuthorization(`Bearer ${mintToken()}`);
+
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier,
+        fetchImpl: impl,
+      });
+
+      const res = await app.inject({ method: 'GET', url: '/readyz' });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ status: 'ok' });
+      expect(calls).toHaveLength(0);
+      await app.close();
+    });
+
+    it('returns 503 verification_unavailable on /readyz when RPC is down / cold', async () => {
+      const { impl, calls } = stubFetch(() => okJson({ upstream: true }));
+      const verifier = makeVerifier({
+        getLeaseState: async () => {
+          throw new Error('ECONNREFUSED');
+        },
+      });
+
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier,
+        fetchImpl: impl,
+      });
+
+      const res = await app.inject({ method: 'GET', url: '/readyz' });
+      expect(res.statusCode).toBe(503);
+      expect(res.json()).toMatchObject({ error: 'verification_unavailable' });
+      expect(calls).toHaveLength(0);
+      await app.close();
+    });
+  });
 });

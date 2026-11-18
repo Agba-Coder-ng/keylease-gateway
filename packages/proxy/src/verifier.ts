@@ -16,6 +16,8 @@ import type { QuotaSink } from './quota.js';
 
 export interface LeaseStateProvider {
   getLeaseState(leaseId: string): Promise<LeaseState>;
+  /** Optional health/readiness probe. */
+  isReady?: () => boolean | Promise<boolean>;
 }
 
 export type FailureReason =
@@ -90,6 +92,7 @@ export class LeaseVerifier {
   private readonly quotaSink: QuotaSink | undefined;
   private readonly calls = new Map<string, number>();
   private rpcCalls = 0;
+  private rpcDown = false;
 
   constructor(options: VerifierOptions) {
     this.provider = options.provider;
@@ -219,12 +222,31 @@ export class LeaseVerifier {
     return { cache: this.cache.stats(), rpcCalls: this.rpcCalls, counters: this.calls.size };
   }
 
+  /**
+   * Reports whether the lease verifier has a cached, reachable state.
+   */
+  async isReady(): Promise<boolean> {
+    if (typeof this.provider.isReady === 'function') {
+      return this.provider.isReady();
+    }
+    return this.cache.size > 0 && !this.rpcDown;
+  }
+
   private async resolveLease(leaseId: string): Promise<LeaseState> {
     const cached = this.cache.get(leaseId);
     if (cached !== undefined) return cached;
 
     this.rpcCalls += 1;
-    const lease = await this.provider.getLeaseState(leaseId);
+    let lease: LeaseState;
+    try {
+      lease = await this.provider.getLeaseState(leaseId);
+      this.rpcDown = false;
+    } catch (error) {
+      if (!isLeaseNotFound(error)) {
+        this.rpcDown = true;
+      }
+      throw error;
+    }
     this.cache.set(leaseId, lease);
     return lease;
   }

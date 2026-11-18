@@ -2,8 +2,9 @@
  * Small in-memory TTL cache with LRU eviction.
  *
  * Used by the verifier to remember on-chain lease state for a short window so
- * a hot proxy path does not hammer Soroban RPC. Values are only cached on
- * success; failures always fall through to the provider.
+ * a hot proxy path does not hammer Soroban RPC. Successful reads and terminal
+ * denials (missing leases) are cached; transient errors always fall through to
+ * the provider.
  */
 export interface TtlCacheOptions {
   /** Default time-to-live in milliseconds. Defaults to 30 seconds. */

@@ -314,6 +314,128 @@ describe('LeaseVerifier RPC caching', () => {
     expect(second.ok).toBe(true);
     expect(calls).toBe(2);
   });
+
+  it('caches LeaseNotFoundError outcomes for a short window', async () => {
+    const error = new Error('not found');
+    error.name = 'LeaseNotFoundError';
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => {
+        throw error;
+      }),
+    };
+    const { verifier, nowMs } = makeVerifier({ provider, cacheTtlMs: 30_000 });
+
+    for (let i = 0; i < 5; i += 1) {
+      const res = await verifier.verifyAuthorization(`Bearer ${tokenFor('missing-lease')}`);
+      expect(res.ok).toBe(false);
+      expect(res.reason).toBe('lease_not_found');
+    }
+
+    // Provider called only once across 5 repeated requests
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(1);
+    expect(verifier.stats().rpcCalls).toBe(1);
+    expect(verifier.stats().denials.hits).toBe(4);
+
+    // After 5s (the capped denial TTL), the next request retries the provider
+    nowMs.value = (START + 6) * 1_000;
+    const retry = await verifier.verifyAuthorization(`Bearer ${tokenFor('missing-lease')}`);
+    expect(retry.ok).toBe(false);
+    expect(retry.reason).toBe('lease_not_found');
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(2);
+  });
+
+  it('caps denial TTL at min(cacheTtlMs, 5000) when cacheTtlMs is small', async () => {
+    const error = new Error('not found');
+    error.name = 'LeaseNotFoundError';
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => {
+        throw error;
+      }),
+    };
+    const { verifier, nowMs } = makeVerifier({ provider, cacheTtlMs: 2_000 });
+
+    await verifier.verifyAuthorization(`Bearer ${tokenFor('missing-lease')}`);
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(1);
+
+    // After 3s (exceeding 2s cacheTtlMs, which is smaller than 5s)
+    nowMs.value = (START + 3) * 1_000;
+    await verifier.verifyAuthorization(`Bearer ${tokenFor('missing-lease')}`);
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(2);
+  });
+
+  it('never caches transport or timeout errors', async () => {
+    let callCount = 0;
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => {
+        callCount += 1;
+        if (callCount === 1) {
+          throw new Error('ETIMEDOUT');
+        }
+        return leaseState();
+      }),
+    };
+    const { verifier } = makeVerifier({ provider });
+
+    const first = await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(first.ok).toBe(false);
+    expect(first.reason).toBe('verification_unavailable');
+
+    const second = await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(second.ok).toBe(true);
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(2);
+    expect(verifier.stats().denials.hits).toBe(0);
+  });
+
+  it('collapses 25 concurrent verifications into one provider call with single-flight', async () => {
+    let resolveProvider!: (lease: LeaseState) => void;
+    const deferredPromise = new Promise<LeaseState>((resolve) => {
+      resolveProvider = resolve;
+    });
+
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(() => deferredPromise),
+    };
+    const { verifier } = makeVerifier({ provider });
+
+    const token = tokenFor('lease-1');
+    const promises = Array.from({ length: 25 }, () =>
+      verifier.verifyAuthorization(`Bearer ${token}`),
+    );
+
+    resolveProvider(leaseState({ leaseId: 'lease-1', callsLimit: 100 }));
+
+    const results = await Promise.all(promises);
+    expect(results).toHaveLength(25);
+    for (const res of results) {
+      expect(res.ok).toBe(true);
+    }
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(1);
+    expect(verifier.stats().rpcCalls).toBe(1);
+  });
+
+  it('retries a rejected lookup on the next request and clears in-flight state', async () => {
+    let callCount = 0;
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => {
+        callCount += 1;
+        if (callCount === 1) {
+          throw new Error('transient RPC network error');
+        }
+        return leaseState({ leaseId: 'lease-1' });
+      }),
+    };
+    const { verifier } = makeVerifier({ provider });
+
+    const token = tokenFor('lease-1');
+    const first = await verifier.verifyAuthorization(`Bearer ${token}`);
+    expect(first.ok).toBe(false);
+    expect(first.reason).toBe('verification_unavailable');
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(1);
+
+    const second = await verifier.verifyAuthorization(`Bearer ${token}`);
+    expect(second.ok).toBe(true);
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('deterministic quota-exhaustion race tests', () => {

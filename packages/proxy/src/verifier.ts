@@ -99,6 +99,7 @@ export class LeaseVerifier {
   private readonly maxCounters: number;
   private readonly quotaSink: QuotaSink | undefined;
   private readonly calls = new Map<string, number>();
+  private readonly inFlight = new Map<string, Promise<LeaseState>>();
   private rpcCalls = 0;
 
   constructor(options: VerifierOptions) {
@@ -229,8 +230,13 @@ export class LeaseVerifier {
 
   /** Drops the local counter for a lease (admin/testing hook). */
   resetCalls(leaseId?: string): void {
-    if (leaseId === undefined) this.calls.clear();
-    else this.calls.delete(leaseId);
+    if (leaseId === undefined) {
+      this.calls.clear();
+      this.inFlight.clear();
+    } else {
+      this.calls.delete(leaseId);
+      this.inFlight.delete(leaseId);
+    }
   }
 
   stats(): VerifierStats {
@@ -250,18 +256,29 @@ export class LeaseVerifier {
       throw new LeaseNotFoundError(leaseId);
     }
 
-    this.rpcCalls += 1;
-    let lease: LeaseState;
-    try {
-      lease = await this.provider.getLeaseState(leaseId);
-    } catch (error) {
-      if (isLeaseNotFound(error)) {
-        this.denialCache.set(leaseId, true, Math.min(this.cacheTtlMs, 5_000));
-      }
-      throw error;
+    const inFlightPromise = this.inFlight.get(leaseId);
+    if (inFlightPromise !== undefined) {
+      return inFlightPromise;
     }
-    this.cache.set(leaseId, lease);
-    return lease;
+
+    const flight = (async () => {
+      this.rpcCalls += 1;
+      try {
+        const lease = await this.provider.getLeaseState(leaseId);
+        this.cache.set(leaseId, lease);
+        return lease;
+      } catch (error) {
+        if (isLeaseNotFound(error)) {
+          this.denialCache.set(leaseId, true, Math.min(this.cacheTtlMs, 5_000));
+        }
+        throw error;
+      } finally {
+        this.inFlight.delete(leaseId);
+      }
+    })();
+
+    this.inFlight.set(leaseId, flight);
+    return flight;
   }
 
   private consume(leaseId: string, used: number): void {

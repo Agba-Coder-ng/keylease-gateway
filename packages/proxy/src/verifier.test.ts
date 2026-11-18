@@ -385,4 +385,55 @@ describe('LeaseVerifier RPC caching', () => {
     expect(provider.getLeaseState).toHaveBeenCalledTimes(2);
     expect(verifier.stats().denials.hits).toBe(0);
   });
+
+  it('collapses 25 concurrent verifications into one provider call with single-flight', async () => {
+    let resolveProvider!: (lease: LeaseState) => void;
+    const deferredPromise = new Promise<LeaseState>((resolve) => {
+      resolveProvider = resolve;
+    });
+
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(() => deferredPromise),
+    };
+    const { verifier } = makeVerifier({ provider });
+
+    const token = tokenFor('lease-1');
+    const promises = Array.from({ length: 25 }, () =>
+      verifier.verifyAuthorization(`Bearer ${token}`),
+    );
+
+    resolveProvider(leaseState({ leaseId: 'lease-1', callsLimit: 100 }));
+
+    const results = await Promise.all(promises);
+    expect(results).toHaveLength(25);
+    for (const res of results) {
+      expect(res.ok).toBe(true);
+    }
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(1);
+    expect(verifier.stats().rpcCalls).toBe(1);
+  });
+
+  it('retries a rejected lookup on the next request and clears in-flight state', async () => {
+    let callCount = 0;
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => {
+        callCount += 1;
+        if (callCount === 1) {
+          throw new Error('transient RPC network error');
+        }
+        return leaseState({ leaseId: 'lease-1' });
+      }),
+    };
+    const { verifier } = makeVerifier({ provider });
+
+    const token = tokenFor('lease-1');
+    const first = await verifier.verifyAuthorization(`Bearer ${token}`);
+    expect(first.ok).toBe(false);
+    expect(first.reason).toBe('verification_unavailable');
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(1);
+
+    const second = await verifier.verifyAuthorization(`Bearer ${token}`);
+    expect(second.ok).toBe(true);
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(2);
+  });
 });

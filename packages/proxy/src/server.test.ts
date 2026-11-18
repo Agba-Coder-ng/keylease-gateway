@@ -8,6 +8,7 @@ import {
   resolveUpstreamUrl,
 } from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
+import { resolveConfig } from './index.js';
 
 const consumer = Keypair.random();
 const NOW = Math.floor(Date.now() / 1000);
@@ -470,6 +471,70 @@ describe('proxy routing', () => {
       expect(res.json()).toMatchObject({ error: 'verification_unavailable' });
       expect(calls).toHaveLength(0);
       await app.close();
+    });
+  });
+
+  describe('Prometheus metrics endpoint', () => {
+    it('is not registered when metricsEnabled is false or unset', async () => {
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      });
+
+      const res = await app.inject({ method: 'GET', url: '/metrics' });
+      expect(res.statusCode).toBe(401);
+      await app.close();
+    });
+
+    it('exposes Prometheus metrics and increments allow/deny counters and latency', async () => {
+      const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+      const app = buildProxyServer({
+        upstream: 'https://api.example.com',
+        verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+        fetchImpl: impl,
+        metricsEnabled: true,
+      });
+
+      const initial = await app.inject({ method: 'GET', url: '/metrics' });
+      expect(initial.statusCode).toBe(200);
+      expect(initial.headers['content-type']).toContain('text/plain');
+      expect(initial.body).toContain('keylease_requests_total 0');
+      expect(initial.body).toContain('keylease_requests_allowed_total 0');
+      expect(calls).toHaveLength(0);
+
+      await app.inject({
+        method: 'GET',
+        url: '/v1/data',
+        headers: { authorization: `Bearer ${mintToken()}` },
+      });
+
+      await app.inject({
+        method: 'GET',
+        url: '/v1/data',
+        headers: { authorization: 'Bearer bad-token' },
+      });
+
+      const updated = await app.inject({ method: 'GET', url: '/metrics' });
+      expect(updated.statusCode).toBe(200);
+      expect(updated.body).toContain('keylease_requests_total 2');
+      expect(updated.body).toContain('keylease_requests_allowed_total 1');
+      expect(updated.body).toContain('keylease_requests_denied_total{error="invalid_token"} 1');
+      expect(updated.body).toContain('keylease_upstream_latency_seconds_count 1');
+      expect(updated.body).toContain('keylease_cache_hits_total');
+      expect(updated.body).toContain('keylease_cache_misses_total');
+      await app.close();
+    });
+
+    it('resolves KEYLEASE_METRICS_ENABLED in config', () => {
+      expect(
+        resolveConfig({ KEYLEASE_UPSTREAM_URL: 'https://api.example.com' }).metricsEnabled,
+      ).toBe(false);
+      expect(
+        resolveConfig({
+          KEYLEASE_UPSTREAM_URL: 'https://api.example.com',
+          KEYLEASE_METRICS_ENABLED: 'true',
+        }).metricsEnabled,
+      ).toBe(true);
     });
   });
 });

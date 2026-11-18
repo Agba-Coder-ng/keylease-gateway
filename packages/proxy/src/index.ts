@@ -16,6 +16,7 @@
  *   KEYLEASE_QUOTA_FLUSH_MS  periodic commit interval (default: 10000)
  *   KEYLEASE_CACHE_TTL_MS    lease-state cache TTL (default: 30000)
  *   KEYLEASE_FORWARD_AUTH    "true" to forward the caller's bearer token
+ *   KEYLEASE_METRICS_ENABLED "true" to expose Prometheus metrics on /metrics (default: false)
  *   PORT / HOST              listen address (default: 8080 / 0.0.0.0)
  */
 import { pathToFileURL } from 'node:url';
@@ -40,6 +41,7 @@ export interface ProxyEnv {
   KEYLEASE_QUOTA_FLUSH_MS?: string | undefined;
   KEYLEASE_CACHE_TTL_MS?: string | undefined;
   KEYLEASE_FORWARD_AUTH?: string | undefined;
+  KEYLEASE_METRICS_ENABLED?: string | undefined;
   PORT?: string | undefined;
   HOST?: string | undefined;
 }
@@ -57,6 +59,7 @@ export interface ResolvedConfig {
   port: number;
   cacheTtlMs: number;
   forwardAuthorization: boolean;
+  metricsEnabled: boolean;
   gatewaySecret: string | null;
   quotaBatch: number;
   quotaFlushMs: number;
@@ -101,6 +104,7 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     port,
     cacheTtlMs,
     forwardAuthorization: env.KEYLEASE_FORWARD_AUTH === 'true',
+    metricsEnabled: env.KEYLEASE_METRICS_ENABLED === 'true',
     gatewaySecret: env.KEYLEASE_GATEWAY_SECRET ?? null,
     quotaBatch: positiveInt(env.KEYLEASE_QUOTA_BATCH, 50, 'KEYLEASE_QUOTA_BATCH'),
     quotaFlushMs: positiveInt(env.KEYLEASE_QUOTA_FLUSH_MS, 10_000, 'KEYLEASE_QUOTA_FLUSH_MS'),
@@ -168,6 +172,7 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
     upstream: config.upstream,
     verifier,
     forwardAuthorization: config.forwardAuthorization,
+    metricsEnabled: config.metricsEnabled,
     logger: true,
   });
 

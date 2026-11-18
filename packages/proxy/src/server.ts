@@ -32,7 +32,11 @@ export interface ProxyOptions {
   forwardAuthorization?: boolean;
   /** Per-request upstream timeout in milliseconds. Defaults to 15s; 0 disables it. */
   requestTimeoutMs?: number;
+  /** Expose Prometheus metrics on /metrics. Defaults to `false`. */
+  metricsEnabled?: boolean;
 }
+
+export const METRICS_LATENCY_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
 
 export interface ForwardedRequestInit {
   method: string;
@@ -113,9 +117,33 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
     done(null, body);
   });
 
+  const metrics = {
+    requestsTotal: 0,
+    requestsAllowed: 0,
+    requestsDenied: new Map<string, number>(),
+    latencyBuckets: new Array(METRICS_LATENCY_BUCKETS.length).fill(0),
+    latencySum: 0,
+    latencyCount: 0,
+  };
+
+  const recordLatency = (seconds: number) => {
+    metrics.latencyCount += 1;
+    metrics.latencySum += seconds;
+    for (let i = 0; i < METRICS_LATENCY_BUCKETS.length; i += 1) {
+      if (seconds <= METRICS_LATENCY_BUCKETS[i]!) {
+        metrics.latencyBuckets[i]! += 1;
+      }
+    }
+  };
+
   const handler = async (request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> => {
+    metrics.requestsTotal += 1;
     const decision = await verifier.verifyAuthorization(request.headers.authorization);
     if (!decision.ok) {
+      metrics.requestsDenied.set(
+        decision.reason,
+        (metrics.requestsDenied.get(decision.reason) ?? 0) + 1,
+      );
       request.log.info(
         { reason: decision.reason, url: request.url },
         'request denied by lease verifier',
@@ -125,6 +153,8 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
         .type('application/json; charset=utf-8')
         .send({ error: decision.reason, message: decision.message });
     }
+
+    metrics.requestsAllowed += 1;
 
     const target = resolveUpstreamUrl(upstream, request.raw.url ?? '/');
     const method = request.method;
@@ -148,10 +178,12 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
       signal: requestTimeoutMs > 0 ? AbortSignal.timeout(requestTimeoutMs) : undefined,
     };
 
+    const startTime = performance.now();
     let response: Response;
     try {
       response = await fetchImpl(target, init);
     } catch (error) {
+      recordLatency((performance.now() - startTime) / 1000);
       const timedOut =
         error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
       request.log.error({ err: error, target }, 'upstream request failed');
@@ -163,6 +195,8 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
           message: timedOut ? 'upstream did not respond in time' : 'upstream is unreachable',
         });
     }
+
+    recordLatency((performance.now() - startTime) / 1000);
 
     reply.code(response.status);
     copyResponseHeaders(reply, response.headers);
@@ -199,6 +233,55 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
         message: 'verifier has no cached, reachable state',
       });
   });
+
+  if (options.metricsEnabled === true) {
+    app.get('/metrics', async (_request, reply) => {
+      const verifierStats = verifier.stats();
+      const lines: string[] = [
+        '# HELP keylease_requests_total Total number of proxy requests received',
+        '# TYPE keylease_requests_total counter',
+        `keylease_requests_total ${metrics.requestsTotal}`,
+        '',
+        '# HELP keylease_requests_allowed_total Total number of requests allowed by lease verifier',
+        '# TYPE keylease_requests_allowed_total counter',
+        `keylease_requests_allowed_total ${metrics.requestsAllowed}`,
+        '',
+        '# HELP keylease_requests_denied_total Total number of requests denied by reason',
+        '# TYPE keylease_requests_denied_total counter',
+      ];
+      for (const [reason, count] of metrics.requestsDenied.entries()) {
+        lines.push(`keylease_requests_denied_total{error="${reason}"} ${count}`);
+      }
+      lines.push(
+        '',
+        '# HELP keylease_cache_hits_total Total number of lease cache hits',
+        '# TYPE keylease_cache_hits_total counter',
+        `keylease_cache_hits_total ${verifierStats.cache.hits}`,
+        '',
+        '# HELP keylease_cache_misses_total Total number of lease cache misses',
+        '# TYPE keylease_cache_misses_total counter',
+        `keylease_cache_misses_total ${verifierStats.cache.misses}`,
+        '',
+        '# HELP keylease_upstream_latency_seconds Upstream request duration in seconds',
+        '# TYPE keylease_upstream_latency_seconds histogram',
+      );
+      for (let i = 0; i < METRICS_LATENCY_BUCKETS.length; i += 1) {
+        lines.push(
+          `keylease_upstream_latency_seconds_bucket{le="${METRICS_LATENCY_BUCKETS[i]}"} ${metrics.latencyBuckets[i]}`,
+        );
+      }
+      lines.push(
+        `keylease_upstream_latency_seconds_bucket{le="+Inf"} ${metrics.latencyCount}`,
+        `keylease_upstream_latency_seconds_sum ${metrics.latencySum.toFixed(6)}`,
+        `keylease_upstream_latency_seconds_count ${metrics.latencyCount}`,
+        '',
+      );
+      return reply
+        .code(200)
+        .type('text/plain; version=0.0.4; charset=utf-8')
+        .send(lines.join('\n'));
+    });
+  }
 
   // Fastify auto-exposes a HEAD route for every GET route; registering HEAD
   // explicitly as well would duplicate it.

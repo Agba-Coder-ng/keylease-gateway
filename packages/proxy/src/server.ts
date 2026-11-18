@@ -66,6 +66,7 @@ export function buildUpstreamHeaders(
     const lower = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
     if (lower === 'authorization' && options.forwardAuthorization !== true) continue;
+    if (lower.startsWith('x-keylease-')) continue;
     out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
   }
   return out;

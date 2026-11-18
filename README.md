@@ -274,6 +274,7 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed) |
 
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
+Forwarded upstream requests also receive these headers set exclusively by the proxy; any client-supplied `x-keylease-*` headers are stripped to prevent spoofing.
 
 ---
 

@@ -114,6 +114,16 @@ describe('buildUpstreamHeaders', () => {
     expect(out['x-multi']).toBe('a, b');
     expect(out['cookie']).toBe('a=1; b=2');
   });
+
+  it('drops inbound headers starting with x-keylease-', () => {
+    const out = buildUpstreamHeaders({
+      'x-keylease-calls-remaining': '999999',
+      'X-KeyLease-Custom': 'spoofed',
+      'x-keylease-lease-id': 'fake',
+      'content-type': 'application/json',
+    });
+    expect(out).toEqual({ 'content-type': 'application/json' });
+  });
 });
 
 describe('proxy routing', () => {
@@ -145,6 +155,35 @@ describe('proxy routing', () => {
     expect(res.statusCode).toBe(401);
     expect(res.json()).toMatchObject({ error: 'invalid_token' });
     expect(calls).toHaveLength(0);
+    await app.close();
+  });
+
+  it('strips client-supplied x-keylease-* headers and sets legitimate values', async () => {
+    const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/resource',
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        'x-keylease-calls-remaining': '999999',
+        'x-keylease-custom': 'spoofed-value',
+        'X-KeyLease-Evil': 'attacker',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(calls).toHaveLength(1);
+    const forwardedHeaders = calls[0]?.init?.headers as Record<string, string>;
+    expect(forwardedHeaders['x-keylease-calls-remaining']).toBe('9');
+    expect(forwardedHeaders['x-keylease-lease-id']).toBe('lease-1');
+    expect(forwardedHeaders['x-keylease-custom']).toBeUndefined();
+    expect(forwardedHeaders['x-keylease-evil']).toBeUndefined();
     await app.close();
   });
 

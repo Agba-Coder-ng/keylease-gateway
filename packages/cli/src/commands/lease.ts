@@ -3,6 +3,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { Keypair } from '@stellar/stellar-sdk';
 import { mintSessionToken } from '../token.js';
 import { SorobanClient, type CreateLeaseResult } from '../client/soroban.js';
+import { CliError } from '../errors.js';
 import type { CliIo } from '../index.js';
 
 /** Where acquired leases are remembered so `keylease env` can find them. */
@@ -18,7 +19,9 @@ export interface AcquireArgs extends NetworkArgs {
   service: string;
   calls: number;
   duration: number;
-  secret: string;
+  /** Consumer secret seed; required unless `dryRun` is set. */
+  secret?: string | undefined;
+  dryRun: boolean;
   json: boolean;
 }
 
@@ -142,7 +145,7 @@ async function writeAtomic(path: string, contents: string): Promise<void> {
 }
 
 export interface AcquireDeps {
-  createClient?: (args: AcquireArgs) => Pick<SorobanClient, 'createLease'>;
+  createClient?: (args: AcquireArgs) => Pick<SorobanClient, 'createLease' | 'quote'>;
   store?: SessionStore;
   now?: () => number;
 }
@@ -268,7 +271,7 @@ export function parseConsumerSecret(secret: string): Keypair {
   }
 }
 
-function defaultCreateClient(args: AcquireArgs): Pick<SorobanClient, 'createLease'> {
+function defaultCreateClient(args: AcquireArgs): Pick<SorobanClient, 'createLease' | 'quote'> {
   return SorobanClient.fromEnv({
     KEYLEASE_NETWORK: args.network,
     KEYLEASE_RPC_URL: args.rpc,
@@ -306,21 +309,85 @@ function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): v
   io.out(`  Authorization: Bearer ${session.token}`);
 }
 
+interface DryRunSummary {
+  service: string;
+  calls: number;
+  duration: number;
+  price: number;
+  expiresAt: number;
+  consumer: string | undefined;
+}
+
+function renderDryRunOutput(summary: DryRunSummary, io: CliIo, json: boolean): void {
+  if (json) {
+    io.out(
+      JSON.stringify(
+        {
+          dry_run: true,
+          service: summary.service,
+          calls: summary.calls,
+          duration: summary.duration,
+          price: summary.price,
+          expires_at: summary.expiresAt,
+          consumer: summary.consumer ?? null,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
+  io.out(`Dry run: quote for ${summary.calls} calls on "${summary.service}" (nothing signed or submitted)`);
+  io.out(`  service    : ${summary.service}`);
+  io.out(`  calls      : ${summary.calls}`);
+  io.out(`  duration   : ${summary.duration}s`);
+  io.out(`  price      : ${summary.price} (token smallest units, quoted from keylease-core)`);
+  if (summary.consumer !== undefined) io.out(`  consumer   : ${summary.consumer}`);
+  io.out(`  expires at : ${new Date(summary.expiresAt * 1000).toISOString()} (if acquired now)`);
+}
+
 /**
  * `keylease acquire --service <id> --calls <count> --duration <secs> --secret <key>`
  *
  * Invokes `create_lease` on `keylease-core`, then mints an ed25519-signed
  * session bearer token bound to `(lease_id, consumer)`.
+ *
+ * With `--dry-run` the price is read through `quote` instead: nothing is signed,
+ * no lease is created, and no session is written to the local store.
  */
 export async function acquireCommand(
   args: AcquireArgs,
   io: CliIo,
   deps: AcquireDeps = {},
 ): Promise<number> {
-  const consumer = parseConsumerSecret(args.secret);
   const createClient = deps.createClient ?? defaultCreateClient;
   const store = deps.store ?? fileSessionStore();
   const now = deps.now ?? (() => Date.now());
+  const consumer = args.secret === undefined ? undefined : parseConsumerSecret(args.secret);
+
+  if (args.dryRun) {
+    const client = createClient(args);
+    const price = await client.quote(args.service, args.calls);
+    const expiresAt = Math.floor(now() / 1000) + args.duration;
+    renderDryRunOutput(
+      {
+        service: args.service,
+        calls: args.calls,
+        duration: args.duration,
+        price,
+        expiresAt,
+        consumer: consumer?.publicKey(),
+      },
+      io,
+      args.json,
+    );
+    return 0;
+  }
+
+  if (consumer === undefined || args.secret === undefined) {
+    throw new CliError('--secret is required unless --dry-run is set', 'missing_option');
+  }
 
   const result: CreateLeaseResult = await createClient(args).createLease({
     service: args.service,
@@ -368,6 +435,21 @@ export function envEntriesFor(session: LeaseSession): Record<string, string> {
   };
 }
 
+/** Values made only of shell-safe characters are written without quotes. */
+const ENV_BARE_VALUE = /^[A-Za-z0-9_.:@/-]+$/;
+
+/**
+ * Renders a value for a `.env` file meant to be sourced by a POSIX shell.
+ *
+ * Plain values stay bare for readability; anything that could be split, quoted
+ * or expanded (`space`, `#`, `$`, `"`, `\\`, empty) is double-quoted with `\\`,
+ * `"` and `$` escaped, so the shell reads back exactly the original value.
+ */
+export function quoteEnvValue(value: string): string {
+  if (ENV_BARE_VALUE.test(value)) return value;
+  return `"${value.replace(/[\\"$]/g, (char) => `\\${char}`)}"`;
+}
+
 /**
  * Merges key/value pairs into existing `.env` text: unknown lines are kept
  * verbatim, previously set `KEY` are replaced in place, new keys appended.
@@ -381,7 +463,7 @@ export function mergeEnv(existing: string, entries: Record<string, string>): str
     const key = match[1] as string;
     if (key in entries && !emitted.has(key)) {
       emitted.add(key);
-      return `${key}=${entries[key]}`;
+      return `${key}=${quoteEnvValue(entries[key] as string)}`;
     }
     if (key in entries) return null; // drop duplicates
     return line;
@@ -395,7 +477,7 @@ export function mergeEnv(existing: string, entries: Record<string, string>): str
   for (const [key, value] of Object.entries(entries)) {
     if (!emitted.has(key)) {
       emitted.add(key);
-      out.push(`${key}=${value}`);
+      out.push(`${key}=${quoteEnvValue(value)}`);
     }
   }
 

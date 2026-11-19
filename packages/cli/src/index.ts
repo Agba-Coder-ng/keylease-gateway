@@ -8,6 +8,7 @@ import {
   type AcquireDeps,
   type EnvArgs,
   type EnvDeps,
+  type NetworkArgs,
 } from './commands/lease.js';
 import { statusCommand, type StatusArgs, type StatusDeps } from './commands/status.js';
 import {
@@ -23,6 +24,21 @@ import {
   type SessionsArgs,
   type SessionsDeps,
 } from './commands/sessions.js';
+import {
+  completionsCommand,
+  COMPLETION_SHELLS,
+  isCompletionShell,
+  type CompletionsArgs,
+} from './commands/completions.js';
+import {
+  loadConfigFile,
+  resolveConfig,
+  type KeyleaseConfigFile,
+  type ResolvedConfig,
+} from './config.js';
+import { CliError } from './errors.js';
+
+export { CliError } from './errors.js';
 
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
@@ -32,19 +48,14 @@ export interface CliIo {
   err(line?: string): void;
 }
 
-export class CliError extends Error {
-  readonly code: string;
-  readonly exitCode: number;
-
-  constructor(message: string, code = 'usage_error', exitCode = 2) {
-    super(message);
-    this.name = 'CliError';
-    this.code = code;
-    this.exitCode = exitCode;
-  }
-}
-
-export type CommandName = 'acquire' | 'env' | 'status' | 'settle' | 'revoke' | 'sessions';
+export type CommandName =
+  | 'acquire'
+  | 'env'
+  | 'status'
+  | 'settle'
+  | 'revoke'
+  | 'sessions'
+  | 'completions';
 
 export type Invocation =
   | { command: 'help' }
@@ -54,7 +65,8 @@ export type Invocation =
   | { command: 'status'; args: StatusArgs }
   | { command: 'settle'; args: SettleArgs }
   | { command: 'revoke'; args: RevokeArgs }
-  | { command: 'sessions'; args: SessionsArgs };
+  | { command: 'sessions'; args: SessionsArgs }
+  | { command: 'completions'; args: CompletionsArgs };
 
 export interface RunDeps {
   acquire?: AcquireDeps;
@@ -63,6 +75,12 @@ export interface RunDeps {
   settle?: SettleDeps;
   revoke?: RevokeDeps;
   sessions?: SessionsDeps;
+  /** Directory holding `.keyleaserc.json` (default: `process.cwd()`). */
+  cwd?: string;
+  /** Environment consulted for `KEYLEASE_*` config (default: `process.env`). */
+  environment?: Record<string, string | undefined>;
+  /** Pre-loaded `.keyleaserc.json` contents, skipping disk reads. */
+  config?: KeyleaseConfigFile;
 }
 
 const OPTION_SPEC = {
@@ -76,6 +94,7 @@ const OPTION_SPEC = {
   rpc: { type: 'string' },
   contract: { type: 'string' },
   file: { type: 'string' },
+  'dry-run': { type: 'boolean' },
   json: { type: 'boolean' },
   'check-chain': { type: 'boolean' },
   prune: { type: 'boolean' },
@@ -151,11 +170,28 @@ function ensureNoPositionals(positionals: string[]): void {
   }
 }
 
+export interface ParseOptions {
+  /** Service id from `.keyleaserc.json` or `KEYLEASE_SERVICE` when `--service` is absent. */
+  defaultService?: string | undefined;
+}
+
+/** Resolves `--service`, falling back to the configured default service. */
+function serviceFrom(values: ParsedOptions, options: ParseOptions): string {
+  const flag = optionalString(values, 'service');
+  if (flag !== undefined) return flag;
+  const fallback = options.defaultService;
+  if (fallback !== undefined && fallback.length > 0) return fallback;
+  throw new CliError(
+    '--service is required (or set "defaultService" in .keyleaserc.json)',
+    'missing_option',
+  );
+}
+
 /**
  * Turns a raw argv slice into a typed invocation. Pure and side-effect free so
  * CLI parameter parsing can be unit tested directly.
  */
-export function parseArgv(argv: string[]): Invocation {
+export function parseArgv(argv: string[], options: ParseOptions = {}): Invocation {
   const [rawCommand, ...rest] = argv;
 
   if (rawCommand === undefined || rawCommand === 'help' || rawCommand === '--help' || rawCommand === '-h') {
@@ -173,12 +209,18 @@ export function parseArgv(argv: string[]): Invocation {
   switch (rawCommand) {
     case 'acquire': {
       ensureNoPositionals(positionals);
+      const dryRun = values['dry-run'] === true;
+      const secret = optionalString(values, 'secret');
+      if (!dryRun && secret === undefined) {
+        throw new CliError('--secret is required unless --dry-run is set', 'missing_option');
+      }
       const args: AcquireArgs = {
         ...networkArgs(values),
-        service: requireString(values, 'service'),
+        service: serviceFrom(values, options),
         calls: requirePositiveInt(values, 'calls'),
         duration: requirePositiveInt(values, 'duration'),
-        secret: requireString(values, 'secret'),
+        secret,
+        dryRun,
         json: values.json === true,
       };
       return { command: 'acquire', args };
@@ -186,7 +228,7 @@ export function parseArgv(argv: string[]): Invocation {
     case 'env': {
       ensureNoPositionals(positionals);
       const args: EnvArgs = {
-        service: requireString(values, 'service'),
+        service: serviceFrom(values, options),
         file: optionalString(values, 'file') ?? '.env',
         json: values.json === true,
       };
@@ -240,9 +282,27 @@ export function parseArgv(argv: string[]): Invocation {
         args: { prune: values.prune === true, json: values.json === true },
       };
     }
+    case 'completions': {
+      const shell = positionals[0];
+      if (shell === undefined) {
+        throw new CliError(
+          'completions requires a shell (supported: bash, zsh, fish)',
+          'missing_option',
+        );
+      }
+      if (positionals.length > 1) {
+        throw new CliError(`unexpected argument "${positionals[1]}"`, 'unexpected_argument');
+      }
+      if (!isCompletionShell(shell)) {
+        throw new CliError(
+          `unsupported shell "${shell}" (supported: ${COMPLETION_SHELLS.join(', ')})`,
+        );
+      }
+      return { command: 'completions', args: { shell } };
+    }
     default:
       throw new CliError(
-        `unknown command "${rawCommand}" (expected acquire, env, status, settle, revoke or sessions)`,
+        `unknown command "${rawCommand}" (expected acquire, env, status, settle, revoke, sessions or completions)`,
         'unknown_command',
       );
   }
@@ -258,21 +318,24 @@ Usage:
   ${CLI_NAME} settle  --lease <id> --secret <key>
   ${CLI_NAME} revoke  --lease <id> --secret <key>
   ${CLI_NAME} sessions [--prune] [--json]
+  ${CLI_NAME} completions <shell>
   ${CLI_NAME} help | --version
 
 Commands:
-  acquire   Prepay a lease in keylease-core escrow and mint a session bearer token
-  env       Write the temporary session keys of an acquired lease into a local .env
-  status    Inspect an on-chain lease, or verify a session token offline
-  settle    Settle an expired/exhausted lease: pay the provider, refund the consumer
-  revoke    End a lease early and refund its unused calls
-  sessions  List locally stored leases or prune expired entries
+  acquire     Prepay a lease in keylease-core escrow and mint a session bearer token
+  env         Write the temporary session keys of an acquired lease into a local .env
+  status      Inspect an on-chain lease, or verify a session token offline
+  settle      Settle an expired/exhausted lease: pay the provider, refund the consumer
+  revoke      End a lease early and refund its unused calls
+  sessions    List locally stored leases or prune expired entries
+  completions Print a bash, zsh or fish completion script
 
 Options:
-  --service <id>       Service identifier the lease is scoped to (required)
+  --service <id>       Service identifier the lease is scoped to (default: .keyleaserc.json)
   --calls <count>      Number of API calls the lease authorises
   --duration <secs>    Lease lifetime in seconds
   --secret <key>       Stellar secret seed (S...) of the consumer account
+  --dry-run            Quote the price of --calls without signing or submitting
   --lease <id>         On-chain lease id (decimal u64)
   --token <token>      Session bearer token to verify offline
   --check-chain        Check the token's current lease over Soroban RPC
@@ -283,6 +346,10 @@ Options:
   --prune              Remove expired sessions (for "sessions")
   --json               Machine-readable JSON output
   -h, --help           Show this help
+
+Configuration:
+  .keyleaserc.json in the working directory may set network, rpc, contract and
+  defaultService. Precedence: flag > KEYLEASE_* environment > file > default.
 `;
 }
 
@@ -295,6 +362,44 @@ export const consoleIo: CliIo = {
   },
 };
 
+const META_COMMANDS = new Set(['help', '--help', '-h', 'version', '--version', '-V']);
+
+/** Commands that must work even if a checked-in config file is broken. */
+function isMetaInvocation(argv: string[]): boolean {
+  const command = argv[0];
+  return command === undefined || META_COMMANDS.has(command);
+}
+
+interface InvocationFlags extends NetworkArgs {
+  service?: string | undefined;
+}
+
+/** The network/service flags explicitly passed to `invocation`, if any. */
+function invocationFlags(invocation: Invocation): InvocationFlags {
+  if (!('args' in invocation)) return {};
+  const args = invocation.args as Partial<InvocationFlags>;
+  return {
+    network: args.network,
+    rpc: args.rpc,
+    contract: args.contract,
+    service: 'service' in invocation.args ? args.service : undefined,
+  };
+}
+
+/** Applies resolved network settings to commands that talk to Soroban RPC. */
+function withResolvedNetwork(invocation: Invocation, resolved: ResolvedConfig): Invocation {
+  if (!('args' in invocation) || !('network' in invocation.args)) return invocation;
+  return {
+    ...invocation,
+    args: {
+      ...invocation.args,
+      network: resolved.network,
+      rpc: resolved.rpc,
+      contract: resolved.contract,
+    },
+  } as Invocation;
+}
+
 /** Parses and dispatches a CLI invocation, returning a process exit code. */
 export async function run(
   argv: string[],
@@ -303,7 +408,18 @@ export async function run(
 ): Promise<number> {
   let invocation: Invocation;
   try {
-    invocation = parseArgv(argv);
+    if (isMetaInvocation(argv)) {
+      invocation = parseArgv(argv);
+    } else {
+      const env = deps.environment ?? process.env;
+      const file = deps.config ?? (await loadConfigFile(deps.cwd ?? process.cwd()));
+      const defaults = resolveConfig({ env, file });
+      const parsed = parseArgv(argv, { defaultService: defaults.service });
+      invocation = withResolvedNetwork(
+        parsed,
+        resolveConfig({ flags: invocationFlags(parsed), env, file }),
+      );
+    }
   } catch (error) {
     if (error instanceof CliError) {
       io.err(`error: ${error.message}`);
@@ -333,6 +449,8 @@ export async function run(
         return await revokeCommand(invocation.args, io, deps.revoke);
       case 'sessions':
         return await sessionsCommand(invocation.args, io, deps.sessions);
+      case 'completions':
+        return await completionsCommand(invocation.args, io);
     }
   } catch (error) {
     if (error instanceof CliError) {

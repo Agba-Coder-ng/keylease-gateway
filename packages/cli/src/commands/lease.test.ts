@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Keypair } from '@stellar/stellar-sdk';
@@ -10,6 +10,7 @@ import {
   fileSessionStore,
   mergeEnv,
   parseConsumerSecret,
+  SessionStoreError,
   type LeaseSession,
 } from './lease.js';
 import { verifySessionToken } from '../token.js';
@@ -238,7 +239,6 @@ describe('envCommand', () => {
       },
     });
 
-    const { writeFile } = await import('node:fs/promises');
     await writeFile(target, 'EXISTING=value\n');
 
     expect(await envCommand({ service: 'weather-api', file: target, json: false }, io, { store })).toBe(0);
@@ -289,11 +289,87 @@ describe('fileSessionStore', () => {
   });
 
   it('rejects a corrupt store with an actionable error', async () => {
-    const { mkdir, writeFile } = await import('node:fs/promises');
     await mkdir(join(dir, '.keylease'), { recursive: true });
     await writeFile(join(dir, '.keylease', 'sessions.json'), 'not json');
     const store = fileSessionStore(dir);
     await expect(store.load()).rejects.toThrow(/Cannot read session store.*corrupt.*Back up or repair/);
+  });
+
+  const sessionFor = (service: string, leaseId: string) => ({
+    service,
+    leaseId,
+    consumer: consumer.publicKey(),
+    token: 'kls1.x.y',
+    callsLimit: 1,
+    issuedAt: NOW,
+    expiresAt: NOW + 60,
+    txHash: null,
+    network: 'testnet',
+  });
+
+  it('keeps both sessions when two saves race', async () => {
+    // Separate store instances model two `acquire` commands in one process.
+    await Promise.all([
+      fileSessionStore(dir).save(sessionFor('weather-api', 'lease-1')),
+      fileSessionStore(dir).save(sessionFor('maps-api', 'lease-2')),
+      fileSessionStore(dir).save(sessionFor('search-api', 'lease-3')),
+    ]);
+
+    const reloaded = await fileSessionStore(dir).load();
+    expect(Object.keys(reloaded).sort()).toEqual(['maps-api', 'search-api', 'weather-api']);
+    // No lock or temp files are left behind.
+    expect(await readdir(join(dir, '.keylease'))).toEqual(['sessions.json']);
+  });
+
+  it('waits for a lock held by another process', async () => {
+    const lockPath = join(dir, '.keylease', 'sessions.json.lock');
+    await mkdir(join(dir, '.keylease'), { recursive: true });
+    await writeFile(lockPath, '12345\n');
+
+    const saving = fileSessionStore(dir, { lockTimeoutMs: 2_000 }).save(
+      sessionFor('weather-api', 'lease-1'),
+    );
+    setTimeout(() => void rm(lockPath, { force: true }), 100);
+    await saving;
+
+    const reloaded = await fileSessionStore(dir).load();
+    expect(reloaded['weather-api']?.leaseId).toBe('lease-1');
+  });
+
+  it('surfaces a clear error when the lock stays held', async () => {
+    await mkdir(join(dir, '.keylease'), { recursive: true });
+    await writeFile(join(dir, '.keylease', 'sessions.json.lock'), '12345\n');
+
+    const store = fileSessionStore(dir, { lockTimeoutMs: 50 });
+    const failure = store.save(sessionFor('weather-api', 'lease-1'));
+    await expect(failure).rejects.toBeInstanceOf(SessionStoreError);
+    await expect(failure).rejects.toMatchObject({ code: 'locked' });
+    await expect(failure).rejects.toThrow(/locked.*sessions\.json\.lock/);
+  });
+
+  it('removes a stale lock once and retries', async () => {
+    const lockPath = join(dir, '.keylease', 'sessions.json.lock');
+    await mkdir(join(dir, '.keylease'), { recursive: true });
+    await writeFile(lockPath, '12345\n');
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lockPath, old, old);
+
+    await fileSessionStore(dir, { lockTimeoutMs: 50, staleLockMs: 10_000 }).save(
+      sessionFor('weather-api', 'lease-1'),
+    );
+    const reloaded = await fileSessionStore(dir).load();
+    expect(reloaded['weather-api']?.leaseId).toBe('lease-1');
+  });
+
+  it('serializes saveAll with concurrent saves', async () => {
+    const store = fileSessionStore(dir);
+    await store.save(sessionFor('weather-api', 'lease-1'));
+    await Promise.all([
+      store.saveAll({ 'weather-api': sessionFor('weather-api', 'lease-1') }),
+      store.save(sessionFor('maps-api', 'lease-2')),
+    ]);
+    const reloaded = await fileSessionStore(dir).load();
+    expect(Object.keys(reloaded).sort()).toEqual(['maps-api', 'weather-api']);
   });
 
   it('reports a missing store with guidance to acquire a lease', async () => {

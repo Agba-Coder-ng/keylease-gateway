@@ -9,7 +9,7 @@ import {
   drainProxyServer,
 } from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
-import { resolveConfig, attachSignalHandlers, ProxyConfigError } from './index.js';
+import { resolveConfig, describeConfig, attachSignalHandlers, ProxyConfigError } from './index.js';
 
 const consumer = Keypair.random();
 const NOW = Math.floor(Date.now() / 1000);
@@ -1090,5 +1090,27 @@ describe('access log sizes', () => {
     expect(Number(res.headers['content-length'])).toBeGreaterThan(0);
     expect(JSON.stringify(lines[0])).not.toContain('secret');
     await app.close();
+  });
+});
+
+describe('describeConfig', () => {
+  it('never exposes secrets or upstream credentials', () => {
+    const config = resolveConfig({
+      KEYLEASE_UPSTREAM_URL: 'https://user:pa55word@api.example.com/v1?api_key=hunter2#frag',
+      KEYLEASE_GATEWAY_SECRET: 'SABCDEFSECRETSEEDVALUE',
+      KEYLEASE_TRUST_PROXY: '10.0.0.0/8',
+    });
+    const summary = describeConfig(config);
+    const text = JSON.stringify(summary);
+    for (const leaked of ['pa55word', 'hunter2', 'SABCDEF', 'user:', 'frag']) {
+      expect(text).not.toContain(leaked);
+    }
+    expect(summary).toMatchObject({
+      upstream: 'https://api.example.com/v1',
+      onChainQuotaCommits: true,
+      trustProxy: ['10.0.0.0/8'],
+      maxInFlight: 1024,
+    });
+    expect(Object.keys(summary)).not.toContain('gatewaySecret');
   });
 });

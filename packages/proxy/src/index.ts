@@ -174,6 +174,30 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
   };
 }
 
+/**
+ * Secret-free view of the resolved configuration, safe to log at startup.
+ * The gateway secret is reduced to a boolean and the upstream URL is stripped
+ * of credentials, query and fragment.
+ */
+export function describeConfig(config: ResolvedConfig): Record<string, unknown> {
+  const url = new URL(config.upstream);
+  return {
+    upstream: `${url.protocol}//${url.host}${url.pathname}`,
+    host: config.host,
+    port: config.port,
+    cacheTtlMs: config.cacheTtlMs,
+    forwardAuthorization: config.forwardAuthorization,
+    trustProxy: config.trustProxy,
+    metricsEnabled: config.metricsEnabled,
+    shutdownTimeoutMs: config.shutdownTimeoutMs,
+    onChainQuotaCommits: config.gatewaySecret !== null,
+    quotaBatch: config.quotaBatch,
+    quotaFlushMs: config.quotaFlushMs,
+    maxBodyBytes: config.maxBodyBytes,
+    maxInFlight: config.maxInFlight,
+  };
+}
+
 export function providerFromClient(
   client: Pick<SorobanClient, 'getLeaseState'>,
 ): LeaseStateProvider {
@@ -284,6 +308,7 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
     maxInFlight: config.maxInFlight,
     logger: true,
   });
+  app.log.info({ config: describeConfig(config) }, 'configuration');
 
   const address = await app.listen({ host: config.host, port: config.port });
   app.log.info(`listening on ${address}`);

@@ -101,6 +101,126 @@ describe('parseArgv', () => {
     expect(args.json).toBe(true);
   });
 
+  it('validates --rpc URLs with valid http and https schemes', () => {
+    const validUrls = [
+      'https://soroban-testnet.stellar.org',
+      'https://mainnet.sorobanrpc.com',
+      'http://localhost:8000/soroban/rpc',
+      'http://127.0.0.1:8000/soroban/rpc',
+      'http://[::1]:8000/soroban/rpc',
+    ];
+
+    for (const url of validUrls) {
+      const invocation = parseArgv([
+        'acquire',
+        '--service',
+        'weather-api',
+        '--calls',
+        '1',
+        '--duration',
+        '60',
+        '--secret',
+        SECRET,
+        '--rpc',
+        url,
+      ]);
+      expect(invocation.command).toBe('acquire');
+      const args = (invocation as { args: AcquireArgs }).args;
+      expect(args.rpc).toBe(url);
+    }
+  });
+
+  it('rejects --rpc URLs with invalid schemes', () => {
+    const invalidUrls = [
+      'ftp://example.com',
+      'file:///path/to/file',
+      'htps://typo.example.com',
+      'htp://typo.example.com',
+    ];
+
+    for (const url of invalidUrls) {
+      const error = expectCliError(
+        () =>
+          parseArgv([
+            'acquire',
+            '--service',
+            'weather-api',
+            '--calls',
+            '1',
+            '--duration',
+            '60',
+            '--secret',
+            SECRET,
+            '--rpc',
+            url,
+          ]),
+        'invalid_option',
+      );
+      expect(error.message).toContain(url);
+      expect(error.message).toContain('scheme');
+    }
+  });
+
+  it('rejects --rpc URLs that are not valid URLs', () => {
+    const invalidUrls = [
+      'not-a-url',
+      'htps://example.com',
+      'localhost:8000',
+      '192.168.1.1:8000',
+    ];
+
+    for (const url of invalidUrls) {
+      const error = expectCliError(
+        () =>
+          parseArgv([
+            'acquire',
+            '--service',
+            'weather-api',
+            '--calls',
+            '1',
+            '--duration',
+            '60',
+            '--secret',
+            SECRET,
+            '--rpc',
+            url,
+          ]),
+        'invalid_option',
+      );
+      expect(error.message).toContain(url);
+    }
+  });
+
+  it('rejects http: URLs that are not localhost', () => {
+    const nonLocalHostUrls = [
+      'http://example.com',
+      'http://192.168.1.1',
+      'http://staging.example.com:8000',
+    ];
+
+    for (const url of nonLocalHostUrls) {
+      const error = expectCliError(
+        () =>
+          parseArgv([
+            'acquire',
+            '--service',
+            'weather-api',
+            '--calls',
+            '1',
+            '--duration',
+            '60',
+            '--secret',
+            SECRET,
+            '--rpc',
+            url,
+          ]),
+        'invalid_option',
+      );
+      expect(error.message).toContain(url);
+      expect(error.message).toContain('localhost');
+    }
+  });
+
   it('requires --service, --calls, --duration and --secret for acquire', () => {
     expectCliError(() => parseArgv(['acquire']), 'missing_option');
     expectCliError(

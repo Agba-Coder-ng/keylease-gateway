@@ -37,6 +37,12 @@ export interface ProxyOptions {
   metricsEnabled?: boolean;
   /** Maximum request body size in bytes. Defaults to 32 MiB. */
   maxBodyBytes?: number;
+  /**
+   * Fastify `trustProxy` setting: `true`, a hop count, or CIDR/IP list of
+   * trusted edge proxies. Defaults to `false`, in which case every inbound
+   * `x-forwarded-*` header is dropped instead of forwarded.
+   */
+  trustProxy?: boolean | number | string | string[];
 }
 
 const REQUEST_ID_HEADER = 'x-request-id';
@@ -81,18 +87,11 @@ export function buildUpstreamHeaders(
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
     if (lower === 'authorization' && options.forwardAuthorization !== true) continue;
     if (lower.startsWith('x-keylease-')) continue;
+    // Forwarding metadata is rebuilt by the proxy from trusted values only.
+    if (lower.startsWith('x-forwarded-')) continue;
     out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
   }
   return out;
-}
-
-function appendForwardedFor(
-  incoming: string | string[] | undefined,
-  remote: string | undefined,
-): string {
-  const existing = Array.isArray(incoming) ? incoming.join(', ') : incoming;
-  if (remote === undefined || remote.length === 0) return existing ?? '';
-  return existing && existing.length > 0 ? `${existing}, ${remote}` : remote;
 }
 
 function isUpgradeRequest(request: FastifyRequest): boolean {
@@ -141,6 +140,8 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   const app = Fastify({
     logger: options.logger ?? false,
     bodyLimit: maxBodyBytes,
+    // Fastify accepts a hop count at runtime even though its typings omit `number`.
+    trustProxy: (options.trustProxy ?? false) as boolean,
     requestIdHeader: false,
     genReqId: (req) => resolveRequestId(req.headers[REQUEST_ID_HEADER]),
   });
@@ -253,8 +254,10 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
       headers: {
         ...headers,
         [REQUEST_ID_HEADER]: request.id,
-        'x-forwarded-for': appendForwardedFor(request.headers['x-forwarded-for'], request.ip),
-        'x-forwarded-host': request.headers.host ?? '',
+        // `ips` (only set with trustProxy) is socket-first and stops at the first
+        // untrusted hop, so spoofed entries never reach the upstream chain.
+        'x-forwarded-for': (request.ips ?? [request.ip]).slice().reverse().join(', '),
+        'x-forwarded-host': request.host,
         'x-forwarded-proto': request.protocol,
         'x-keylease-lease-id': decision.lease.leaseId,
         'x-keylease-calls-remaining': String(decision.remainingCalls),

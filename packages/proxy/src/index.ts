@@ -16,6 +16,8 @@
  *   KEYLEASE_QUOTA_FLUSH_MS  periodic commit interval (default: 10000)
  *   KEYLEASE_CACHE_TTL_MS    lease-state cache TTL (default: 30000)
  *   KEYLEASE_MAX_BODY_BYTES  maximum request body size in bytes (default: 33554432)
+ *   KEYLEASE_TRUST_PROXY     trusted edge proxies for x-forwarded-*: "true", a hop count or
+ *                            a comma-separated IP/CIDR list (default: false)
  *   KEYLEASE_FORWARD_AUTH    "true" to forward the caller's bearer token
  *   KEYLEASE_METRICS_ENABLED "true" to expose Prometheus metrics on /metrics (default: false)
  *   KEYLEASE_SHUTDOWN_TIMEOUT_MS shutdown drain timeout in ms (default: 10000)
@@ -42,6 +44,7 @@ export interface ProxyEnv {
   KEYLEASE_QUOTA_BATCH?: string | undefined;
   KEYLEASE_QUOTA_FLUSH_MS?: string | undefined;
   KEYLEASE_CACHE_TTL_MS?: string | undefined;
+  KEYLEASE_TRUST_PROXY?: string | undefined;
   KEYLEASE_FORWARD_AUTH?: string | undefined;
   KEYLEASE_METRICS_ENABLED?: string | undefined;
   KEYLEASE_SHUTDOWN_TIMEOUT_MS?: string | undefined;
@@ -63,6 +66,7 @@ export interface ResolvedConfig {
   port: number;
   cacheTtlMs: number;
   forwardAuthorization: boolean;
+  trustProxy: boolean | number | string[];
   metricsEnabled: boolean;
   shutdownTimeoutMs: number;
   gatewaySecret: string | null;
@@ -81,6 +85,23 @@ function positiveInt(raw: string | undefined, fallback: number, name: string): n
     throw new ProxyConfigError(`${name} "${raw}" must be a positive integer`);
   }
   return value;
+}
+
+function parseTrustProxy(raw: string | undefined): boolean | number | string[] {
+  const value = raw?.trim();
+  if (value === undefined || value === '' || value === 'false') return false;
+  if (value === 'true') return true;
+  if (/^\d+$/.test(value)) {
+    const hops = Number(value);
+    return hops === 0 ? false : hops;
+  }
+  const entries = value.split(',').map((entry) => entry.trim());
+  if (entries.some((entry) => !/^[0-9a-fA-F.:]+(\/\d{1,3})?$/.test(entry))) {
+    throw new ProxyConfigError(
+      `KEYLEASE_TRUST_PROXY "${raw ?? ''}" must be "true", "false", a hop count or a comma-separated IP/CIDR list`,
+    );
+  }
+  return entries;
 }
 
 export function resolveConfig(env: ProxyEnv): ResolvedConfig {
@@ -124,6 +145,7 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     port,
     cacheTtlMs,
     forwardAuthorization: env.KEYLEASE_FORWARD_AUTH === 'true',
+    trustProxy: parseTrustProxy(env.KEYLEASE_TRUST_PROXY),
     metricsEnabled: env.KEYLEASE_METRICS_ENABLED === 'true',
     shutdownTimeoutMs: positiveInt(
       env.KEYLEASE_SHUTDOWN_TIMEOUT_MS,
@@ -241,6 +263,7 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
     upstream: config.upstream,
     verifier,
     forwardAuthorization: config.forwardAuthorization,
+    trustProxy: config.trustProxy,
     metricsEnabled: config.metricsEnabled,
     maxBodyBytes: config.maxBodyBytes,
     logger: true,

@@ -902,3 +902,67 @@ describe('WebSocket upgrade requests', () => {
   });
 });
 
+describe('trustProxy and x-forwarded-* headers', () => {
+  async function forwarded(trustProxy: boolean | string[], remoteAddress: string) {
+    const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+      trustProxy,
+    });
+    await app.inject({
+      method: 'GET',
+      url: '/',
+      remoteAddress,
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        host: 'proxy.local',
+        'x-forwarded-for': '6.6.6.6',
+        'x-forwarded-proto': 'https',
+        'x-forwarded-host': 'evil.example',
+      },
+    });
+    await app.close();
+    return (calls[0]?.init as { headers: Record<string, string> }).headers;
+  }
+
+  it('drops spoofed x-forwarded-* headers when trust is off (default)', async () => {
+    const headers = await forwarded(false, '192.0.2.10');
+    expect(headers['x-forwarded-for']).toBe('192.0.2.10');
+    expect(headers['x-forwarded-proto']).toBe('http');
+    expect(headers['x-forwarded-host']).toBe('proxy.local');
+  });
+
+  it('derives x-forwarded-* from a trusted edge proxy', async () => {
+    const headers = await forwarded(true, '10.0.0.1');
+    expect(headers['x-forwarded-for']).toBe('6.6.6.6, 10.0.0.1');
+    expect(headers['x-forwarded-proto']).toBe('https');
+    expect(headers['x-forwarded-host']).toBe('evil.example');
+  });
+
+  it('ignores forwarded headers from a peer outside the trusted CIDR list', async () => {
+    const untrusted = await forwarded(['10.0.0.0/8'], '192.0.2.10');
+    expect(untrusted['x-forwarded-for']).toBe('192.0.2.10');
+    expect(untrusted['x-forwarded-proto']).toBe('http');
+    const trusted = await forwarded(['10.0.0.0/8'], '10.1.2.3');
+    expect(trusted['x-forwarded-for']).toBe('6.6.6.6, 10.1.2.3');
+  });
+});
+
+describe('resolveConfig KEYLEASE_TRUST_PROXY', () => {
+  const base = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
+  it('parses false, true, hop counts and CIDR lists', () => {
+    expect(resolveConfig(base).trustProxy).toBe(false);
+    expect(resolveConfig({ ...base, KEYLEASE_TRUST_PROXY: 'true' }).trustProxy).toBe(true);
+    expect(resolveConfig({ ...base, KEYLEASE_TRUST_PROXY: '2' }).trustProxy).toBe(2);
+    expect(
+      resolveConfig({ ...base, KEYLEASE_TRUST_PROXY: '10.0.0.0/8, 127.0.0.1' }).trustProxy,
+    ).toEqual(['10.0.0.0/8', '127.0.0.1']);
+  });
+  it('rejects garbage', () => {
+    expect(() => resolveConfig({ ...base, KEYLEASE_TRUST_PROXY: 'yes please' })).toThrow(
+      ProxyConfigError,
+    );
+  });
+});

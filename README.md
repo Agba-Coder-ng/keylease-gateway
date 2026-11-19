@@ -277,6 +277,8 @@ lease first; if it is corrupt, back it up or repair it before retrying.
 | --- | --- | --- |
 | `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account |
 | `set_gateway(gateway)` | admin | Rotate the account allowed to commit quota |
+| `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
+| `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
 | `register_service(provider, service, price_per_call)` | provider | Register or re-price a service (`price_per_call > 0`) |
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
@@ -301,8 +303,9 @@ and on reads: `load_config`, `load_service` and `load_lease` extend the entry
 when its TTL falls below `MIN_TTL`, so a lease that is only ever simulated or
 read stays alive. `extend_ttl` is a no-op above the threshold, so the hot read
 path costs one storage access and no write.
-Events: `init`, `gateway`, `service_registered`, `lease_created`,
-`calls_committed`, `lease_revoked`, `lease_settled`.
+Events: `init`, `gateway`, `admin_proposed`, `admin_changed`,
+`service_registered`, `lease_created`, `calls_committed`, `lease_revoked`,
+`lease_settled`.
 
 Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 `Error(Contract, #n)`:

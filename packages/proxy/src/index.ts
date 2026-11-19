@@ -18,6 +18,8 @@
  *   KEYLEASE_MAX_BODY_BYTES  maximum request body size in bytes (default: 33554432)
  *   KEYLEASE_TRUST_PROXY     trusted edge proxies for x-forwarded-*: "true", a hop count or
  *                            a comma-separated IP/CIDR list (default: false)
+ *   KEYLEASE_MAX_INFLIGHT    max concurrent proxied requests; excess get 503 + Retry-After
+ *                            (default: 1024, 0 disables)
  *   KEYLEASE_FORWARD_AUTH    "true" to forward the caller's bearer token
  *   KEYLEASE_METRICS_ENABLED "true" to expose Prometheus metrics on /metrics (default: false)
  *   KEYLEASE_SHUTDOWN_TIMEOUT_MS shutdown drain timeout in ms (default: 10000)
@@ -26,7 +28,7 @@
 import { pathToFileURL } from 'node:url';
 import { Keypair } from '@stellar/stellar-sdk';
 import { SorobanClient } from '@keylease/cli/soroban';
-import { buildProxyServer, drainProxyServer } from './server.js';
+import { buildProxyServer, DEFAULT_MAX_IN_FLIGHT, drainProxyServer } from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
 import { OnChainQuota, type QuotaSink } from './quota.js';
 
@@ -49,6 +51,7 @@ export interface ProxyEnv {
   KEYLEASE_METRICS_ENABLED?: string | undefined;
   KEYLEASE_SHUTDOWN_TIMEOUT_MS?: string | undefined;
   KEYLEASE_MAX_BODY_BYTES?: string | undefined;
+  KEYLEASE_MAX_INFLIGHT?: string | undefined;
   PORT?: string | undefined;
   HOST?: string | undefined;
 }
@@ -73,6 +76,7 @@ export interface ResolvedConfig {
   quotaBatch: number;
   quotaFlushMs: number;
   maxBodyBytes: number;
+  maxInFlight: number;
 }
 
 export const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024; // 32 MiB
@@ -139,6 +143,16 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     );
   }
 
+  const maxInFlight =
+    env.KEYLEASE_MAX_INFLIGHT === undefined
+      ? DEFAULT_MAX_IN_FLIGHT
+      : Number(env.KEYLEASE_MAX_INFLIGHT);
+  if (!Number.isInteger(maxInFlight) || maxInFlight < 0) {
+    throw new ProxyConfigError(
+      `KEYLEASE_MAX_INFLIGHT "${env.KEYLEASE_MAX_INFLIGHT ?? ''}" must be a non-negative integer (0 disables the cap)`,
+    );
+  }
+
   return {
     upstream,
     host: env.HOST ?? '0.0.0.0',
@@ -156,6 +170,31 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     quotaBatch: positiveInt(env.KEYLEASE_QUOTA_BATCH, 50, 'KEYLEASE_QUOTA_BATCH'),
     quotaFlushMs: positiveInt(env.KEYLEASE_QUOTA_FLUSH_MS, 10_000, 'KEYLEASE_QUOTA_FLUSH_MS'),
     maxBodyBytes,
+    maxInFlight,
+  };
+}
+
+/**
+ * Secret-free view of the resolved configuration, safe to log at startup.
+ * The gateway secret is reduced to a boolean and the upstream URL is stripped
+ * of credentials, query and fragment.
+ */
+export function describeConfig(config: ResolvedConfig): Record<string, unknown> {
+  const url = new URL(config.upstream);
+  return {
+    upstream: `${url.protocol}//${url.host}${url.pathname}`,
+    host: config.host,
+    port: config.port,
+    cacheTtlMs: config.cacheTtlMs,
+    forwardAuthorization: config.forwardAuthorization,
+    trustProxy: config.trustProxy,
+    metricsEnabled: config.metricsEnabled,
+    shutdownTimeoutMs: config.shutdownTimeoutMs,
+    onChainQuotaCommits: config.gatewaySecret !== null,
+    quotaBatch: config.quotaBatch,
+    quotaFlushMs: config.quotaFlushMs,
+    maxBodyBytes: config.maxBodyBytes,
+    maxInFlight: config.maxInFlight,
   };
 }
 
@@ -266,8 +305,10 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
     trustProxy: config.trustProxy,
     metricsEnabled: config.metricsEnabled,
     maxBodyBytes: config.maxBodyBytes,
+    maxInFlight: config.maxInFlight,
     logger: true,
   });
+  app.log.info({ config: describeConfig(config) }, 'configuration');
 
   const address = await app.listen({ host: config.host, port: config.port });
   app.log.info(`listening on ${address}`);

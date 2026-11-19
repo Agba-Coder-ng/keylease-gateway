@@ -43,7 +43,15 @@ export interface ProxyOptions {
    * `x-forwarded-*` header is dropped instead of forwarded.
    */
   trustProxy?: boolean | number | string | string[];
+  /**
+   * Maximum number of proxied requests handled at once (verification through
+   * the end of the upstream response). Excess requests get a 503 with
+   * `Retry-After`. Defaults to 1024; 0 disables the cap.
+   */
+  maxInFlight?: number;
 }
+
+export const DEFAULT_MAX_IN_FLIGHT = 1024;
 
 const REQUEST_ID_HEADER = 'x-request-id';
 const VALID_REQUEST_ID = /^[A-Za-z0-9._:~+=/-]{1,128}$/;
@@ -150,6 +158,9 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
     done(null, body);
   });
 
+  const maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
+  let upstreamSlots = 0;
+
   let inFlightRequests = 0;
   const drainWaiters = new Set<() => void>();
 
@@ -158,7 +169,22 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
     reply.header(REQUEST_ID_HEADER, request.id);
   });
 
-  app.addHook('onResponse', async () => {
+  app.addHook('onResponse', async (request, reply) => {
+    // Sizes come from headers only; bodies are never buffered or measured here.
+    const requestBytes = Number(request.headers['content-length'] ?? 0);
+    const responseBytes = Number(reply.getHeader('content-length') ?? 0);
+    request.log.info(
+      {
+        requestId: request.id,
+        method: request.method,
+        path: (request.raw.url ?? '/').split('?')[0],
+        statusCode: reply.statusCode,
+        requestBytes: Number.isFinite(requestBytes) ? requestBytes : 0,
+        responseBytes: Number.isFinite(responseBytes) ? responseBytes : 0,
+        durationMs: Math.round(reply.elapsedTime),
+      },
+      'access',
+    );
     inFlightRequests -= 1;
     if (inFlightRequests <= 0) {
       for (const waiter of drainWaiters) {
@@ -211,6 +237,29 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   });
   const handler = async (request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> => {
     metrics.requestsTotal += 1;
+    if (maxInFlight > 0 && upstreamSlots >= maxInFlight) {
+      return reply
+        .code(503)
+        .header('retry-after', '1')
+        .type('application/json; charset=utf-8')
+        .send({
+          error: 'overloaded',
+          message: 'too many in-flight upstream requests; retry shortly',
+        });
+    }
+    // Taken before verification so shed requests are never charged against a lease.
+    upstreamSlots += 1;
+    try {
+      return await handleProxied(request, reply);
+    } finally {
+      upstreamSlots -= 1;
+    }
+  };
+
+  const handleProxied = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<FastifyReply> => {
     if (isUpgradeRequest(request)) {
       // Upgrades are never proxied; refuse before the lease is verified or charged.
       return reply

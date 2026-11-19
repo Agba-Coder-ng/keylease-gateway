@@ -9,7 +9,7 @@ import {
   drainProxyServer,
 } from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
-import { resolveConfig, attachSignalHandlers, ProxyConfigError } from './index.js';
+import { resolveConfig, describeConfig, attachSignalHandlers, ProxyConfigError } from './index.js';
 
 const consumer = Keypair.random();
 const NOW = Math.floor(Date.now() / 1000);
@@ -964,5 +964,246 @@ describe('resolveConfig KEYLEASE_TRUST_PROXY', () => {
     expect(() => resolveConfig({ ...base, KEYLEASE_TRUST_PROXY: 'yes please' })).toThrow(
       ProxyConfigError,
     );
+  });
+});
+
+describe('in-flight upstream cap', () => {
+  const baseEnv = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
+
+  function gated(maxInFlight: number, fail = false) {
+    const releases: Array<() => void> = [];
+    const { impl, calls } = stubFetch(
+      () =>
+        new Promise<Response>((resolve, reject) => {
+          releases.push(() => (fail ? reject(new Error('boom')) : resolve(okJson({ ok: true }))));
+        }),
+    );
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState({ callsLimit: 100 }) }),
+      fetchImpl: impl,
+      maxInFlight,
+    });
+    const send = () =>
+      app.inject({
+        method: 'GET',
+        url: '/x',
+        headers: { authorization: `Bearer ${mintToken()}` },
+      });
+    return { app, calls, releases, send };
+  }
+
+  it('sheds excess requests with 503 + Retry-After and charges no quota', async () => {
+    const { app, calls, releases, send } = gated(1);
+    const first = send();
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    const shed = await send();
+    expect(shed.statusCode).toBe(503);
+    expect(shed.headers['retry-after']).toBe('1');
+    expect(shed.json()).toMatchObject({ error: 'overloaded' });
+    expect(calls).toHaveLength(1);
+    releases[0]!();
+    expect((await first).statusCode).toBe(200);
+    await app.close();
+  });
+
+  it('releases the slot after success and after upstream errors', async () => {
+    const ok = gated(1);
+    const p1 = ok.send();
+    await vi.waitFor(() => expect(ok.calls).toHaveLength(1));
+    ok.releases[0]!();
+    await p1;
+    const p2 = ok.send();
+    await vi.waitFor(() => expect(ok.calls).toHaveLength(2));
+    ok.releases[1]!();
+    expect((await p2).statusCode).toBe(200);
+    await ok.app.close();
+
+    const bad = gated(1, true);
+    const e1 = bad.send();
+    await vi.waitFor(() => expect(bad.calls).toHaveLength(1));
+    bad.releases[0]!();
+    expect((await e1).statusCode).toBe(502);
+    const e2 = bad.send();
+    await vi.waitFor(() => expect(bad.calls).toHaveLength(2));
+    bad.releases[1]!();
+    expect((await e2).statusCode).toBe(502);
+    await bad.app.close();
+  });
+
+  it('releases the slot on denials and 0 disables the cap', async () => {
+    const { app, calls } = gated(1);
+    for (let i = 0; i < 3; i += 1) {
+      const denied = await app.inject({ method: 'GET', url: '/x' });
+      expect(denied.statusCode).toBe(401);
+    }
+    expect(calls).toHaveLength(0);
+    await app.close();
+
+    const open = gated(0);
+    const pending = [open.send(), open.send(), open.send()];
+    await vi.waitFor(() => expect(open.calls).toHaveLength(3));
+    open.releases.forEach((release) => release());
+    for (const r of await Promise.all(pending)) expect(r.statusCode).toBe(200);
+    await open.app.close();
+  });
+
+  it('parses KEYLEASE_MAX_INFLIGHT', () => {
+    expect(resolveConfig(baseEnv).maxInFlight).toBe(1024);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_MAX_INFLIGHT: '0' }).maxInFlight).toBe(0);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_MAX_INFLIGHT: '8' }).maxInFlight).toBe(8);
+    for (const bad of ['-1', 'abc', '1.5']) {
+      expect(() => resolveConfig({ ...baseEnv, KEYLEASE_MAX_INFLIGHT: bad })).toThrow(
+        ProxyConfigError,
+      );
+    }
+  });
+});
+
+describe('access log sizes', () => {
+  it('logs request and response byte sizes without the path query', async () => {
+    const { impl } = stubFetch(() => okJson({ hello: 'world' }));
+    const lines: Array<Record<string, unknown>> = [];
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+    app.log.info = ((obj: unknown, msg?: string) => {
+      if (msg === 'access') lines.push(obj as Record<string, unknown>);
+    }) as typeof app.log.info;
+    const res = await app.inject({
+      method: 'POST',
+      url: '/echo?token=secret',
+      headers: { authorization: `Bearer ${mintToken()}`, 'content-type': 'text/plain' },
+      payload: 'abcde',
+    });
+    expect(res.statusCode).toBe(200);
+    await vi.waitFor(() => expect(lines).toHaveLength(1));
+    expect(lines[0]).toMatchObject({
+      method: 'POST',
+      path: '/echo',
+      statusCode: 200,
+      requestBytes: 5,
+      responseBytes: Number(res.headers['content-length']),
+    });
+    expect(Number(res.headers['content-length'])).toBeGreaterThan(0);
+    expect(JSON.stringify(lines[0])).not.toContain('secret');
+    await app.close();
+  });
+});
+
+describe('describeConfig', () => {
+  it('never exposes secrets or upstream credentials', () => {
+    const config = resolveConfig({
+      KEYLEASE_UPSTREAM_URL: 'https://user:pa55word@api.example.com/v1?api_key=hunter2#frag',
+      KEYLEASE_GATEWAY_SECRET: 'SABCDEFSECRETSEEDVALUE',
+      KEYLEASE_TRUST_PROXY: '10.0.0.0/8',
+    });
+    const summary = describeConfig(config);
+    const text = JSON.stringify(summary);
+    for (const leaked of ['pa55word', 'hunter2', 'SABCDEF', 'user:', 'frag']) {
+      expect(text).not.toContain(leaked);
+    }
+    expect(summary).toMatchObject({
+      upstream: 'https://api.example.com/v1',
+      onChainQuotaCommits: true,
+      trustProxy: ['10.0.0.0/8'],
+      maxInFlight: 1024,
+    });
+    expect(Object.keys(summary)).not.toContain('gatewaySecret');
+  });
+});
+
+describe('buildUpstreamHeaders property test (request-smuggling vectors)', () => {
+  // Dependency-free: a seeded mulberry32 PRNG keeps every run reproducible.
+  function prng(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const pick = <T>(rand: () => number, items: readonly T[]): T =>
+    items[Math.floor(rand() * items.length)]!;
+  const mixCase = (rand: () => number, name: string): string =>
+    [...name].map((c) => (rand() < 0.5 ? c.toUpperCase() : c.toLowerCase())).join('');
+
+  const FORBIDDEN = [
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+    'host',
+    'content-length',
+    'x-forwarded-for',
+    'x-forwarded-host',
+    'x-forwarded-proto',
+    'x-forwarded-port',
+    'x-keylease-lease-id',
+    'x-keylease-calls-remaining',
+    'authorization',
+  ];
+  const VALUES = [
+    'chunked',
+    'chunked, identity',
+    '0',
+    '5',
+    '-1',
+    'close',
+    'keep-alive, Upgrade',
+    'websocket',
+    '1.2.3.4',
+    'evil.example.com',
+    'Bearer stolen',
+    'x',
+  ];
+  const BENIGN = ['accept', 'content-type', 'user-agent', 'x-custom', 'cookie', 'x-request-id'];
+
+  it('never forwards hop-by-hop, forwarding or lease headers in any casing', () => {
+    const rand = prng(0x5eed);
+    for (let run = 0; run < 500; run += 1) {
+      const input: Record<string, string | string[]> = {};
+      const count = 1 + Math.floor(rand() * 12);
+      for (let i = 0; i < count; i += 1) {
+        const name = mixCase(rand, rand() < 0.6 ? pick(rand, FORBIDDEN) : pick(rand, BENIGN));
+        const value = pick(rand, VALUES);
+        input[name] = rand() < 0.2 ? [value, pick(rand, VALUES)] : value;
+      }
+      const out = buildUpstreamHeaders(input);
+      for (const key of Object.keys(out)) {
+        expect(key, `run ${run}: ${JSON.stringify(input)}`).toBe(key.toLowerCase());
+        expect(FORBIDDEN, `run ${run}: ${JSON.stringify(input)}`).not.toContain(key);
+        expect(key.startsWith('x-keylease-')).toBe(false);
+        expect(key.startsWith('x-forwarded-')).toBe(false);
+      }
+    }
+  });
+
+  it('keeps authorization only when forwarding is enabled and preserves benign headers', () => {
+    const rand = prng(0xc0ffee);
+    for (let run = 0; run < 200; run += 1) {
+      const name = mixCase(rand, pick(rand, BENIGN.filter((n) => n !== 'cookie')));
+      const value = pick(rand, VALUES);
+      const input = { [name]: value, [mixCase(rand, 'Authorization')]: 'Bearer t' };
+      expect(buildUpstreamHeaders(input)[name.toLowerCase()]).toBe(value);
+      expect(buildUpstreamHeaders(input).authorization).toBeUndefined();
+      expect(buildUpstreamHeaders(input, { forwardAuthorization: true }).authorization).toBe(
+        'Bearer t',
+      );
+    }
+  });
+
+  it('is deterministic for a given seed', () => {
+    const a = prng(42);
+    const b = prng(42);
+    expect([a(), a(), a()]).toEqual([b(), b(), b()]);
   });
 });

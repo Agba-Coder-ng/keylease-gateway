@@ -312,6 +312,10 @@ impl KeyleaseCore {
 
     /// Gateway-only: commit `count` served calls against a lease. Committing
     /// more calls than are left clamps at `calls_limit` instead of overflowing.
+    ///
+    /// The `calls_committed` event keeps its
+    /// `(calls_committed, consumer, lease_id)` topic tuple and publishes
+    /// `(calls_used, remaining)` so indexers do not need a second read.
     pub fn use_call(env: Env, lease_id: u64, count: u32) -> Result<Lease, Error> {
         let config = load_config(&env)?;
         config.gateway.require_auth();
@@ -329,9 +333,10 @@ impl KeyleaseCore {
 
         lease.calls_used = lease.calls_used.saturating_add(count).min(lease.calls_limit);
         store_lease(&env, &lease);
+        let remaining = lease.calls_limit.saturating_sub(lease.calls_used);
         env.events().publish(
             (Symbol::new(&env, "calls_committed"), lease.consumer.clone(), lease_id),
-            lease.calls_used,
+            (lease.calls_used, remaining),
         );
         Ok(lease)
     }

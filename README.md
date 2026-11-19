@@ -532,7 +532,14 @@ Once lease verification succeeds, the call remains consumed even if the client d
 ## Deployments
 
 Nothing in this project holds mainnet value until an audit is announced (see
-[SECURITY.md](./SECURITY.md)). Current deployment status:
+[SECURITY.md](./SECURITY.md)); the concrete gates and sign-off are in
+[docs/mainnet-readiness.md](./docs/mainnet-readiness.md).
+
+Operators: [docs/runbook.md](./docs/runbook.md) covers the startup checklist,
+HTTP 5xx diagnostics, quota drift and crash recovery, gateway key rotation and
+restarting without losing calls.
+
+Current deployment status:
 
 | Component | Network / host | Address or URL |
 | --- | --- | --- |
@@ -582,6 +589,9 @@ keylease-gateway/
 │   │       └── client/soroban.ts
 │   └── proxy/                         # @keylease/proxy
 │       └── src/{index,server,verifier,quota,cache}.ts
+├── docs/
+│   ├── runbook.md                     # operator runbook: startup, 5xx, quota, rotation
+│   └── mainnet-readiness.md           # mainnet gates, solvency checks, drill, sign-off
 ├── deployments.json                   # testnet contract ids + tx hashes
 ├── .github/workflows/ci.yml           # TS: lint/build/tsc/test · Rust: cargo test + wasm
 ├── .github/workflows/security.yml     # PR malware scan (ClamAV) + dependency review
@@ -600,7 +610,7 @@ keylease-gateway/
 pnpm contract:test # cargo test: 36 contract tests
 pnpm contract:build# stellar contract build (wasm32v1-none)
 pnpm build         # tsc emit for both packages (topological order)
-pnpm test          # vitest: 213 tests (109 CLI + 104 proxy)
+pnpm test          # vitest: 213 package tests (109 CLI + 104 proxy) + PR-title rules
 pnpm lint          # eslint (flat config, typescript-eslint)
 pnpm typecheck     # build, then tsc --noEmit in every package
 ```

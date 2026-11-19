@@ -966,3 +966,96 @@ describe('resolveConfig KEYLEASE_TRUST_PROXY', () => {
     );
   });
 });
+
+describe('in-flight upstream cap', () => {
+  const baseEnv = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
+
+  function gated(maxInFlight: number, fail = false) {
+    const releases: Array<() => void> = [];
+    const { impl, calls } = stubFetch(
+      () =>
+        new Promise<Response>((resolve, reject) => {
+          releases.push(() => (fail ? reject(new Error('boom')) : resolve(okJson({ ok: true }))));
+        }),
+    );
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState({ callsLimit: 100 }) }),
+      fetchImpl: impl,
+      maxInFlight,
+    });
+    const send = () =>
+      app.inject({
+        method: 'GET',
+        url: '/x',
+        headers: { authorization: `Bearer ${mintToken()}` },
+      });
+    return { app, calls, releases, send };
+  }
+
+  it('sheds excess requests with 503 + Retry-After and charges no quota', async () => {
+    const { app, calls, releases, send } = gated(1);
+    const first = send();
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    const shed = await send();
+    expect(shed.statusCode).toBe(503);
+    expect(shed.headers['retry-after']).toBe('1');
+    expect(shed.json()).toMatchObject({ error: 'overloaded' });
+    expect(calls).toHaveLength(1);
+    releases[0]!();
+    expect((await first).statusCode).toBe(200);
+    await app.close();
+  });
+
+  it('releases the slot after success and after upstream errors', async () => {
+    const ok = gated(1);
+    const p1 = ok.send();
+    await vi.waitFor(() => expect(ok.calls).toHaveLength(1));
+    ok.releases[0]!();
+    await p1;
+    const p2 = ok.send();
+    await vi.waitFor(() => expect(ok.calls).toHaveLength(2));
+    ok.releases[1]!();
+    expect((await p2).statusCode).toBe(200);
+    await ok.app.close();
+
+    const bad = gated(1, true);
+    const e1 = bad.send();
+    await vi.waitFor(() => expect(bad.calls).toHaveLength(1));
+    bad.releases[0]!();
+    expect((await e1).statusCode).toBe(502);
+    const e2 = bad.send();
+    await vi.waitFor(() => expect(bad.calls).toHaveLength(2));
+    bad.releases[1]!();
+    expect((await e2).statusCode).toBe(502);
+    await bad.app.close();
+  });
+
+  it('releases the slot on denials and 0 disables the cap', async () => {
+    const { app, calls } = gated(1);
+    for (let i = 0; i < 3; i += 1) {
+      const denied = await app.inject({ method: 'GET', url: '/x' });
+      expect(denied.statusCode).toBe(401);
+    }
+    expect(calls).toHaveLength(0);
+    await app.close();
+
+    const open = gated(0);
+    const pending = [open.send(), open.send(), open.send()];
+    await vi.waitFor(() => expect(open.calls).toHaveLength(3));
+    open.releases.forEach((release) => release());
+    for (const r of await Promise.all(pending)) expect(r.statusCode).toBe(200);
+    await open.app.close();
+  });
+
+  it('parses KEYLEASE_MAX_INFLIGHT', () => {
+    expect(resolveConfig(baseEnv).maxInFlight).toBe(1024);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_MAX_INFLIGHT: '0' }).maxInFlight).toBe(0);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_MAX_INFLIGHT: '8' }).maxInFlight).toBe(8);
+    for (const bad of ['-1', 'abc', '1.5']) {
+      expect(() => resolveConfig({ ...baseEnv, KEYLEASE_MAX_INFLIGHT: bad })).toThrow(
+        ProxyConfigError,
+      );
+    }
+  });
+});

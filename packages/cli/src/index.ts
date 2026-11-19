@@ -43,6 +43,9 @@ export { CliError } from './errors.js';
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
 
+/** Maximum lease duration in seconds (365 days). */
+export const MAX_DURATION_SECONDS = 365 * 24 * 60 * 60;
+
 export interface CliIo {
   out(line?: string): void;
   err(line?: string): void;
@@ -151,6 +154,17 @@ function requirePositiveInt(values: ParsedOptions, name: keyof ParsedOptions): n
   return parsed;
 }
 
+function requireDuration(values: ParsedOptions): number {
+  const duration = requirePositiveInt(values, 'duration');
+  if (duration > MAX_DURATION_SECONDS) {
+    throw new CliError(
+      `--duration must not exceed ${MAX_DURATION_SECONDS} seconds (365 days), got ${duration}`,
+      'invalid_option',
+    );
+  }
+  return duration;
+}
+
 function networkArgs(values: ParsedOptions): {
   network?: string | undefined;
   rpc?: string | undefined;
@@ -218,7 +232,7 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
         ...networkArgs(values),
         service: serviceFrom(values, options),
         calls: requirePositiveInt(values, 'calls'),
-        duration: requirePositiveInt(values, 'duration'),
+        duration: requireDuration(values),
         secret,
         dryRun,
         json: values.json === true,
@@ -333,7 +347,7 @@ Commands:
 Options:
   --service <id>       Service identifier the lease is scoped to (default: .keyleaserc.json)
   --calls <count>      Number of API calls the lease authorises
-  --duration <secs>    Lease lifetime in seconds
+  --duration <secs>    Lease lifetime in seconds (max: ${MAX_DURATION_SECONDS} / 365 days)
   --secret <key>       Stellar secret seed (S...) of the consumer account
   --dry-run            Quote the price of --calls without signing or submitting
   --lease <id>         On-chain lease id (decimal u64)

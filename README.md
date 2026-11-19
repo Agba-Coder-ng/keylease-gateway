@@ -221,8 +221,8 @@ friendbot, writes `deployments.json` (public) and
 
 | Command | Purpose |
 | --- | --- |
-| `keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>` | Invokes `create_lease` (paying the SAC token into escrow) and prints a signed session bearer token |
-| `keylease acquire --service <id> --calls <n> --duration <secs> --dry-run` | Quotes the price of those calls without signing, creating a lease or storing a session |
+| `keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>` | Invokes `create_lease` (paying the SAC token into escrow) and prints a signed session bearer token; `--duration` max is 365 days |
+| `keylease acquire --service <id> --calls <n> --duration <secs> --dry-run` | Quotes the price of those calls without signing, creating a lease or storing a session; `--duration` max is 365 days |
 | `keylease env --service <id> [--file .env]` | Writes the temporary keys of an acquired lease into a local `.env` |
 | `keylease status --lease <id>` | Reads live lease state by simulating `get_lease` |
 | `keylease status --token <token>` | Verifies a session token offline |

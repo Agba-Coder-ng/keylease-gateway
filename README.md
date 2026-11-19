@@ -278,6 +278,14 @@ lease first; if it is corrupt, back it up or repair it before retrying.
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
 | `get_lease(id)` · `get_service(id)` · `get_config()` · `remaining_calls(id)` | – | Views used by the CLI and proxy |
+| `version()` | – | Contract ABI version as a `String`, equal to the crate version in `Cargo.toml`; callable before `init` |
+
+`version()` follows semver on the contract ABI: **patch** for internal fixes
+with no interface change, **minor** for additive changes (new entry points,
+views, error variants or events), **major** for breaking changes (removed or
+renamed entry points, changed arguments or storage layout). Bump
+`contracts/keylease-core/Cargo.toml` with every contract change; clients should
+refuse a major version they do not recognise.
 
 Storage: `Config` in instance storage; `Service(String)` and `Lease(u64)` as
 persistent entries with TTL bumps (`MIN_TTL` 7 days, `EXTEND_TO` 30 days).

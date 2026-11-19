@@ -1,6 +1,6 @@
 extern crate std;
 
-use crate::{Error, KeyleaseCore, KeyleaseCoreClient, Lease};
+use crate::{Error, KeyleaseCore, KeyleaseCoreClient, Lease, CONTRACT_VERSION};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
@@ -62,6 +62,21 @@ fn init_is_one_time_and_exposes_config() {
 
     let err = h.client.try_init(&h.admin, &h.token, &h.gateway).unwrap_err();
     assert_eq!(err.unwrap(), Error::AlreadyInitialized);
+}
+
+#[test]
+fn version_matches_the_crate_version() {
+    let h = setup();
+    assert_eq!(CONTRACT_VERSION, env!("CARGO_PKG_VERSION"));
+    assert_eq!(h.client.version(), String::from_str(&h.env, CONTRACT_VERSION));
+}
+
+#[test]
+fn version_is_readable_before_init() {
+    let env = Env::default();
+    let contract_id = env.register(KeyleaseCore, ());
+    let client = KeyleaseCoreClient::new(&env, &contract_id);
+    assert_eq!(client.version(), String::from_str(&env, env!("CARGO_PKG_VERSION")));
 }
 
 #[test]

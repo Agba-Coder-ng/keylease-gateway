@@ -18,6 +18,11 @@ import {
   type SettleArgs,
   type SettleDeps,
 } from './commands/lifecycle.js';
+import {
+  sessionsCommand,
+  type SessionsArgs,
+  type SessionsDeps,
+} from './commands/sessions.js';
 
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
@@ -39,7 +44,7 @@ export class CliError extends Error {
   }
 }
 
-export type CommandName = 'acquire' | 'env' | 'status' | 'settle' | 'revoke';
+export type CommandName = 'acquire' | 'env' | 'status' | 'settle' | 'revoke' | 'sessions';
 
 export type Invocation =
   | { command: 'help' }
@@ -48,7 +53,8 @@ export type Invocation =
   | { command: 'env'; args: EnvArgs }
   | { command: 'status'; args: StatusArgs }
   | { command: 'settle'; args: SettleArgs }
-  | { command: 'revoke'; args: RevokeArgs };
+  | { command: 'revoke'; args: RevokeArgs }
+  | { command: 'sessions'; args: SessionsArgs };
 
 export interface RunDeps {
   acquire?: AcquireDeps;
@@ -56,6 +62,7 @@ export interface RunDeps {
   status?: StatusDeps;
   settle?: SettleDeps;
   revoke?: RevokeDeps;
+  sessions?: SessionsDeps;
 }
 
 const OPTION_SPEC = {
@@ -70,6 +77,8 @@ const OPTION_SPEC = {
   contract: { type: 'string' },
   file: { type: 'string' },
   json: { type: 'boolean' },
+  'check-chain': { type: 'boolean' },
+  prune: { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
 } as const;
 
@@ -189,10 +198,14 @@ export function parseArgv(argv: string[]): Invocation {
         ...networkArgs(values),
         lease: optionalString(values, 'lease'),
         token: optionalString(values, 'token'),
+        checkChain: values['check-chain'] === true,
         json: values.json === true,
       };
       if (!args.lease && !args.token) {
         throw new CliError('status requires either --lease <id> or --token <session-token>', 'missing_option');
+      }
+      if (args.checkChain && !args.token) {
+        throw new CliError('--check-chain requires --token <session-token>', 'invalid_option');
       }
       return { command: 'status', args };
     }
@@ -220,9 +233,16 @@ export function parseArgv(argv: string[]): Invocation {
         },
       };
     }
+    case 'sessions': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'sessions',
+        args: { prune: values.prune === true, json: values.json === true },
+      };
+    }
     default:
       throw new CliError(
-        `unknown command "${rawCommand}" (expected acquire, env, status, settle or revoke)`,
+        `unknown command "${rawCommand}" (expected acquire, env, status, settle, revoke or sessions)`,
         'unknown_command',
       );
   }
@@ -234,9 +254,10 @@ export function renderHelp(): string {
 Usage:
   ${CLI_NAME} acquire --service <id> --calls <count> --duration <secs> --secret <key>
   ${CLI_NAME} env     --service <id> [--file <path>]
-  ${CLI_NAME} status  --lease <id> | --token <session-token>
+  ${CLI_NAME} status  --lease <id> | --token <session-token> [--check-chain]
   ${CLI_NAME} settle  --lease <id> --secret <key>
   ${CLI_NAME} revoke  --lease <id> --secret <key>
+  ${CLI_NAME} sessions [--prune] [--json]
   ${CLI_NAME} help | --version
 
 Commands:
@@ -245,6 +266,7 @@ Commands:
   status    Inspect an on-chain lease, or verify a session token offline
   settle    Settle an expired/exhausted lease: pay the provider, refund the consumer
   revoke    End a lease early and refund its unused calls
+  sessions  List locally stored leases or prune expired entries
 
 Options:
   --service <id>       Service identifier the lease is scoped to (required)
@@ -253,10 +275,12 @@ Options:
   --secret <key>       Stellar secret seed (S...) of the consumer account
   --lease <id>         On-chain lease id (decimal u64)
   --token <token>      Session bearer token to verify offline
+  --check-chain        Check the token's current lease over Soroban RPC
   --file <path>        Target env file for "env" (default: .env)
   --network <name>     testnet | mainnet | local (default: testnet)
   --rpc <url>          Soroban RPC endpoint override
   --contract <id>      keylease-core contract id override
+  --prune              Remove expired sessions (for "sessions")
   --json               Machine-readable JSON output
   -h, --help           Show this help
 `;
@@ -307,6 +331,8 @@ export async function run(
         return await settleCommand(invocation.args, io, deps.settle);
       case 'revoke':
         return await revokeCommand(invocation.args, io, deps.revoke);
+      case 'sessions':
+        return await sessionsCommand(invocation.args, io, deps.sessions);
     }
   } catch (error) {
     if (error instanceof CliError) {

@@ -40,6 +40,10 @@ function memoryStore(initial: Record<string, LeaseSession> = {}) {
     save: async (session: LeaseSession) => {
       sessions[session.service] = session;
     },
+    saveAll: async (next: Record<string, LeaseSession>) => {
+      for (const service of Object.keys(sessions)) delete sessions[service];
+      Object.assign(sessions, next);
+    },
   };
 }
 
@@ -268,8 +272,6 @@ describe('fileSessionStore', () => {
 
   it('round-trips sessions through disk', async () => {
     const store = fileSessionStore(dir);
-    expect(await store.load()).toEqual({});
-
     await store.save({
       service: 'weather-api',
       leaseId: 'lease-1',
@@ -286,11 +288,17 @@ describe('fileSessionStore', () => {
     expect(reloaded['weather-api']?.leaseId).toBe('lease-1');
   });
 
-  it('treats a corrupt store as empty', async () => {
+  it('rejects a corrupt store with an actionable error', async () => {
     const { mkdir, writeFile } = await import('node:fs/promises');
     await mkdir(join(dir, '.keylease'), { recursive: true });
     await writeFile(join(dir, '.keylease', 'sessions.json'), 'not json');
     const store = fileSessionStore(dir);
-    await expect(store.load()).resolves.toEqual({});
+    await expect(store.load()).rejects.toThrow(/Cannot read session store.*corrupt.*Back up or repair/);
+  });
+
+  it('reports a missing store with guidance to acquire a lease', async () => {
+    await expect(fileSessionStore(dir).load()).rejects.toThrow(
+      /Cannot read session store.*missing.*keylease acquire/,
+    );
   });
 });

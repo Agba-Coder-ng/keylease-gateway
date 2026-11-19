@@ -44,6 +44,23 @@ export interface LeaseSession {
 export interface SessionStore {
   load(): Promise<Record<string, LeaseSession>>;
   save(session: LeaseSession): Promise<void>;
+  saveAll(sessions: Record<string, LeaseSession>): Promise<void>;
+}
+
+export class SessionStoreError extends Error {
+  constructor(
+    readonly code: 'missing' | 'corrupt' | 'unreadable',
+    path: string,
+  ) {
+    const guidance =
+      code === 'missing'
+        ? 'Run `keylease acquire` to create a stored lease.'
+        : code === 'corrupt'
+          ? 'Back up or repair the file, then run this command again.'
+          : 'Check file permissions and try again.';
+    super(`Cannot read session store at ${path}: ${code}. ${guidance}`);
+    this.name = 'SessionStoreError';
+  }
 }
 
 export interface AcquireDeps {
@@ -58,6 +75,25 @@ export interface EnvDeps {
   writeFile?: (path: string, contents: string) => Promise<void>;
 }
 
+function isLeaseSession(value: unknown): value is LeaseSession {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const session = value as Record<string, unknown>;
+  return (
+    typeof session['service'] === 'string' &&
+    typeof session['leaseId'] === 'string' &&
+    typeof session['consumer'] === 'string' &&
+    typeof session['token'] === 'string' &&
+    typeof session['callsLimit'] === 'number' &&
+    Number.isFinite(session['callsLimit']) &&
+    typeof session['issuedAt'] === 'number' &&
+    Number.isFinite(session['issuedAt']) &&
+    typeof session['expiresAt'] === 'number' &&
+    Number.isFinite(session['expiresAt']) &&
+    (typeof session['txHash'] === 'string' || session['txHash'] === null) &&
+    typeof session['network'] === 'string'
+  );
+}
+
 /** File-backed store, one JSON document keyed by service id. */
 export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
   const path = isAbsolute(SESSION_STORE_PATH)
@@ -66,20 +102,44 @@ export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
 
   return {
     async load(): Promise<Record<string, LeaseSession>> {
+      let raw: string;
       try {
-        const raw = await readFile(path, 'utf8');
-        const parsed: unknown = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          return parsed as Record<string, LeaseSession>;
-        }
-      } catch {
-        // Missing or corrupt store: treat as empty.
+        raw = await readFile(path, 'utf8');
+      } catch (error) {
+        const code =
+          error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+        throw new SessionStoreError(code === 'ENOENT' ? 'missing' : 'unreadable', path);
       }
-      return {};
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new SessionStoreError('corrupt', path);
+      }
+
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new SessionStoreError('corrupt', path);
+      }
+      const sessions: Record<string, LeaseSession> = {};
+      for (const [service, session] of Object.entries(parsed)) {
+        if (!isLeaseSession(session)) throw new SessionStoreError('corrupt', path);
+        sessions[service] = session;
+      }
+      return sessions;
     },
     async save(session: LeaseSession): Promise<void> {
-      const sessions = await this.load();
+      let sessions: Record<string, LeaseSession>;
+      try {
+        sessions = await this.load();
+      } catch (error) {
+        if (!(error instanceof SessionStoreError) || error.code !== 'missing') throw error;
+        sessions = {};
+      }
       sessions[session.service] = session;
+      await this.saveAll(sessions);
+    },
+    async saveAll(sessions: Record<string, LeaseSession>): Promise<void> {
       await mkdir(dirname(path), { recursive: true });
       await writeFile(path, `${JSON.stringify(sessions, null, 2)}\n`, { mode: 0o600 });
     },

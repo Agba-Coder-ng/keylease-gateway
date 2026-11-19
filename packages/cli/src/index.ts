@@ -317,6 +317,11 @@ Options:
   --prune              Remove expired sessions (for "sessions")
   --json               Machine-readable JSON output
   -h, --help           Show this help
+
+Error reference:
+  Contract errors are documented at:
+  https://github.com/KeyLease-Security/keylease-gateway#contract-reference
+  See the "Contract failures" section for error codes and meanings.
 `;
 }
 

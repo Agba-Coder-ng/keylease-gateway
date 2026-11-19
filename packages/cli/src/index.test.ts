@@ -219,6 +219,49 @@ describe('parseArgv', () => {
       expect(error.message).toContain(url);
       expect(error.message).toContain('localhost');
     }
+  it('parses --dry-run acquire without a secret', () => {
+    const invocation = parseArgv([
+      'acquire',
+      '--service',
+      'weather-api',
+      '--calls',
+      '5',
+      '--duration',
+      '300',
+      '--dry-run',
+    ]);
+    expect(invocation.command).toBe('acquire');
+    expect((invocation as { args: AcquireArgs }).args).toMatchObject({
+      service: 'weather-api',
+      calls: 5,
+      duration: 300,
+      secret: undefined,
+      dryRun: true,
+      json: false,
+    });
+
+    const withSecret = parseArgv([
+      'acquire',
+      '--service',
+      'weather-api',
+      '--calls',
+      '5',
+      '--duration',
+      '300',
+      '--dry-run',
+      '--secret',
+      SECRET,
+    ]);
+    expect((withSecret as { args: AcquireArgs }).args.dryRun).toBe(true);
+    expect((withSecret as { args: AcquireArgs }).args.secret).toBe(SECRET);
+  });
+
+  it('requires --secret unless --dry-run is set', () => {
+    const error = expectCliError(
+      () => parseArgv(['acquire', '--service', 'x', '--calls', '1', '--duration', '1']),
+      'missing_option',
+    );
+    expect(error.message).toContain('--dry-run');
   });
 
   it('requires --service, --calls, --duration and --secret for acquire', () => {
@@ -384,10 +427,13 @@ describe('renderHelp', () => {
       'env',
       'status',
       'sessions',
+      'completions',
       '--prune',
       '--check-chain',
+      '--dry-run',
       '--secret',
       '--service',
+      '.keyleaserc.json',
     ]) {
       expect(help).toContain(needle);
     }
@@ -440,6 +486,7 @@ describe('run', () => {
           now: () => NOW_MS,
           store,
           createClient: () => ({
+            quote: async () => 10,
             createLease: async (params) => {
               seen.push(params);
               return { leaseId: 'lease-abc', txHash: 'deadbeef' };
@@ -467,6 +514,7 @@ describe('run', () => {
       {
         acquire: {
           createClient: () => ({
+            quote: async () => 10,
             createLease: async () => {
               throw new Error('rpc exploded');
             },

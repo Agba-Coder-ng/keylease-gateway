@@ -1,8 +1,9 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { Keypair } from '@stellar/stellar-sdk';
 import { mintSessionToken } from '../token.js';
 import { SorobanClient, type CreateLeaseResult } from '../client/soroban.js';
+import { CliError } from '../errors.js';
 import type { CliIo } from '../index.js';
 
 /**
@@ -36,7 +37,9 @@ export interface AcquireArgs extends NetworkArgs {
   service: string;
   calls: number;
   duration: number;
-  secret: string;
+  /** Consumer secret seed; required unless `dryRun` is set. */
+  secret?: string | undefined;
+  dryRun: boolean;
   json: boolean;
 }
 
@@ -68,22 +71,100 @@ export interface SessionStore {
 
 export class SessionStoreError extends Error {
   constructor(
-    readonly code: 'missing' | 'corrupt' | 'unreadable',
+    readonly code: 'missing' | 'corrupt' | 'unreadable' | 'locked',
     path: string,
   ) {
-    const guidance =
-      code === 'missing'
-        ? 'Run `keylease acquire` to create a stored lease.'
-        : code === 'corrupt'
-          ? 'Back up or repair the file, then run this command again.'
-          : 'Check file permissions and try again.';
-    super(`Cannot read session store at ${path}: ${code}. ${guidance}`);
+    if (code === 'locked') {
+      super(
+        `Cannot write session store at ${path}: locked. Another keylease process holds ` +
+          `${path}.lock; wait for it to finish, or delete the lock file if no keylease ` +
+          'command is running.',
+      );
+    } else {
+      const guidance =
+        code === 'missing'
+          ? 'Run `keylease acquire` to create a stored lease.'
+          : code === 'corrupt'
+            ? 'Back up or repair the file, then run this command again.'
+            : 'Check file permissions and try again.';
+      super(`Cannot read session store at ${path}: ${code}. ${guidance}`);
+    }
     this.name = 'SessionStoreError';
   }
 }
 
+export interface FileSessionStoreOptions {
+  /** How long to wait for another process's lock before giving up. */
+  lockTimeoutMs?: number;
+  /** A lock file older than this is considered abandoned and removed once. */
+  staleLockMs?: number;
+}
+
+const DEFAULT_LOCK_TIMEOUT_MS = 2_000;
+const DEFAULT_STALE_LOCK_MS = 10_000;
+const LOCK_POLL_MS = 25;
+
+/** Per-path tail of the in-process write queue. */
+const pendingWrites = new Map<string, Promise<unknown>>();
+
+function errorCode(error: unknown): unknown {
+  return error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+}
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Takes an exclusive `<path>.lock` (O_CREAT | O_EXCL) for cross-process
+ * safety. A lock older than `staleLockMs` is removed and retried once; if the
+ * lock is still held after `timeoutMs`, fails with a `locked` error.
+ */
+async function acquireLock(
+  path: string,
+  timeoutMs: number,
+  staleLockMs: number,
+): Promise<() => Promise<void>> {
+  const lockPath = `${path}.lock`;
+  const deadline = Date.now() + timeoutMs;
+  let removedStale = false;
+  for (;;) {
+    try {
+      const handle = await open(lockPath, 'wx', 0o600);
+      await handle.writeFile(`${process.pid}\n`);
+      await handle.close();
+      return async () => {
+        await unlink(lockPath).catch(() => undefined);
+      };
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') throw error;
+    }
+
+    if (!removedStale) {
+      const info = await stat(lockPath).catch(() => null);
+      if (info && Date.now() - info.mtimeMs > staleLockMs) {
+        removedStale = true;
+        await unlink(lockPath).catch(() => undefined);
+        continue;
+      }
+    }
+    if (Date.now() >= deadline) throw new SessionStoreError('locked', path);
+    await delay(LOCK_POLL_MS);
+  }
+}
+
+/** Writes `contents` to a sibling temp file, then renames it over `path`. */
+async function writeAtomic(path: string, contents: string): Promise<void> {
+  const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    await writeFile(tmp, contents, { mode: 0o600 });
+    await rename(tmp, path);
+  } catch (error) {
+    await unlink(tmp).catch(() => undefined);
+    throw error;
+  }
+}
+
 export interface AcquireDeps {
-  createClient?: (args: AcquireArgs) => Pick<SorobanClient, 'createLease'>;
+  createClient?: (args: AcquireArgs) => Pick<SorobanClient, 'createLease' | 'quote'>;
   store?: SessionStore;
   now?: () => number;
 }
@@ -201,9 +282,48 @@ export function selectLease(
  *   Created with mode 0o600 (owner read/write only) to protect sensitive tokens.
  */
 export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
+/**
+ * File-backed store, one JSON document keyed by service id.
+ *
+ * This is a local cache, not a database. Writes are serialized per path within
+ * the process, guarded across processes by a best-effort `<path>.lock` file,
+ * and land via an atomic temp-file rename so readers never see a torn file.
+ */
+export function fileSessionStore(
+  cwd: string = process.cwd(),
+  options: FileSessionStoreOptions = {},
+): SessionStore {
   const path = isAbsolute(SESSION_STORE_PATH)
     ? SESSION_STORE_PATH
     : join(cwd, SESSION_STORE_PATH);
+  const lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+  const staleLockMs = options.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
+
+  /** Runs `task` after every earlier write to `path` in this process, under the file lock. */
+  function exclusive<T>(task: () => Promise<T>): Promise<T> {
+    const previous = pendingWrites.get(path) ?? Promise.resolve();
+    const run = previous
+      .catch(() => undefined)
+      .then(async () => {
+        await mkdir(dirname(path), { recursive: true });
+        const release = await acquireLock(path, lockTimeoutMs, staleLockMs);
+        try {
+          return await task();
+        } finally {
+          await release();
+        }
+      });
+    pendingWrites.set(path, run);
+    void run
+      .finally(() => {
+        if (pendingWrites.get(path) === run) pendingWrites.delete(path);
+      })
+      .catch(() => undefined);
+    return run;
+  }
+
+  const writeSessions = (sessions: Record<string, LeaseSession>): Promise<void> =>
+    writeAtomic(path, `${JSON.stringify(sessions, null, 2)}\n`);
 
   return {
     async load(): Promise<Record<string, LeaseSession[]>> {
@@ -211,9 +331,7 @@ export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
       try {
         raw = await readFile(path, 'utf8');
       } catch (error) {
-        const code =
-          error && typeof error === 'object' && 'code' in error ? error.code : undefined;
-        throw new SessionStoreError(code === 'ENOENT' ? 'missing' : 'unreadable', path);
+        throw new SessionStoreError(errorCode(error) === 'ENOENT' ? 'missing' : 'unreadable', path);
       }
 
       let parsed: unknown;
@@ -255,6 +373,20 @@ export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
     async saveAll(sessions: Record<string, LeaseSession[]>): Promise<void> {
       await mkdir(dirname(path), { recursive: true });
       await writeFile(path, `${JSON.stringify(sessions, null, 2)}\n`, { mode: 0o600 });
+      await exclusive(async () => {
+        let sessions: Record<string, LeaseSession>;
+        try {
+          sessions = await this.load();
+        } catch (error) {
+          if (!(error instanceof SessionStoreError) || error.code !== 'missing') throw error;
+          sessions = {};
+        }
+        sessions[session.service] = session;
+        await writeSessions(sessions);
+      });
+    },
+    async saveAll(sessions: Record<string, LeaseSession>): Promise<void> {
+      await exclusive(() => writeSessions(sessions));
     },
   };
 }
@@ -267,7 +399,7 @@ export function parseConsumerSecret(secret: string): Keypair {
   }
 }
 
-function defaultCreateClient(args: AcquireArgs): Pick<SorobanClient, 'createLease'> {
+function defaultCreateClient(args: AcquireArgs): Pick<SorobanClient, 'createLease' | 'quote'> {
   return SorobanClient.fromEnv({
     KEYLEASE_NETWORK: args.network,
     KEYLEASE_RPC_URL: args.rpc,
@@ -305,6 +437,44 @@ function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): v
   io.out(`  Authorization: Bearer ${session.token}`);
 }
 
+interface DryRunSummary {
+  service: string;
+  calls: number;
+  duration: number;
+  price: number;
+  expiresAt: number;
+  consumer: string | undefined;
+}
+
+function renderDryRunOutput(summary: DryRunSummary, io: CliIo, json: boolean): void {
+  if (json) {
+    io.out(
+      JSON.stringify(
+        {
+          dry_run: true,
+          service: summary.service,
+          calls: summary.calls,
+          duration: summary.duration,
+          price: summary.price,
+          expires_at: summary.expiresAt,
+          consumer: summary.consumer ?? null,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
+  io.out(`Dry run: quote for ${summary.calls} calls on "${summary.service}" (nothing signed or submitted)`);
+  io.out(`  service    : ${summary.service}`);
+  io.out(`  calls      : ${summary.calls}`);
+  io.out(`  duration   : ${summary.duration}s`);
+  io.out(`  price      : ${summary.price} (token smallest units, quoted from keylease-core)`);
+  if (summary.consumer !== undefined) io.out(`  consumer   : ${summary.consumer}`);
+  io.out(`  expires at : ${new Date(summary.expiresAt * 1000).toISOString()} (if acquired now)`);
+}
+
 /**
  * `keylease acquire --service <id> --calls <count> --duration <secs> --secret <key>`
  *
@@ -316,16 +486,44 @@ function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): v
  *   - New lease: appended to the service's array
  *   - Same leaseId: replaced in-place (e.g., on retry or renewal with tx hash update)
  *   - env command: automatically selects newest unexpired lease
+ * Invokes `create_lease` on `keylease-core`, then mints an ed25519-signed
+ * session bearer token bound to `(lease_id, consumer)`.
+ *
+ * With `--dry-run` the price is read through `quote` instead: nothing is signed,
+ * no lease is created, and no session is written to the local store.
  */
 export async function acquireCommand(
   args: AcquireArgs,
   io: CliIo,
   deps: AcquireDeps = {},
 ): Promise<number> {
-  const consumer = parseConsumerSecret(args.secret);
   const createClient = deps.createClient ?? defaultCreateClient;
   const store = deps.store ?? fileSessionStore();
   const now = deps.now ?? (() => Date.now());
+  const consumer = args.secret === undefined ? undefined : parseConsumerSecret(args.secret);
+
+  if (args.dryRun) {
+    const client = createClient(args);
+    const price = await client.quote(args.service, args.calls);
+    const expiresAt = Math.floor(now() / 1000) + args.duration;
+    renderDryRunOutput(
+      {
+        service: args.service,
+        calls: args.calls,
+        duration: args.duration,
+        price,
+        expiresAt,
+        consumer: consumer?.publicKey(),
+      },
+      io,
+      args.json,
+    );
+    return 0;
+  }
+
+  if (consumer === undefined || args.secret === undefined) {
+    throw new CliError('--secret is required unless --dry-run is set', 'missing_option');
+  }
 
   const result: CreateLeaseResult = await createClient(args).createLease({
     service: args.service,
@@ -373,6 +571,21 @@ export function envEntriesFor(session: LeaseSession): Record<string, string> {
   };
 }
 
+/** Values made only of shell-safe characters are written without quotes. */
+const ENV_BARE_VALUE = /^[A-Za-z0-9_.:@/-]+$/;
+
+/**
+ * Renders a value for a `.env` file meant to be sourced by a POSIX shell.
+ *
+ * Plain values stay bare for readability; anything that could be split, quoted
+ * or expanded (`space`, `#`, `$`, `"`, `\\`, empty) is double-quoted with `\\`,
+ * `"` and `$` escaped, so the shell reads back exactly the original value.
+ */
+export function quoteEnvValue(value: string): string {
+  if (ENV_BARE_VALUE.test(value)) return value;
+  return `"${value.replace(/[\\"$]/g, (char) => `\\${char}`)}"`;
+}
+
 /**
  * Merges key/value pairs into existing `.env` text: unknown lines are kept
  * verbatim, previously set `KEY` are replaced in place, new keys appended.
@@ -388,6 +601,7 @@ export function mergeEnv(existing: string, entries: Record<string, string>): str
     if (key in entries && !emitted.has(key)) {
       emitted.add(key);
       return `${exportPrefix}${key}=${entries[key]}`;
+      return `${key}=${quoteEnvValue(entries[key] as string)}`;
     }
     if (key in entries) return null; // drop duplicates
     return line;
@@ -401,7 +615,7 @@ export function mergeEnv(existing: string, entries: Record<string, string>): str
   for (const [key, value] of Object.entries(entries)) {
     if (!emitted.has(key)) {
       emitted.add(key);
-      out.push(`${key}=${value}`);
+      out.push(`${key}=${quoteEnvValue(value)}`);
     }
   }
 

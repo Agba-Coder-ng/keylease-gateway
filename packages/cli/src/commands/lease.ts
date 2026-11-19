@@ -262,12 +262,13 @@ export function mergeEnv(existing: string, entries: Record<string, string>): str
   const lines = existing.length > 0 ? existing.split('\n') : [];
   const emitted = new Set<string>();
   const out = lines.map((line) => {
-    const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line.trimEnd());
+    const match = /^(export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line.trimEnd());
     if (!match) return line;
-    const key = match[1] as string;
+    const exportPrefix = match[1] ?? '';
+    const key = match[2] as string;
     if (key in entries && !emitted.has(key)) {
       emitted.add(key);
-      return `${key}=${entries[key]}`;
+      return `${exportPrefix}${key}=${entries[key]}`;
     }
     if (key in entries) return null; // drop duplicates
     return line;

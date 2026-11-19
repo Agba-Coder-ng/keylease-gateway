@@ -259,6 +259,42 @@ lease is active or expired. Add `--json` for machine-readable output, or
 `--prune` to remove expired entries. If the session store is missing, acquire a
 lease first; if it is corrupt, back it up or repair it before retrying.
 
+#### Environment file merge rule
+
+When `keylease env` writes to a `.env` file, it merges the new session keys with
+existing content according to these rules:
+
+- Matching keys are replaced in place, preserving their relative line order and
+  any `export` prefix from the original assignment
+- Duplicate assignments of the same key (whether prefixed with `export` or not)
+  are deduplicated — only the first occurrence is kept, updated with the new
+  value; subsequent duplicates are dropped
+- Non-matching lines and comments are preserved as-is
+- New keys that don't already exist are appended at the end
+- The file always ends with a single newline
+
+Example: starting with this `.env`:
+
+```bash
+export KEYLEASE_SESSION_TOKEN=old_value
+OTHER_VAR=keep_me
+KEYLEASE_SESSION_TOKEN=duplicate  # This line will be dropped
+# My comment
+```
+
+Running `keylease env --service my-api` with a new token produces:
+
+```bash
+export KEYLEASE_SESSION_TOKEN=new_value
+OTHER_VAR=keep_me
+# My comment
+KEYLEASE_SERVICE=my-api
+KEYLEASE_LEASE_ID=...
+```
+
+This ensures that stale or duplicate exported tokens cannot accidentally shadow
+the active lease credentials in shells that process both lines.
+
 ---
 
 ## Contract reference

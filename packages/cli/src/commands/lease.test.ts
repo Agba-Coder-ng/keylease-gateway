@@ -180,6 +180,43 @@ describe('mergeEnv', () => {
     const twice = mergeEnv(once, { KEYLEASE_SERVICE: 'x' });
     expect(twice).toBe(once);
   });
+
+  it('preserves export prefix when rewriting exported keys', () => {
+    const existing = 'export KEYLEASE_SESSION_TOKEN=old\n';
+    const merged = mergeEnv(existing, { KEYLEASE_SESSION_TOKEN: 'new' });
+    expect(merged).toBe('export KEYLEASE_SESSION_TOKEN=new\n');
+  });
+
+  it('drops duplicate assignments with mixed export prefixes', () => {
+    const existing = ['export KEYLEASE_SESSION_TOKEN=old', 'KEYLEASE_SESSION_TOKEN=also-old', ''].join('\n');
+    const merged = mergeEnv(existing, { KEYLEASE_SESSION_TOKEN: 'new' });
+    expect(merged).toBe('export KEYLEASE_SESSION_TOKEN=new\n');
+  });
+
+  it('handles mixed exported and unexported keys', () => {
+    const existing = [
+      'export KEYLEASE_SERVICE=weather-api',
+      'KEYLEASE_LEASE_ID=lease-old',
+      'OTHER_VAR=value',
+      'export OTHER_EXPORTED=data',
+    ].join('\n');
+    const merged = mergeEnv(existing, {
+      KEYLEASE_SERVICE: 'updated-service',
+      KEYLEASE_SESSION_TOKEN: 'kls1.new',
+    });
+    expect(merged).toContain('export KEYLEASE_SERVICE=updated-service');
+    expect(merged).toContain('KEYLEASE_SESSION_TOKEN=kls1.new');
+    expect(merged).toContain('OTHER_VAR=value');
+    expect(merged).toContain('export OTHER_EXPORTED=data');
+    expect(merged).not.toContain('KEYLEASE_LEASE_ID');
+  });
+
+  it('handles trailing comments after values', () => {
+    const existing = 'A=old # this is a comment\nB=value\n';
+    const merged = mergeEnv(existing, { A: 'new' });
+    // Note: mergeEnv captures everything after = as the value, including comments
+    expect(merged).toBe('A=new # this is a comment\nB=value\n');
+  });
 });
 
 describe('envCommand', () => {

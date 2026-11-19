@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { Keypair } from '@stellar/stellar-sdk';
 import { mintSessionToken } from '../token.js';
 import { SorobanClient, type CreateLeaseResult } from '../client/soroban.js';
@@ -18,7 +19,7 @@ export interface AcquireArgs extends NetworkArgs {
   service: string;
   calls: number;
   duration: number;
-  secret: string;
+  secret: string | undefined;
   json: boolean;
 }
 
@@ -67,6 +68,7 @@ export interface AcquireDeps {
   createClient?: (args: AcquireArgs) => Pick<SorobanClient, 'createLease'>;
   store?: SessionStore;
   now?: () => number;
+  readSecretFromStdin?: () => Promise<string>;
 }
 
 export interface EnvDeps {
@@ -146,6 +148,71 @@ export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
   };
 }
 
+/**
+ * Resolves the consumer secret with precedence: flag value > KEYLEASE_SECRET env var > stdin.
+ * If secret is '-', reads one line from stdin without echoing (like `read -s`).
+ * If secret is undefined, checks KEYLEASE_SECRET environment variable.
+ * If neither is provided, reads from stdin.
+ * 
+ * @param secretArg - The --secret flag value (may be '-' for stdin or undefined for env/stdin fallback)
+ * @param deps - Optional dependencies for reading from stdin (used for testing)
+ */
+export async function resolveConsumerSecret(
+  secretArg: string | undefined,
+  deps?: { readSecretFromStdin?: () => Promise<string> },
+): Promise<string> {
+  // Precedence 1: --secret flag value (except '-' which means stdin)
+  if (secretArg && secretArg !== '-') {
+    return secretArg;
+  }
+
+  // Precedence 2: KEYLEASE_SECRET environment variable
+  const envSecret = process.env['KEYLEASE_SECRET'];
+  if (envSecret && secretArg !== '-') {
+    return envSecret;
+  }
+
+  // Precedence 3 or fallback: Read from stdin without echoing
+  const reader = deps?.readSecretFromStdin ?? readSecretFromStdin;
+  return reader();
+}
+
+/**
+ * Reads one line from stdin without echoing, similar to `read -s` in bash.
+ */
+export async function readSecretFromStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stderr, // Write prompts to stderr to keep stdout clean
+    });
+
+    // Disable echo on the input stream
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
+
+    rl.question('', (secret) => {
+      // Restore normal mode and output a newline
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      process.stderr.write('\n');
+      rl.close();
+      resolve(secret);
+    });
+
+    // Handle errors
+    rl.on('error', (error) => {
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+      rl.close();
+      reject(error);
+    });
+  });
+}
+
 export function parseConsumerSecret(secret: string): Keypair {
   try {
     return Keypair.fromSecret(secret);
@@ -193,17 +260,26 @@ function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): v
 }
 
 /**
- * `keylease acquire --service <id> --calls <count> --duration <secs> --secret <key>`
+ * `keylease acquire --service <id> --calls <count> --duration <secs> [--secret <key>]`
  *
  * Invokes `create_lease` on `keylease-core`, then mints an ed25519-signed
  * session bearer token bound to `(lease_id, consumer)`.
+ * 
+ * Secret resolution (precedence: flag > env > stdin):
+ * - If --secret is provided (and not '-'), use it directly
+ * - If --secret - or not provided, check KEYLEASE_SECRET env var
+ * - If env var is set, use it
+ * - Otherwise, read from stdin without echoing
  */
 export async function acquireCommand(
   args: AcquireArgs,
   io: CliIo,
   deps: AcquireDeps = {},
 ): Promise<number> {
-  const consumer = parseConsumerSecret(args.secret);
+  const secret = await resolveConsumerSecret(args.secret, {
+    readSecretFromStdin: deps.readSecretFromStdin,
+  });
+  const consumer = parseConsumerSecret(secret);
   const createClient = deps.createClient ?? defaultCreateClient;
   const store = deps.store ?? fileSessionStore();
   const now = deps.now ?? (() => Date.now());
@@ -219,7 +295,7 @@ export async function acquireCommand(
   const expiresAt = issuedAt + args.duration;
   const token = mintSessionToken({
     leaseId: result.leaseId,
-    consumerSecret: args.secret,
+    consumerSecret: secret,
     issuedAt,
     expiresAt,
   });

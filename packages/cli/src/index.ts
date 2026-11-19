@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import {
   acquireCommand,
   envCommand,
+  resolveConsumerSecret,
   type AcquireArgs,
   type AcquireDeps,
   type EnvArgs,
@@ -173,12 +174,13 @@ export function parseArgv(argv: string[]): Invocation {
   switch (rawCommand) {
     case 'acquire': {
       ensureNoPositionals(positionals);
+      const secretArg = optionalString(values, 'secret');
       const args: AcquireArgs = {
         ...networkArgs(values),
         service: requireString(values, 'service'),
         calls: requirePositiveInt(values, 'calls'),
         duration: requirePositiveInt(values, 'duration'),
-        secret: requireString(values, 'secret'),
+        secret: secretArg,
         json: values.json === true,
       };
       return { command: 'acquire', args };
@@ -216,7 +218,7 @@ export function parseArgv(argv: string[]): Invocation {
         args: {
           ...networkArgs(values),
           lease: requireString(values, 'lease'),
-          secret: requireString(values, 'secret'),
+          secret: optionalString(values, 'secret'),
           json: values.json === true,
         },
       };
@@ -228,7 +230,7 @@ export function parseArgv(argv: string[]): Invocation {
         args: {
           ...networkArgs(values),
           lease: requireString(values, 'lease'),
-          secret: requireString(values, 'secret'),
+          secret: optionalString(values, 'secret'),
           json: values.json === true,
         },
       };
@@ -252,11 +254,11 @@ export function renderHelp(): string {
   return `${CLI_NAME} ${CLI_VERSION} - Soroban lease manager for KeyLease gateways
 
 Usage:
-  ${CLI_NAME} acquire --service <id> --calls <count> --duration <secs> --secret <key>
+  ${CLI_NAME} acquire --service <id> --calls <count> --duration <secs> [--secret <key>]
   ${CLI_NAME} env     --service <id> [--file <path>]
   ${CLI_NAME} status  --lease <id> | --token <session-token> [--check-chain]
-  ${CLI_NAME} settle  --lease <id> --secret <key>
-  ${CLI_NAME} revoke  --lease <id> --secret <key>
+  ${CLI_NAME} settle  --lease <id> [--secret <key>]
+  ${CLI_NAME} revoke  --lease <id> [--secret <key>]
   ${CLI_NAME} sessions [--prune] [--json]
   ${CLI_NAME} help | --version
 
@@ -273,6 +275,10 @@ Options:
   --calls <count>      Number of API calls the lease authorises
   --duration <secs>    Lease lifetime in seconds
   --secret <key>       Stellar secret seed (S...) of the consumer account
+                       Read from stdin if '--secret -' or omitted
+                       Fallback to KEYLEASE_SECRET env var
+                       WARNING: passing via --secret flag is visible in shell history
+                       and process listings. Use stdin or env var when possible.
   --lease <id>         On-chain lease id (canonical decimal: 0 or [1-9][0-9]*)
   --token <token>      Session bearer token to verify offline
   --check-chain        Check the token's current lease over Soroban RPC

@@ -115,3 +115,103 @@ describe('statusCommand --check-chain', () => {
     expect(out.join('\n')).not.toContain(bearer);
   });
 });
+
+describe('statusCommand --lease', () => {
+  it('includes network and truncated contract id in human output', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease()),
+    };
+
+    await statusCommand(
+      { lease: '42', json: false },
+      io,
+      {
+        leaseStateProvider: provider,
+        networkName: 'testnet',
+        contractId: 'CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC',
+      },
+    );
+
+    const output = out.join('\n');
+    expect(output).toContain('network    : testnet');
+    expect(output).toContain('contract   : CC2YHTV3...UOXDA3KRC');
+  });
+
+  it('includes network and truncated contract id in JSON output', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease()),
+    };
+
+    await statusCommand(
+      { lease: '42', json: true },
+      io,
+      {
+        leaseStateProvider: provider,
+        networkName: 'mainnet',
+        contractId: 'CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC',
+      },
+    );
+
+    const result = JSON.parse(out.join('\n')) as Record<string, unknown>;
+    expect(result.network).toBe('mainnet');
+    expect(result.contract_id).toBe('CC2YHTV3...UOXDA3KRC');
+  });
+
+  it('resolves network from args when not provided in deps', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease()),
+    };
+
+    await statusCommand(
+      { lease: '42', network: 'local', json: false },
+      io,
+      {
+        leaseStateProvider: provider,
+      },
+    );
+
+    expect(out.join('\n')).toContain('network    : local');
+  });
+
+  it('defaults to testnet when network is not specified', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease()),
+    };
+
+    await statusCommand(
+      { lease: '42', json: false },
+      io,
+      {
+        leaseStateProvider: provider,
+      },
+    );
+
+    expect(out.join('\n')).toContain('network    : testnet');
+  });
+
+  it('omits network and contract when not provided', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease()),
+    };
+
+    await statusCommand(
+      { lease: '42', json: false },
+      io,
+      {
+        leaseStateProvider: provider,
+        networkName: undefined,
+        contractId: undefined,
+      },
+    );
+
+    const output = out.join('\n');
+    expect(output).toContain('Lease 42');
+    expect(output).not.toContain('network');
+    expect(output).not.toContain('contract');
+  });
+});

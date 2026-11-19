@@ -23,6 +23,8 @@ export interface StatusDeps {
   createClient?: (args: StatusArgs) => Pick<SorobanClient, 'getLeaseState'>;
   leaseStateProvider?: LeaseStateProvider;
   now?: () => number;
+  networkName?: string | undefined;
+  contractId?: string | undefined;
 }
 
 interface CheckResult {
@@ -188,13 +190,18 @@ async function checkTokenOnChain(
   return Object.values(checks).every((check) => check.passed) ? 0 : 1;
 }
 
-function renderState(state: LeaseState, io: CliIo, json: boolean): void {
+function renderState(state: LeaseState, io: CliIo, json: boolean, networkName?: string, contractId?: string): void {
   if (json) {
-    io.out(JSON.stringify(state, null, 2));
+    const output: Record<string, unknown> = state;
+    if (networkName !== undefined) output.network = networkName;
+    if (contractId !== undefined) output.contract_id = contractId;
+    io.out(JSON.stringify(output, null, 2));
     return;
   }
   const expired = state.expiresAt <= Math.floor(Date.now() / 1000);
   io.out(`Lease ${state.leaseId}`);
+  if (networkName !== undefined) io.out(`  network    : ${networkName}`);
+  if (contractId !== undefined) io.out(`  contract   : ${contractId}`);
   io.out(`  service    : ${state.service}`);
   io.out(`  provider   : ${state.provider}`);
   io.out(`  consumer   : ${state.consumer}`);
@@ -250,6 +257,12 @@ export async function statusCommand(
 
   const createClient = deps.createClient ?? defaultCreateClient;
   const state = await createClient(args).getLeaseState(args.lease);
-  renderState(state, io, args.json);
+  
+  // Resolve network name and truncated contract id
+  const networkName = deps.networkName ?? args.network ?? 'testnet';
+  const contractId = deps.contractId ?? args.contract;
+  const contractIdTruncated = contractId ? `${contractId.slice(0, 8)}...${contractId.slice(-8)}` : undefined;
+  
+  renderState(state, io, args.json, networkName, contractIdTruncated);
   return 0;
 }

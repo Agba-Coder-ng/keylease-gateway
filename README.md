@@ -245,6 +245,34 @@ the on-chain service; service and call limits are not claims encoded in the
 current session token. Chain lookup failures are reported as failed checks and
 return exit code 1.
 
+`keylease status --lease 42` reads the on-chain lease state and reports the network and contract address:
+
+```text
+Lease 42
+  network    : testnet
+  contract   : CC2YHTV3...UOXDA3KRC
+  service    : weather-api
+  provider   : GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  consumer   : GDUKMGUGDZQK6YHYA5Z6AY2G4XDSZPSZ3SW5UN3ARVMO6QSRDWP5YLEX
+  calls      : 4/10
+  escrow     : 10000 (paid into keylease-core)
+  expires at : 2023-11-15T10:00:00.000Z
+  active     : yes
+  settled    : no
+```
+
+Add `--json` for machine-readable output, including the full contract id:
+
+```json
+{
+  "leaseId": "42",
+  "network": "testnet",
+  "contract_id": "CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC",
+  "service": "weather-api",
+  ...
+}
+```
+
 `--secret` is the consumer account's **Stellar secret seed**. It signs the
 `create_lease` transaction and the session token, and it never leaves the
 process — it is not printed, logged, or written to disk.

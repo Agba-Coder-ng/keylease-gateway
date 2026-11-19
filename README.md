@@ -283,7 +283,7 @@ lease first; if it is corrupt, back it up or repair it before retrying.
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
 | `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
-| `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`) |
+| `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
 | `get_lease(id)` · `get_service(id)` · `get_config()` · `remaining_calls(id)` | – | Views used by the CLI and proxy |
@@ -306,6 +306,11 @@ path costs one storage access and no write.
 Events: `init`, `gateway`, `admin_proposed`, `admin_changed`,
 `service_registered`, `lease_created`, `calls_committed`, `lease_revoked`,
 `lease_settled`.
+
+`calls_committed` keeps its `(calls_committed, consumer, lease_id)` topic
+tuple, so existing topic filters still match, but its payload is now the pair
+`(calls_used, remaining)`. Both fields are `u32`; indexers that decoded a bare
+`calls_used` value must read the pair (or the first element).
 
 Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 `Error(Contract, #n)`:

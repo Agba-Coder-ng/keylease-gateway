@@ -655,6 +655,47 @@ fn admin_transfer_emits_proposal_and_change_events() {
 }
 
 #[test]
+fn calls_committed_event_publishes_used_and_remaining() {
+    use soroban_sdk::{testutils::Events as _, IntoVal, Symbol, Vec as SVec};
+
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    h.client.use_call(&id, &3);
+
+    let topics = || {
+        SVec::from_array(
+            &h.env,
+            [
+                Symbol::new(&h.env, "calls_committed").into_val(&h.env),
+                h.consumer.clone().into_val(&h.env),
+                id.into_val(&h.env),
+            ],
+        )
+    };
+
+    assert_eq!(
+        h.env.events().all(),
+        SVec::from_array(
+            &h.env,
+            [(h.client.address.clone(), topics(), (3u32, 7u32).into_val(&h.env))],
+        ),
+    );
+
+    // Committing past the limit clamps, so the event reports 0 remaining.
+    h.client.use_call(&id, &999);
+    assert_eq!(
+        h.env.events().all(),
+        SVec::from_array(
+            &h.env,
+            [(h.client.address.clone(), topics(), (10u32, 0u32).into_val(&h.env))],
+        ),
+    );
+}
+
+#[test]
 fn escrow_survives_many_leases() {
     let h = setup();
     StellarAssetClient::new(&h.env, &h.token).mint(&h.consumer, &10_000_000);

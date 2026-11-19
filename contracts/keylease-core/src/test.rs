@@ -108,6 +108,46 @@ fn quote_prices_a_batch_of_calls() {
 }
 
 #[test]
+fn quote_rejects_overflowing_totals() {
+    let h = setup();
+    h.client
+        .register_service(&h.provider, &service_id(&h.env), &i128::MAX);
+
+    // A single call still fits in i128.
+    assert_eq!(h.client.quote(&service_id(&h.env), &1), i128::MAX);
+    // i128::MAX * 2 overflows: checked_mul must surface InvalidAmount, not trap.
+    let err = h.client.try_quote(&service_id(&h.env), &2).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidAmount);
+    let err = h.client.try_quote(&service_id(&h.env), &u32::MAX).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidAmount);
+}
+
+#[test]
+fn quote_rejects_zero_calls() {
+    let h = setup();
+    register(&h);
+    let err = h.client.try_quote(&service_id(&h.env), &0).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidCalls);
+}
+
+#[test]
+fn quote_rejects_zero_calls_before_looking_up_the_service() {
+    let h = setup();
+    let unknown = String::from_str(&h.env, "nope");
+    let err = h.client.try_quote(&unknown, &0).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidCalls);
+}
+
+#[test]
+fn quote_rejects_an_unknown_service() {
+    let h = setup();
+    register(&h);
+    let unknown = String::from_str(&h.env, "nope");
+    let err = h.client.try_quote(&unknown, &1).unwrap_err();
+    assert_eq!(err.unwrap(), Error::UnknownService);
+}
+
+#[test]
 fn create_lease_escrows_the_full_price() {
     let h = setup();
     register(&h);

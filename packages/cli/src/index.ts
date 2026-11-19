@@ -37,6 +37,7 @@ import {
   type ResolvedConfig,
 } from './config.js';
 import { CliError } from './errors.js';
+import { renderError } from './error-renderer.js';
 
 export { CliError } from './errors.js';
 
@@ -400,12 +401,22 @@ function withResolvedNetwork(invocation: Invocation, resolved: ResolvedConfig): 
   } as Invocation;
 }
 
+/**
+ * Detects whether --json flag is present in argv.
+ * Used early to determine error rendering mode.
+ */
+function hasJsonFlag(argv: string[]): boolean {
+  return argv.includes('--json');
+}
+
 /** Parses and dispatches a CLI invocation, returning a process exit code. */
 export async function run(
   argv: string[],
   io: CliIo = consoleIo,
   deps: RunDeps = {},
 ): Promise<number> {
+  const json = hasJsonFlag(argv);
+
   let invocation: Invocation;
   try {
     if (isMetaInvocation(argv)) {
@@ -422,8 +433,7 @@ export async function run(
     }
   } catch (error) {
     if (error instanceof CliError) {
-      io.err(`error: ${error.message}`);
-      io.err(`run "${CLI_NAME} help" for usage`);
+      renderError(error, io, json);
       return error.exitCode;
     }
     throw error;
@@ -454,11 +464,10 @@ export async function run(
     }
   } catch (error) {
     if (error instanceof CliError) {
-      io.err(`error: ${error.message}`);
+      renderError(error, io, json);
       return error.exitCode;
     }
-    const message = error instanceof Error ? error.message : String(error);
-    io.err(`error: ${message}`);
+    renderError(error, io, json);
     return 1;
   }
 }

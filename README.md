@@ -238,6 +238,52 @@ Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
 `--contract <id>`, `--json` (machine-readable output), `--dry-run`
 (`acquire` only).
 
+#### Error responses with `--json`
+
+When `--json` is set, errors are emitted to stderr as machine-readable JSON
+instead of plain text. The format is stable across all commands:
+
+```json
+{
+  "error": {
+    "code": "missing_option",
+    "message": "--duration is required",
+    "hint": "run \"keylease help\" for usage"
+  }
+}
+```
+
+The `error` object always contains:
+- `code` (string): A stable machine-readable error identifier
+- `message` (string): Human-readable error description
+- `hint` (string, optional): Actionable suggestion (hints are omitted for token and runtime errors)
+
+**Error codes** are drawn from three categories:
+
+**CLI validation errors** (exit code 2):
+- `parse_error` — Invalid argument syntax or unknown flag
+- `missing_option` — Required flag not provided
+- `invalid_option` — Flag value failed validation (not a number, not a Stellar key, etc.)
+- `unexpected_argument` — Positional argument where none expected
+- `unknown_command` — Unrecognized command name
+- `usage_error` — Generic validation issue
+
+**Token verification errors** (exit code 1):
+- `malformed_token` — Token format invalid (wrong prefix, not base64url, missing fields)
+- `unsupported_version` — Token version mismatch
+- `invalid_consumer` — Consumer public key invalid
+- `bad_signature` — Ed25519 signature does not verify
+- `consumer_mismatch` — Token consumer doesn't match expected
+- `lease_mismatch` — Token lease_id doesn't match requested
+- `token_expired` — Token past expiry time
+- `token_not_yet_valid` — Token's issued-at time hasn't arrived (clock skew)
+
+**Runtime errors** (exit code 1):
+- `internal_error` — Unhandled exceptions, RPC failures, etc.
+
+Success output remains unchanged: `--json` renders structured data to stdout
+without wrapping.
+
 `status --token` checks the token signature and expiry offline. Add
 `--check-chain` to also simulate `get_lease` and check that the lease is active,
 belongs to the token's consumer, and has calls remaining. The result includes

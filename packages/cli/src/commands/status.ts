@@ -5,6 +5,7 @@ import {
   TokenVerificationError,
   type SessionTokenPayload,
 } from '../token.js';
+import { renderError } from '../error-renderer.js';
 import type { CliIo } from '../index.js';
 import type { NetworkArgs } from './lease.js';
 
@@ -94,6 +95,10 @@ async function checkTokenOnChain(
   try {
     payload = parseSessionToken(args.token ?? '').payload;
   } catch (error) {
+    if (args.json) {
+      renderError(error, io, true);
+      return 1;
+    }
     const detail =
       error instanceof TokenVerificationError ? error.message : String(error);
     const checks: TokenChainChecks = {
@@ -236,7 +241,7 @@ export async function statusCommand(
       return 0;
     } catch (error) {
       if (error instanceof TokenVerificationError) {
-        io.err(`token verification failed (${error.code}): ${error.message}`);
+        renderError(error, io, args.json);
         return 1;
       }
       throw error;

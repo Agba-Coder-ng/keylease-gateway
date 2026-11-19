@@ -323,6 +323,11 @@ Add `--json` for machine-readable output, including the full contract id:
 `create_lease` transaction and the session token, and it never leaves the
 process — it is not printed, logged, or written to disk.
 
+Session bearer tokens (`kls1.*` format) are redacted in all error messages and
+logs. If a token parse error or verification failure occurs, the CLI will
+display `kls1.<redacted>` instead of the full token value, ensuring credentials
+are never leaked to terminal output, CI logs, or pasted issues.
+
 `acquire --dry-run` calls `quote` on `keylease-core` first and prints the
 service, call count, duration, quoted price (token smallest units) and the
 expiry the lease would get — then stops. Nothing is signed, no lease is created

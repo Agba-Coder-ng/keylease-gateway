@@ -114,6 +114,35 @@ describe('statusCommand --check-chain', () => {
     expect(out.join('\n')).toContain('lease active   : FAIL (chain lookup failed: RPC unavailable)');
     expect(out.join('\n')).not.toContain(bearer);
   });
+
+  it('never echoes a deliberately malformed token in stderr', async () => {
+    const malformed = 'kls1.invalid.token.with.too.many.parts';
+    const { io, err } = captureIo();
+
+    expect(
+      await statusCommand(args(malformed), io, {
+        now: () => NOW * 1000,
+      }),
+    ).toBe(1);
+
+    const stderr = err.join('\n');
+    expect(stderr).not.toContain('invalid');
+    expect(stderr).not.toContain('kls1.invalid');
+    expect(stderr).toContain('kls1.<redacted>');
+  });
+
+  it('redacts tokens in verification error messages', async () => {
+    const malformed = 'kls1.notbase64url!!!.sig';
+    const { io, err } = captureIo();
+
+    await statusCommand(args(malformed, false), io, {
+      now: () => NOW * 1000,
+    });
+
+    const stderr = err.join('\n');
+    expect(stderr).not.toContain('kls1.notbase64url');
+    expect(stderr).toContain('kls1.<redacted>');
+  });
 });
 
 describe('statusCommand --lease', () => {

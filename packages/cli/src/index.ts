@@ -36,10 +36,10 @@ import {
   type KeyleaseConfigFile,
   type ResolvedConfig,
 } from './config.js';
-import { CliError } from './errors.js';
+import { CliError, redactToken } from './errors.js';
 import { renderError } from './error-renderer.js';
 
-export { CliError } from './errors.js';
+export { CliError, redactToken } from './errors.js';
 
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';

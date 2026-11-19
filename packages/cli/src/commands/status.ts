@@ -7,6 +7,7 @@ import {
 } from '../token.js';
 import { renderError } from '../error-renderer.js';
 import type { CliIo } from '../index.js';
+import { redactToken } from '../errors.js';
 import type { NetworkArgs } from './lease.js';
 
 export interface StatusArgs extends NetworkArgs {
@@ -104,7 +105,7 @@ async function checkTokenOnChain(
     const detail =
       error instanceof TokenVerificationError ? error.message : String(error);
     const checks: TokenChainChecks = {
-      signature: { passed: false, detail },
+      signature: { passed: false, detail: redactToken(detail) },
       expiry: { passed: false, detail: 'cannot evaluate an invalid token' },
       ...failedChainChecks('not checked because the token could not be parsed'),
     };

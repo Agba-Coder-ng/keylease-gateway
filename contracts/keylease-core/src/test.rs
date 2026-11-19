@@ -383,6 +383,134 @@ fn gateway_can_be_rotated_by_the_admin() {
     assert_eq!(h.client.remaining_calls(&1), 0);
 }
 
+/// Negative authorisation coverage.
+///
+/// `setup()` mocks every signature, so a missing `require_auth` regression is
+/// invisible to the happy-path tests above. These cases clear the mock set and
+/// assert the *host* rejects the invocation (an auth error, not a contract
+/// `Error` variant), which is how a real caller without the right key fails.
+mod unauthorised {
+    use super::*;
+
+    fn clear_auths(h: &Harness) {
+        h.env.mock_auths(&[]);
+    }
+
+    #[test]
+    fn use_call_requires_the_gateway() {
+        let h = setup();
+        register(&h);
+        let id = h
+            .client
+            .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+        clear_auths(&h);
+
+        let err = h.client.try_use_call(&id, &1).unwrap_err();
+        assert!(
+            err.is_err(),
+            "a caller without the gateway key must not commit quota"
+        );
+        assert_eq!(h.client.remaining_calls(&id), 10);
+    }
+
+    #[test]
+    fn revoke_requires_the_consumer() {
+        let h = setup();
+        register(&h);
+        let id = h
+            .client
+            .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+        h.client.use_call(&id, &1);
+        clear_auths(&h);
+
+        let before = balance(&h, &h.consumer);
+        let err = h.client.try_revoke(&id).unwrap_err();
+        assert!(err.is_err(), "only the consumer may revoke a lease");
+        assert_eq!(balance(&h, &h.consumer), before);
+        assert!(h.client.get_lease(&id).active);
+    }
+
+    #[test]
+    fn create_lease_requires_the_consumer() {
+        let h = setup();
+        register(&h);
+        clear_auths(&h);
+
+        let before = balance(&h, &h.consumer);
+        let err = h
+            .client
+            .try_create_lease(&h.consumer, &service_id(&h.env), &10, &60)
+            .unwrap_err();
+        assert!(err.is_err(), "the consumer must authorise the escrow pull");
+        assert_eq!(balance(&h, &h.consumer), before);
+        assert_eq!(h.client.get_config().lease_count, 0);
+    }
+
+    #[test]
+    fn register_service_requires_the_provider() {
+        let h = setup();
+        clear_auths(&h);
+
+        let err = h
+            .client
+            .try_register_service(&h.provider, &service_id(&h.env), &1_000)
+            .unwrap_err();
+        assert!(err.is_err(), "a provider signature is required");
+        let err = h
+            .client
+            .try_get_service(&service_id(&h.env))
+            .unwrap_err();
+        assert_eq!(err.unwrap(), Error::UnknownService);
+    }
+
+    #[test]
+    fn set_gateway_requires_the_admin() {
+        let h = setup();
+        let next = Address::generate(&h.env);
+        clear_auths(&h);
+
+        let err = h.client.try_set_gateway(&next).unwrap_err();
+        assert!(err.is_err(), "only the admin may rotate the gateway");
+        assert_eq!(h.client.get_config().gateway, h.gateway);
+    }
+
+    #[test]
+    fn set_service_active_requires_the_provider_signature() {
+        let h = setup();
+        register(&h);
+        let impostor = Address::generate(&h.env);
+        clear_auths(&h);
+
+        let err = h
+            .client
+            .try_set_service_active(&impostor, &service_id(&h.env), &false)
+            .unwrap_err();
+        assert!(
+            err.is_err(),
+            "a provider signature is required, not just the address"
+        );
+        assert!(h.client.get_service(&service_id(&h.env)).active);
+    }
+
+    /// `settle` is deliberately permissionless, so it is the one entrypoint
+    /// that must keep working without any signature once the lease is
+    /// expired.
+    #[test]
+    fn settle_stays_permissionless() {
+        let h = setup();
+        register(&h);
+        let id = h
+            .client
+            .create_lease(&h.consumer, &service_id(&h.env), &2, &60);
+        h.client.use_call(&id, &2);
+        clear_auths(&h);
+
+        let lease = h.client.settle(&id);
+        assert!(lease.settled);
+        assert_eq!(balance(&h, &h.provider), 2_000);
+    }
+}
+
 #[test]
 fn escrow_survives_many_leases() {
     let h = setup();

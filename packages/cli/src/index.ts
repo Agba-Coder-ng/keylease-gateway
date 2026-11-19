@@ -36,9 +36,9 @@ import {
   type KeyleaseConfigFile,
   type ResolvedConfig,
 } from './config.js';
-import { CliError } from './errors.js';
+import { CliError, redactToken } from './errors.js';
 
-export { CliError } from './errors.js';
+export { CliError, redactToken } from './errors.js';
 
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
@@ -422,7 +422,7 @@ export async function run(
     }
   } catch (error) {
     if (error instanceof CliError) {
-      io.err(`error: ${error.message}`);
+      io.err(`error: ${redactToken(error.message)}`);
       io.err(`run "${CLI_NAME} help" for usage`);
       return error.exitCode;
     }
@@ -454,11 +454,11 @@ export async function run(
     }
   } catch (error) {
     if (error instanceof CliError) {
-      io.err(`error: ${error.message}`);
+      io.err(`error: ${redactToken(error.message)}`);
       return error.exitCode;
     }
     const message = error instanceof Error ? error.message : String(error);
-    io.err(`error: ${message}`);
+    io.err(`error: ${redactToken(message)}`);
     return 1;
   }
 }

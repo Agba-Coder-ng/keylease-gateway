@@ -114,36 +114,61 @@ fn config_key() -> DataKey {
     DataKey::Config
 }
 
+/// Bump the TTL of an entry that was just read.
+///
+/// Reads are the hot path (`get_lease` is simulated by the proxy on every
+/// request), so an entry that is only ever read must still stay alive.
+/// `extend_ttl` is a no-op while the entry is above `MIN_TTL`, so the common
+/// case costs one storage access and no write.
+fn bump_instance_ttl(env: &Env) {
+    env.storage().instance().extend_ttl(MIN_TTL, EXTEND_TO);
+}
+
+fn bump_persistent_ttl(env: &Env, key: &DataKey) {
+    env.storage().persistent().extend_ttl(key, MIN_TTL, EXTEND_TO);
+}
+
 fn load_config(env: &Env) -> Result<Config, Error> {
-    env.storage()
+    let config = env
+        .storage()
         .instance()
         .get(&config_key())
-        .ok_or(Error::NotInitialized)
+        .ok_or(Error::NotInitialized)?;
+    bump_instance_ttl(env);
+    Ok(config)
 }
 
 fn store_config(env: &Env, config: &Config) {
     env.storage().instance().set(&config_key(), config);
-    env.storage().instance().extend_ttl(MIN_TTL, EXTEND_TO);
+    bump_instance_ttl(env);
 }
 
 fn load_service(env: &Env, service: &soroban_sdk::String) -> Result<Service, Error> {
-    env.storage()
+    let key = DataKey::Service(service.clone());
+    let stored = env
+        .storage()
         .persistent()
-        .get(&DataKey::Service(service.clone()))
-        .ok_or(Error::UnknownService)
+        .get(&key)
+        .ok_or(Error::UnknownService)?;
+    bump_persistent_ttl(env, &key);
+    Ok(stored)
 }
 
 fn load_lease(env: &Env, lease_id: u64) -> Result<Lease, Error> {
-    env.storage()
+    let key = DataKey::Lease(lease_id);
+    let lease = env
+        .storage()
         .persistent()
-        .get(&DataKey::Lease(lease_id))
-        .ok_or(Error::LeaseNotFound)
+        .get(&key)
+        .ok_or(Error::LeaseNotFound)?;
+    bump_persistent_ttl(env, &key);
+    Ok(lease)
 }
 
 fn store_lease(env: &Env, lease: &Lease) {
     let key = DataKey::Lease(lease.id);
     env.storage().persistent().set(&key, lease);
-    env.storage().persistent().extend_ttl(&key, MIN_TTL, EXTEND_TO);
+    bump_persistent_ttl(env, &key);
 }
 
 #[contractimpl]
@@ -202,7 +227,7 @@ impl KeyleaseCore {
         };
         let key = DataKey::Service(service.clone());
         env.storage().persistent().set(&key, &stored);
-        env.storage().persistent().extend_ttl(&key, MIN_TTL, EXTEND_TO);
+        bump_persistent_ttl(&env, &key);
         env.events().publish(
             (Symbol::new(&env, "service_registered"), provider),
             (service, price_per_call),
@@ -226,7 +251,7 @@ impl KeyleaseCore {
         stored.active = active;
         let key = DataKey::Service(service);
         env.storage().persistent().set(&key, &stored);
-        env.storage().persistent().extend_ttl(&key, MIN_TTL, EXTEND_TO);
+        bump_persistent_ttl(&env, &key);
         Ok(stored)
     }
 

@@ -9,6 +9,7 @@ use soroban_sdk::{
 
 struct Harness {
     env: Env,
+    contract_id: Address,
     admin: Address,
     gateway: Address,
     consumer: Address,
@@ -39,7 +40,7 @@ fn setup() -> Harness {
     let client = KeyleaseCoreClient::new(&env, &contract_id);
     client.init(&admin, &token, &gateway);
 
-    Harness { env, admin, gateway, consumer, provider, token, client }
+    Harness { env, contract_id, admin, gateway, consumer, provider, token, client }
 }
 
 fn register(h: &Harness) {
@@ -381,6 +382,56 @@ fn gateway_can_be_rotated_by_the_admin() {
     h.client.set_gateway(&next);
     assert_eq!(h.client.get_config().gateway, next);
     assert_eq!(h.client.remaining_calls(&1), 0);
+}
+
+#[test]
+fn reads_extend_the_ttl_of_leases_services_and_config() {
+    use crate::{DataKey, EXTEND_TO, MIN_TTL};
+    use soroban_sdk::testutils::storage::{Instance, Persistent};
+
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &86_400);
+
+    let lease_key = DataKey::Lease(id);
+    let service_key = DataKey::Service(service_id(&h.env));
+
+    // Age every entry until it is below the extension threshold but not yet
+    // expired, which is the state a long-idle lease reaches in production.
+    h.env
+        .ledger()
+        .with_mut(|li| li.sequence_number += EXTEND_TO - MIN_TTL + 1);
+
+    let lease_ttl = || {
+        h.env.as_contract(&h.contract_id, || {
+            h.env.storage().persistent().get_ttl(&lease_key)
+        })
+    };
+    let service_ttl = || {
+        h.env.as_contract(&h.contract_id, || {
+            h.env.storage().persistent().get_ttl(&service_key)
+        })
+    };
+    let config_ttl = || {
+        h.env
+            .as_contract(&h.contract_id, || h.env.storage().instance().get_ttl())
+    };
+
+    assert!(lease_ttl() < MIN_TTL);
+    assert!(service_ttl() < MIN_TTL);
+    assert!(config_ttl() < MIN_TTL);
+
+    // Plain reads must raise the live-until ledger again.
+    h.client.get_lease(&id);
+    assert!(lease_ttl() >= MIN_TTL);
+
+    h.client.get_service(&service_id(&h.env));
+    assert!(service_ttl() >= MIN_TTL);
+
+    h.client.get_config();
+    assert!(config_ttl() >= MIN_TTL);
 }
 
 #[test]

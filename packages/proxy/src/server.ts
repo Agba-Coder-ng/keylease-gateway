@@ -95,6 +95,19 @@ function appendForwardedFor(
   return existing && existing.length > 0 ? `${existing}, ${remote}` : remote;
 }
 
+function isUpgradeRequest(request: FastifyRequest): boolean {
+  const connection = request.headers.connection;
+  const upgrade = request.headers.upgrade;
+  return (
+    typeof upgrade === 'string' &&
+    upgrade.length > 0 &&
+    typeof connection === 'string' &&
+    connection
+      .split(',')
+      .some((token) => token.trim().toLowerCase() === 'upgrade')
+  );
+}
+
 function allowsBody(method: string): boolean {
   return method !== 'GET' && method !== 'HEAD';
 }
@@ -197,6 +210,18 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   });
   const handler = async (request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> => {
     metrics.requestsTotal += 1;
+    if (isUpgradeRequest(request)) {
+      // Upgrades are never proxied; refuse before the lease is verified or charged.
+      return reply
+        .code(426)
+        .header('connection', 'Upgrade')
+        .header('upgrade', 'HTTP/1.1')
+        .type('application/json; charset=utf-8')
+        .send({
+          error: 'upgrade_required',
+          message: 'protocol upgrades (e.g. WebSocket) are not supported by this proxy',
+        });
+    }
     const decision = await verifier.verifyAuthorization(request.headers.authorization);
     if (!decision.ok) {
       metrics.requestsDenied.set(

@@ -868,3 +868,37 @@ describe('x-request-id propagation', () => {
   });
 });
 
+describe('WebSocket upgrade requests', () => {
+  it('answers 426 before verification and consumes no quota', async () => {
+    const getLeaseState = vi.fn(async () => leaseState());
+    const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState }),
+      fetchImpl: impl,
+    });
+    const res = await app.inject({
+      method: 'GET',
+      url: '/socket',
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        connection: 'keep-alive, Upgrade',
+        upgrade: 'websocket',
+      },
+    });
+    expect(res.statusCode).toBe(426);
+    expect(res.headers['upgrade']).toBe('HTTP/1.1');
+    expect(res.json()).toMatchObject({ error: 'upgrade_required' });
+    expect(getLeaseState).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+
+    const next = await app.inject({
+      method: 'GET',
+      url: '/',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+    expect(next.headers['x-keylease-calls-remaining']).toBe('9');
+    await app.close();
+  });
+});
+

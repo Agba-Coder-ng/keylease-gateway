@@ -46,6 +46,8 @@ pub enum Error {
     InvalidPrice = 12,
     InvalidAmount = 13,
     Unauthorized = 14,
+    /// `create_lease` was called with the contract itself as consumer.
+    InvalidConsumer = 15,
 }
 
 #[contracttype]
@@ -231,6 +233,12 @@ impl KeyleaseCore {
 
     /// Prepays a lease: transfers `calls * price_per_call` from `consumer`
     /// into escrow and returns the new lease id.
+    ///
+    /// The consumer may not be this contract: escrow would move from the
+    /// contract to itself and the refund could never reach a real account
+    /// (`InvalidConsumer`). The admin and gateway are deliberately allowed —
+    /// they are ordinary accounts that can receive refunds, and an operator
+    /// leasing their own service for smoke tests is a legitimate use.
     pub fn create_lease(
         env: Env,
         consumer: Address,
@@ -238,6 +246,9 @@ impl KeyleaseCore {
         calls: u32,
         duration: u64,
     ) -> Result<u64, Error> {
+        if consumer == env.current_contract_address() {
+            return Err(Error::InvalidConsumer);
+        }
         consumer.require_auth();
         if calls == 0 {
             return Err(Error::InvalidCalls);

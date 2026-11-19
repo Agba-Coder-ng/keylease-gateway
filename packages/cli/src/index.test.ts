@@ -229,6 +229,58 @@ describe('parseArgv', () => {
     );
   });
 
+  it('validates the maximum duration (365 days)', () => {
+    const maxSeconds = 365 * 24 * 60 * 60; // 31536000
+
+    // Exactly at the limit: should pass
+    const atLimit = parseArgv([
+      'acquire',
+      '--service',
+      'x',
+      '--calls',
+      '1',
+      `--duration=${maxSeconds}`,
+      '--secret',
+      SECRET,
+    ]);
+    expect(atLimit.command).toBe('acquire');
+    expect((atLimit as { args: AcquireArgs }).args.duration).toBe(maxSeconds);
+
+    // One second over: should fail
+    const error = expectCliError(
+      () =>
+        parseArgv([
+          'acquire',
+          '--service',
+          'x',
+          '--calls',
+          '1',
+          `--duration=${maxSeconds + 1}`,
+          '--secret',
+          SECRET,
+        ]),
+      'invalid_option',
+    );
+    expect(error.message).toContain('365 days');
+    expect(error.message).toContain(String(maxSeconds));
+
+    // Zero should still fail (caught by requirePositiveInt)
+    expectCliError(
+      () =>
+        parseArgv([
+          'acquire',
+          '--service',
+          'x',
+          '--calls',
+          '1',
+          '--duration=0',
+          '--secret',
+          SECRET,
+        ]),
+      'invalid_option',
+    );
+  });
+
   it('rejects unknown commands, flags and stray positionals', () => {
     expectCliError(() => parseArgv(['destroy', '--service', 'x']), 'unknown_command');
     expectCliError(

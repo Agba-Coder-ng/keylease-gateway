@@ -129,8 +129,11 @@ behind a lease, and it can leave the contract through exactly two paths:
   `refund = price_paid × (calls_limit − calls_used) / calls_limit` → consumer,
   provider gets nothing.
 
-Integer division floors, so the consumer receives the remainder. Both paths
-mark the lease `settled` and cannot run twice (`AlreadySettled`). There is **no
+Integer division floors. In `settle` the consumer receives
+`price_paid − payable`, so the rounding dust goes to the consumer; in `revoke`
+the refund itself is floored, so a few stroops stay in the contract with no way
+to withdraw them. Both paths mark the lease `settled` and cannot run twice
+(`AlreadySettled`). There is **no
 admin withdrawal or sweep entry point**: the contract can only pay providers and
 consumers, so any surplus in the contract is stuck and is itself a finding.
 
@@ -143,8 +146,8 @@ For every lease that is not yet `settled`, the contract owes at most
 balance_of_contract_in_escrow_token  ==  Σ price_paid over all unsettled leases
 ```
 
-is the expected state. `>` means funds nobody can withdraw (investigate:
-wrong token, out-of-band transfer, or a settled lease incorrectly counted).
+is the expected state. `>` means funds nobody can withdraw (investigate: revoke rounding dust, a
+settled lease incorrectly counted, wrong token, or an out-of-band transfer).
 `<` means the contract cannot honour its obligations — **hard blocker**.
 
 ### 4.3 Procedure

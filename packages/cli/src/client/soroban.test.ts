@@ -6,6 +6,8 @@ import {
   parseLeaseId,
   parseLeaseState,
   encodeLeaseState,
+  validateRpcUrl,
+  SorobanError,
   type LeaseState,
   type SorobanRpc,
 } from './soroban.js';
@@ -36,6 +38,47 @@ describe('parseLeaseId', () => {
     expect(() => parseLeaseId('lease-1')).toThrow(/decimal u64/);
     expect(() => parseLeaseId('0')).toThrow(/out of the u64 range/);
     expect(() => parseLeaseId('18446744073709551616')).toThrow(/out of the u64 range/);
+  });
+});
+
+describe('validateRpcUrl', () => {
+  it('accepts valid https URLs', () => {
+    expect(() => validateRpcUrl('https://soroban-testnet.stellar.org')).not.toThrow();
+    expect(() => validateRpcUrl('https://mainnet.sorobanrpc.com')).not.toThrow();
+    expect(() =>
+      validateRpcUrl('https://soroban-testnet.stellar.org:443/soroban/rpc'),
+    ).not.toThrow();
+  });
+
+  it('accepts http URLs for localhost', () => {
+    expect(() => validateRpcUrl('http://localhost:8000')).not.toThrow();
+    expect(() => validateRpcUrl('http://localhost:8000/soroban/rpc')).not.toThrow();
+    expect(() => validateRpcUrl('http://127.0.0.1:8000')).not.toThrow();
+    expect(() => validateRpcUrl('http://[::1]:8000')).not.toThrow();
+  });
+
+  it('rejects invalid URLs', () => {
+    expect(() => validateRpcUrl('not-a-url')).toThrow('must be a valid URL');
+    expect(() => validateRpcUrl('localhost:8000')).toThrow('must be a valid URL');
+    expect(() => validateRpcUrl('192.168.1.1:8000')).toThrow('must be a valid URL');
+  });
+
+  it('rejects wrong schemes', () => {
+    expect(() => validateRpcUrl('ftp://example.com')).toThrow('scheme must be http: or https:');
+    expect(() => validateRpcUrl('file:///path/to/file')).toThrow('scheme must be http: or https:');
+    expect(() => validateRpcUrl('gopher://example.com')).toThrow('scheme must be http: or https:');
+  });
+
+  it('rejects http URLs that are not localhost', () => {
+    expect(() => validateRpcUrl('http://example.com')).toThrow('localhost');
+    expect(() => validateRpcUrl('http://192.168.1.1')).toThrow('localhost');
+    expect(() => validateRpcUrl('http://staging.example.com:8000')).toThrow('localhost');
+    expect(() => validateRpcUrl('http://example.com:8000/soroban/rpc')).toThrow('localhost');
+  });
+
+  it('catches typos like htps:// or htp://', () => {
+    expect(() => validateRpcUrl('htps://example.com')).toThrow('scheme');
+    expect(() => validateRpcUrl('htp://example.com')).toThrow('scheme');
   });
 });
 

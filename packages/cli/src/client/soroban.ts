@@ -586,6 +586,37 @@ function transactionResultName(result: unknown): string {
   return 'unknown error';
 }
 
+/**
+ * Validates an RPC URL ensuring it is a valid http: or https: URL.
+ * http: is only allowed for local/localhost URLs, matching the SDK's allowHttp rule.
+ *
+ * @throws SorobanError if the URL is invalid or does not meet the scheme requirements
+ */
+export function validateRpcUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new SorobanError(`invalid RPC URL "${url}": must be a valid URL`);
+  }
+
+  const scheme = parsed.protocol;
+  if (scheme !== 'http:' && scheme !== 'https:') {
+    throw new SorobanError(`invalid RPC URL "${url}": scheme must be http: or https:, got ${scheme}`);
+  }
+
+  // Allow http: only for localhost/127.0.0.1
+  if (scheme === 'http:') {
+    const hostname = parsed.hostname;
+    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1') {
+      throw new SorobanError(
+        `invalid RPC URL "${url}": http: is only allowed for localhost, not ${hostname}`,
+      );
+    }
+  }
+}
+
 function createRpcServer(url: string): SorobanRpc {
+  validateRpcUrl(url);
   return new rpc.Server(url, { allowHttp: url.startsWith('http://') }) as unknown as SorobanRpc;
 }

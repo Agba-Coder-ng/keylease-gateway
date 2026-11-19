@@ -1,5 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OnChainQuota, type CallCommitter } from './quota.js';
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 function fakeCommitter(): CallCommitter & { calls: Array<[string, number]> } {
   const calls: Array<[string, number]> = [];
@@ -66,6 +71,75 @@ describe('OnChainQuota', () => {
     expect(errors).toHaveLength(1);
     expect(quota.pendingFor('5')).toBe(1);
     await quota.close();
+  });
+
+  it('retries with jittered backoff and clears pending counts after success', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const calls: Array<[string, number]> = [];
+    const committer: CallCommitter = {
+      useCalls: vi.fn(async (leaseId: string, count: number) => {
+        calls.push([leaseId, count]);
+        if (calls.length === 1) throw new Error('rpc down');
+        return {};
+      }),
+    };
+    const quota = new OnChainQuota({
+      committer,
+      batchSize: 10,
+      flushIntervalMs: 10,
+      retryBaseDelayMs: 100,
+      retryMaxDelayMs: 500,
+    });
+
+    quota.record('12');
+    await quota.flush();
+    expect(calls).toEqual([['12', 1]]);
+    expect(quota.pendingFor('12')).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(49);
+    expect(calls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(calls).toEqual([
+      ['12', 1],
+      ['12', 1],
+    ]);
+    expect(quota.pendingFor('12')).toBe(0);
+    await quota.close();
+  });
+
+  it('stops automatic retries at the configured attempt limit', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const errors: unknown[] = [];
+    const committer: CallCommitter = {
+      useCalls: vi.fn(async () => {
+        throw new Error('rpc down');
+      }),
+    };
+    const quota = new OnChainQuota({
+      committer,
+      batchSize: 10,
+      flushIntervalMs: 0,
+      maxRetryAttempts: 3,
+      retryBaseDelayMs: 100,
+      retryMaxDelayMs: 500,
+      onError: (error) => errors.push(error),
+    });
+
+    quota.record('13');
+    await quota.flush();
+    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(committer.useCalls).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(committer.useCalls).toHaveBeenCalledTimes(3);
+    expect(errors).toHaveLength(3);
+    expect(quota.pendingFor('13')).toBe(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(committer.useCalls).toHaveBeenCalledTimes(3);
   });
 
   it('close() commits whatever is still pending', async () => {

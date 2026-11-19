@@ -1,6 +1,9 @@
 extern crate std;
 
-use crate::{Error, KeyleaseCore, KeyleaseCoreClient, Lease, CONTRACT_VERSION};
+use crate::{
+    Error, KeyleaseCore, KeyleaseCoreClient, Lease, CONTRACT_VERSION, MAX_LEASE_DURATION,
+    MAX_SERVICE_LEN, MIN_SERVICE_LEN,
+};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
@@ -108,6 +111,78 @@ fn register_service_rejects_non_positive_price() {
     assert!(svc.active);
     assert_eq!(svc.price_per_call, 1_000);
     assert_eq!(h.client.get_service(&service_id(&h.env)).provider, h.provider);
+}
+
+#[test]
+fn register_service_validates_service_id_length_and_charset() {
+    let h = setup();
+
+    // Empty string
+    let empty = String::from_str(&h.env, "");
+    let err = h
+        .client
+        .try_register_service(&h.provider, &empty, &1_000)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidService);
+
+    // Too long (> 64 chars, 65 bytes)
+    let too_long = String::from_str(
+        &h.env,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    assert_eq!(too_long.len(), MAX_SERVICE_LEN + 1);
+    let err = h
+        .client
+        .try_register_service(&h.provider, &too_long, &1_000)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidService);
+
+    // Whitespace
+    for invalid in &["hello world", " leading", "trailing ", " \t "] {
+        let s = String::from_str(&h.env, invalid);
+        let err = h
+            .client
+            .try_register_service(&h.provider, &s, &1_000)
+            .unwrap_err();
+        assert_eq!(err.unwrap(), Error::InvalidService);
+    }
+
+    // Control characters
+    for invalid in &["api\nservice", "api\x00null", "api\r\n", "api\tname"] {
+        let s = String::from_str(&h.env, invalid);
+        let err = h
+            .client
+            .try_register_service(&h.provider, &s, &1_000)
+            .unwrap_err();
+        assert_eq!(err.unwrap(), Error::InvalidService);
+    }
+
+    // Disallowed punctuation / special characters
+    for invalid in &["api/v1", "api:v1", "api@v1", "api#1", "api$"] {
+        let s = String::from_str(&h.env, invalid);
+        let err = h
+            .client
+            .try_register_service(&h.provider, &s, &1_000)
+            .unwrap_err();
+        assert_eq!(err.unwrap(), Error::InvalidService);
+    }
+
+    // Valid: 1 char
+    let single = String::from_str(&h.env, "a");
+    assert_eq!(single.len(), MIN_SERVICE_LEN);
+    assert!(h.client.try_register_service(&h.provider, &single, &100).is_ok());
+
+    // Valid: exactly 64 chars
+    let max_len = String::from_str(
+        &h.env,
+        "abcdefghijklmnopqrstuvwxyz0123456789.ABCDEF-GHIJKLMNOP_QRSTUVWXY",
+    );
+    assert_eq!(max_len.len(), MAX_SERVICE_LEN);
+    assert!(h.client.try_register_service(&h.provider, &max_len, &100).is_ok());
+
+    // Valid: combination of allowed symbols
+    let symbols = String::from_str(&h.env, "my_service-v1.0");
+    assert!(h.client.try_register_service(&h.provider, &symbols, &100).is_ok());
 }
 
 #[test]
@@ -225,6 +300,51 @@ fn create_lease_validates_its_arguments() {
         .try_create_lease(&h.consumer, &service_id(&h.env), &10, &60)
         .unwrap_err();
     assert_eq!(err.unwrap(), Error::ServiceInactive);
+}
+
+#[test]
+fn create_lease_rejects_overflowing_and_excessive_durations() {
+    let h = setup();
+    register(&h);
+    let consumer_before = balance(&h, &h.consumer);
+    let escrow_before = balance(&h, &h.client.address);
+
+    // u64::MAX duration
+    let err = h
+        .client
+        .try_create_lease(&h.consumer, &service_id(&h.env), &10, &u64::MAX)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidDuration);
+
+    // u64::MAX - timestamp duration
+    let timestamp = h.env.ledger().timestamp();
+    let near_overflow = u64::MAX - timestamp;
+    let err = h
+        .client
+        .try_create_lease(&h.consumer, &service_id(&h.env), &10, &near_overflow)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidDuration);
+
+    // Upper bound exceeded (MAX_LEASE_DURATION + 1)
+    let err = h
+        .client
+        .try_create_lease(&h.consumer, &service_id(&h.env), &10, &(MAX_LEASE_DURATION + 1))
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidDuration);
+
+    // Verify token balance was not modified (tokens not moved on error)
+    assert_eq!(balance(&h, &h.consumer), consumer_before);
+    assert_eq!(balance(&h, &h.client.address), escrow_before);
+    assert_eq!(h.client.get_config().lease_count, 0);
+
+    // Exactly MAX_LEASE_DURATION succeeds
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &MAX_LEASE_DURATION);
+    assert_eq!(id, 1);
+    let lease = h.client.get_lease(&id);
+    assert_eq!(lease.expires_at, timestamp + MAX_LEASE_DURATION);
+    assert_eq!(balance(&h, &h.consumer), consumer_before - 10_000);
 }
 
 #[test]

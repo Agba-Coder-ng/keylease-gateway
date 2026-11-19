@@ -39,6 +39,16 @@ const MIN_TTL: u32 = DAY_IN_LEDGERS * 7;
 /// Extend it to a month.
 const EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 
+/// Minimum allowed service identifier length in characters/bytes.
+pub const MIN_SERVICE_LEN: u32 = 1;
+/// Maximum allowed service identifier length in characters/bytes.
+pub const MAX_SERVICE_LEN: u32 = 64;
+
+/// Minimum allowed lease duration in seconds (1 second).
+pub const MIN_LEASE_DURATION: u64 = 1;
+/// Maximum allowed lease duration in seconds (365 days).
+pub const MAX_LEASE_DURATION: u64 = 365 * 24 * 3600;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -59,6 +69,8 @@ pub enum Error {
     Unauthorized = 14,
     /// `create_lease` was called with the contract itself as consumer.
     InvalidConsumer = 15,
+    /// `register_service` was called with an invalid service id (length or charset).
+    InvalidService = 16,
 }
 
 #[contracttype]
@@ -143,6 +155,25 @@ fn load_config(env: &Env) -> Result<Config, Error> {
 fn store_config(env: &Env, config: &Config) {
     env.storage().instance().set(&config_key(), config);
     bump_instance_ttl(env);
+}
+
+/// Validates that a service identifier is non-empty, at most `MAX_SERVICE_LEN` bytes,
+/// and contains only ASCII alphanumeric characters, hyphens, underscores, or dots.
+pub fn validate_service_id(service: &soroban_sdk::String) -> Result<(), Error> {
+    let len = service.len();
+    if !(MIN_SERVICE_LEN..=MAX_SERVICE_LEN).contains(&len) {
+        return Err(Error::InvalidService);
+    }
+    let mut buf = [0u8; MAX_SERVICE_LEN as usize];
+    let slice = &mut buf[..len as usize];
+    service.copy_into_slice(slice);
+    for &b in slice.iter() {
+        let is_allowed = matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.');
+        if !is_allowed {
+            return Err(Error::InvalidService);
+        }
+    }
+    Ok(())
 }
 
 fn load_service(env: &Env, service: &soroban_sdk::String) -> Result<Service, Error> {
@@ -256,6 +287,7 @@ impl KeyleaseCore {
     ) -> Result<Service, Error> {
         load_config(&env)?;
         provider.require_auth();
+        validate_service_id(&service)?;
         if price_per_call <= 0 {
             return Err(Error::InvalidPrice);
         }
@@ -329,9 +361,14 @@ impl KeyleaseCore {
         if calls == 0 {
             return Err(Error::InvalidCalls);
         }
-        if duration == 0 {
+        if duration == 0 || duration > MAX_LEASE_DURATION {
             return Err(Error::InvalidDuration);
         }
+        let expires_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(duration)
+            .ok_or(Error::InvalidDuration)?;
 
         let mut config = load_config(&env)?;
         let stored = load_service(&env, &service)?;
@@ -361,7 +398,7 @@ impl KeyleaseCore {
             consumer: consumer.clone(),
             calls_limit: calls,
             calls_used: 0,
-            expires_at: env.ledger().timestamp() + duration,
+            expires_at,
             active: true,
             settled: false,
             price_paid: amount,

@@ -11,27 +11,29 @@
  */
 import type { Keypair } from '@stellar/stellar-sdk';
 import { SorobanClient, type LeaseState } from '../client/soroban.js';
-import { parseConsumerSecret, type NetworkArgs } from './lease.js';
+import { parseConsumerSecret, resolveConsumerSecret, type NetworkArgs } from './lease.js';
 import type { CliIo } from '../index.js';
 
 export interface SettleArgs extends NetworkArgs {
   lease: string;
-  secret: string;
+  secret: string | undefined;
   json: boolean;
 }
 
 export interface RevokeArgs extends NetworkArgs {
   lease: string;
-  secret: string;
+  secret: string | undefined;
   json: boolean;
 }
 
 export interface SettleDeps {
   createClient?: (args: SettleArgs) => Pick<SorobanClient, 'settle'>;
+  readSecretFromStdin?: () => Promise<string>;
 }
 
 export interface RevokeDeps {
   createClient?: (args: RevokeArgs) => Pick<SorobanClient, 'revoke'>;
+  readSecretFromStdin?: () => Promise<string>;
 }
 
 function defaultClient(args: NetworkArgs): SorobanClient {
@@ -66,26 +68,32 @@ export function renderLeaseOutcome(
   io.out(`  refunded    : ${refunded} (to consumer)`);
 }
 
-/** `keylease settle --lease <id> --secret <key>` */
+/** `keylease settle --lease <id> [--secret <key>]` */
 export async function settleCommand(
   args: SettleArgs,
   io: CliIo,
   deps: SettleDeps = {},
 ): Promise<number> {
-  const signer: Keypair = parseConsumerSecret(args.secret);
+  const secret = await resolveConsumerSecret(args.secret, {
+    readSecretFromStdin: deps.readSecretFromStdin,
+  });
+  const signer: Keypair = parseConsumerSecret(secret);
   const client = deps.createClient ? deps.createClient(args) : defaultClient(args);
   const lease = await client.settle(args.lease, signer);
   renderLeaseOutcome('settled', lease, io, args.json);
   return 0;
 }
 
-/** `keylease revoke --lease <id> --secret <key>` */
+/** `keylease revoke --lease <id> [--secret <key>]` */
 export async function revokeCommand(
   args: RevokeArgs,
   io: CliIo,
   deps: RevokeDeps = {},
 ): Promise<number> {
-  const signer: Keypair = parseConsumerSecret(args.secret);
+  const secret = await resolveConsumerSecret(args.secret, {
+    readSecretFromStdin: deps.readSecretFromStdin,
+  });
+  const signer: Keypair = parseConsumerSecret(secret);
   const client = deps.createClient ? deps.createClient(args) : defaultClient(args);
   const lease = await client.revoke(args.lease, signer);
   renderLeaseOutcome('revoked', lease, io, args.json);

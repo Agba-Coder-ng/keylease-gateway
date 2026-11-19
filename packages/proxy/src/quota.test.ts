@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { OnChainQuota, type CallCommitter } from './quota.js';
+import { OnChainQuota, QuotaCapacityWarning, type CallCommitter } from './quota.js';
 
 function fakeCommitter(): CallCommitter & { calls: Array<[string, number]> } {
   const calls: Array<[string, number]> = [];
@@ -45,6 +45,56 @@ describe('OnChainQuota', () => {
     await quota.flush();
     expect(committer.calls).toEqual([['3', 3]]);
     await quota.close();
+  });
+
+  it('flushes at the tracked-lease bound and eventually commits every call', async () => {
+    const committer = fakeCommitter();
+    const errors: Array<{ error: unknown; leaseId: string; count: number }> = [];
+    const quota = new OnChainQuota({
+      committer,
+      batchSize: 100,
+      maxTrackedLeases: 2,
+      flushIntervalMs: 0,
+      onError: (error, leaseId, count) => errors.push({ error, leaseId, count }),
+    });
+
+    quota.record('7');
+    quota.record('7');
+    quota.record('9');
+    quota.record('11');
+    quota.record('13');
+    quota.record('15');
+
+    expect(errors).toHaveLength(2);
+    expect(errors[0]).toMatchObject({
+      error: expect.any(QuotaCapacityWarning),
+      leaseId: '7',
+      count: 2,
+    });
+    expect(errors[1]).toMatchObject({
+      error: expect.any(QuotaCapacityWarning),
+      leaseId: '11',
+      count: 1,
+    });
+
+    await quota.close();
+
+    expect(committer.calls).toEqual([
+      ['7', 2],
+      ['9', 1],
+      ['11', 1],
+      ['13', 1],
+      ['15', 1],
+    ]);
+  });
+
+  it('rejects invalid tracked-lease limits', () => {
+    const committer = fakeCommitter();
+    for (const maxTrackedLeases of [0, -1, Number.NaN, 1.5]) {
+      expect(
+        () => new OnChainQuota({ committer, maxTrackedLeases, flushIntervalMs: 0 }),
+      ).toThrow(RangeError);
+    }
   });
 
   it('requeues counts when a commit fails and reports the error', async () => {

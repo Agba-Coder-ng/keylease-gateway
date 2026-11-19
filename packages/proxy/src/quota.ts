@@ -30,15 +30,25 @@ export interface OnChainQuotaOptions {
   committer: CallCommitter;
   /** Commit once this many calls are pending. Defaults to 50. */
   batchSize?: number;
+  /** Maximum distinct leases tracked before an early flush. Defaults to 10 000. */
+  maxTrackedLeases?: number;
   /** Periodic flush interval in ms; `0` disables the timer. Defaults to 10s. */
   flushIntervalMs?: number;
-  /** Called when a commit fails; failed counts are queued again. */
+  /** Called when the lease bound triggers a flush or a commit fails. Failed counts are queued again. */
   onError?: (error: unknown, leaseId: string, count: number) => void;
+}
+
+export class QuotaCapacityWarning extends Error {
+  constructor(maxTrackedLeases: number) {
+    super(`maximum tracked leases (${maxTrackedLeases}) reached; flushing pending calls early`);
+    this.name = 'QuotaCapacityWarning';
+  }
 }
 
 export class OnChainQuota implements QuotaSink {
   private readonly committer: CallCommitter;
   private readonly batchSize: number;
+  private readonly maxTrackedLeases: number;
   private readonly flushIntervalMs: number;
   private readonly onError: (error: unknown, leaseId: string, count: number) => void;
   private readonly pending = new Map<string, number>();
@@ -48,6 +58,11 @@ export class OnChainQuota implements QuotaSink {
   constructor(options: OnChainQuotaOptions) {
     this.committer = options.committer;
     this.batchSize = Math.max(1, options.batchSize ?? 50);
+    const maxTrackedLeases = options.maxTrackedLeases ?? 10_000;
+    if (!Number.isSafeInteger(maxTrackedLeases) || maxTrackedLeases <= 0) {
+      throw new RangeError('maxTrackedLeases must be a positive safe integer');
+    }
+    this.maxTrackedLeases = maxTrackedLeases;
     this.flushIntervalMs = options.flushIntervalMs ?? 10_000;
     this.onError = options.onError ?? (() => {});
     if (this.flushIntervalMs > 0) {
@@ -60,6 +75,12 @@ export class OnChainQuota implements QuotaSink {
   }
 
   record(leaseId: string): void {
+    if (!this.pending.has(leaseId) && this.pending.size >= this.maxTrackedLeases) {
+      const [flushedLeaseId, count] = this.pending.entries().next().value!;
+      void this.flush();
+      this.onError(new QuotaCapacityWarning(this.maxTrackedLeases), flushedLeaseId, count);
+    }
+
     const next = (this.pending.get(leaseId) ?? 0) + 1;
     this.pending.set(leaseId, next);
     if (this.totalPending() >= this.batchSize) {
@@ -73,7 +94,10 @@ export class OnChainQuota implements QuotaSink {
 
   /** Serialises flushes so two commits never overlap. */
   flush(): Promise<void> {
-    this.queue = this.queue.then(() => this.drain());
+    const snapshot = [...this.pending.entries()];
+    if (snapshot.length === 0) return this.queue;
+    this.pending.clear();
+    this.queue = this.queue.then(() => this.drain(snapshot));
     return this.queue;
   }
 
@@ -91,11 +115,7 @@ export class OnChainQuota implements QuotaSink {
     return total;
   }
 
-  private async drain(): Promise<void> {
-    if (this.pending.size === 0) return;
-    const snapshot = [...this.pending.entries()];
-    this.pending.clear();
-
+  private async drain(snapshot: Array<[string, number]>): Promise<void> {
     for (const [leaseId, count] of snapshot) {
       try {
         await this.committer.useCalls(leaseId, count);

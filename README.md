@@ -8,6 +8,9 @@
 [![Soroban](https://img.shields.io/badge/Soroban-soroban--sdk%2029-8A2BE2.svg)](https://soroban.stellar.org)
 [![Stellar Testnet](https://img.shields.io/badge/Stellar-Testnet-08B5E5.svg)](https://stellar.expert/explorer/testnet/contract/CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC)
 
+<!-- Recording placeholder: replace with the hosted ~2-minute testnet demo. -->
+[▶ Watch the end-to-end demo](./docs/media/demo.mp4)
+
 KeyLease sells **prepaid, per-call API access on Stellar**. A provider registers a
 priced service on the Soroban contract, a consumer prepays a lease with real
 XLM, and an edge proxy admits requests only while that lease still has calls
@@ -124,6 +127,9 @@ sequenceDiagram
 
 ## Quickstart
 
+<!-- Generated from scripts/demo/quickstart.sh; placeholder until the GIF is recorded. -->
+![Animated KeyLease quickstart](./docs/media/quickstart.gif)
+
 ```bash
 pnpm install
 pnpm build
@@ -153,6 +159,41 @@ curl -H "Authorization: Bearer $KEYLEASE_SESSION_TOKEN" http://localhost:8080/v1
 
 # 6. settle the lease after it expires (pays provider, refunds the rest)
 node packages/cli/dist/index.js settle --lease 2 --secret "$STELLAR_SECRET"
+```
+
+### Record the demo
+
+The local demo script acquires a five-call **testnet** lease, writes its session
+keys to a private temporary `.env`, starts a local mock upstream and proxy, then
+shows one allowed request and one rejected forged token. It prompts for the
+funded testnet secret without echoing it, suppresses the CLI's token output, and
+never needs or displays a mainnet key. The prepaid testnet lease remains on
+chain after the local processes stop.
+
+For the animated quickstart, install `asciinema` and
+[`agg`](https://github.com/asciinema/agg), then record without enabling stdin
+capture:
+
+```bash
+mkdir -p docs/media
+asciinema rec docs/media/quickstart.cast
+# In the recorded shell:
+bash scripts/demo/quickstart.sh
+# Exit the recorded shell, then render the GIF:
+agg docs/media/quickstart.cast docs/media/quickstart.gif
+```
+
+For the video, record `bash scripts/demo/quickstart.sh` in OBS while narrating
+the flow, save it as `docs/media/demo.mp4`, and replace the placeholder link
+above with the hosted video URL before publishing. Suggested caption / pinned
+comment commands:
+
+```text
+keylease acquire --network testnet --contract <testnet-contract-id> --service weather-api --calls 5 --duration 3600 --secret [hidden]
+keylease env --service weather-api --file .env
+KEYLEASE_UPSTREAM_URL=http://localhost:<local-upstream-port> node packages/proxy/dist/index.js
+curl -i -H "Authorization: Bearer [session token]" http://localhost:<proxy-port>/v1/weather
+curl -i -H "Authorization: Bearer kls1.forged.invalid" http://localhost:<proxy-port>/v1/weather
 ```
 
 Offline sanity check of a token (no RPC required):
@@ -267,6 +308,8 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `KEYLEASE_SHUTDOWN_TIMEOUT_MS` | no | `10000` | Graceful shutdown drain timeout in milliseconds |
 | `PORT` / `HOST` | no | `8080` / `0.0.0.0` | Listen address |
 
+The on-chain quota sink tracks at most 10,000 distinct leases in its pending batch by default. It flushes pending calls early when that bound is reached.
+
 ### Responses
 
 | Status | Meaning |
@@ -275,13 +318,14 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `401 missing_token` / `invalid_token` / `token_expired` | Bearer token absent, malformed, forged or expired |
 | `403 lease_not_found` / `lease_inactive` / `lease_expired` / `consumer_mismatch` | On-chain lease does not permit this call |
 | `403 quota_exhausted` | The lease's call limit has been spent (on chain, locally, or both) |
-| `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) or `/readyz` has no reachable state |
+| `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) or `/readyz` has no reachable state. Includes `Retry-After`, rounded up from the configured cache TTL and capped at 30 seconds |
 | `426 upgrade_required` | `Connection: upgrade` requests (e.g. WebSocket) are not supported; rejected before verification, so no call is consumed. The response carries `Upgrade: HTTP/1.1` |
 | `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed) |
 
 Every response carries `x-request-id`: a valid inbound value (1-128 chars of `A-Za-z0-9._:~+=/-`) is reused, anything else is replaced by a generated UUID. It is also forwarded upstream and appears in denial logs.
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
 Forwarded upstream requests also receive these headers set exclusively by the proxy; any client-supplied `x-keylease-*` headers are stripped to prevent spoofing.
+Once lease verification succeeds, the call remains consumed even if the client disconnects or the upstream request fails; aborted calls are not refunded.
 `/healthz` and `/readyz` endpoints provide health and readiness probes without requiring bearer tokens and are never forwarded upstream.
 
 ---

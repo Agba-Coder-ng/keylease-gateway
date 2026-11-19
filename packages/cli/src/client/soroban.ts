@@ -309,6 +309,149 @@ function contractErrorCode(detail: string): number | null {
   return match?.[1] === undefined ? null : Number(match[1]);
 }
 
+/**
+ * Determines if an error is a transient RPC failure that should be retried.
+ * Retries on:
+ * - 429 (Too Many Requests)
+ * - 5xx errors (server errors)
+ * - Timeout errors
+ * Never retries on contract errors or other client errors.
+ */
+function isTransientError(error: unknown): boolean {
+  // Network timeout errors
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    if (message.includes('timeout') || message.includes('econnrefused') || message.includes('enotfound')) {
+      return true;
+    }
+  }
+
+  // HTTP error responses
+  if (typeof error === 'object' && error !== null) {
+    const err = error as Record<string, unknown>;
+    const status = err.status as unknown;
+    if (typeof status === 'number') {
+      // 429 Too Many Requests
+      if (status === 429) {
+        return true;
+      }
+      // 5xx Server Errors
+      if (status >= 500 && status < 600) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Extracts the Retry-After value from a response in seconds.
+ * Handles both seconds (numeric) and HTTP-date formats.
+ */
+function getRetryAfterSeconds(error: unknown): number | null {
+  if (typeof error === 'object' && error !== null) {
+    const err = error as Record<string, unknown>;
+    const retryAfter = err.retryAfter as unknown;
+
+    if (typeof retryAfter === 'number') {
+      // Already in seconds
+      return retryAfter;
+    }
+    if (typeof retryAfter === 'string') {
+      // Try parsing as a number (seconds)
+      const seconds = Number(retryAfter);
+      if (Number.isFinite(seconds) && seconds > 0) {
+        return seconds;
+      }
+      // Try parsing as HTTP-date (we'll do simple check; full parsing is complex)
+      try {
+        const date = new Date(retryAfter);
+        if (!isNaN(date.getTime())) {
+          const delayMs = date.getTime() - Date.now();
+          if (delayMs > 0) {
+            return Math.ceil(delayMs / 1000);
+          }
+        }
+      } catch {
+        // Ignore parse errors
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Configuration for retry behavior with exponential backoff.
+ */
+interface RetryConfig {
+  maxAttempts: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  backoffMultiplier: number;
+}
+
+const DEFAULT_RETRY_CONFIG: RetryConfig = {
+  maxAttempts: 5,
+  initialDelayMs: 100,
+  maxDelayMs: 10_000,
+  backoffMultiplier: 2,
+};
+
+/**
+ * Executes an async operation with exponential backoff retry on transient errors.
+ * - Retries only on 429, 5xx, and timeout errors
+ * - Never retries on contract errors or other application errors
+ * - Respects Retry-After header when present
+ * - Caps total attempts by maxAttempts
+ *
+ * @param operation The async operation to retry
+ * @param sleep Function to sleep between retries (injected for testing)
+ * @param config Retry configuration
+ * @returns The result of the operation
+ * @throws The last error if all retries are exhausted or a non-transient error occurs
+ */
+async function withRetry<T>(
+  operation: () => Promise<T>,
+  sleep: (ms: number) => Promise<void>,
+  config: Partial<RetryConfig> = {},
+): Promise<T> {
+  const finalConfig = { ...DEFAULT_RETRY_CONFIG, ...config };
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < finalConfig.maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      // Never retry on non-transient errors (including ContractCallError)
+      if (!isTransientError(error)) {
+        throw error;
+      }
+
+      // Don't sleep after the last failed attempt
+      if (attempt === finalConfig.maxAttempts - 1) {
+        throw error;
+      }
+
+      lastError = error;
+
+      // Calculate delay: check for Retry-After first, then use exponential backoff
+      let delayMs = finalConfig.initialDelayMs * Math.pow(finalConfig.backoffMultiplier, attempt);
+      delayMs = Math.min(delayMs, finalConfig.maxDelayMs);
+
+      const retryAfterSeconds = getRetryAfterSeconds(error);
+      if (retryAfterSeconds !== null) {
+        delayMs = Math.min(retryAfterSeconds * 1000, finalConfig.maxDelayMs);
+      }
+
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError ?? new SorobanError('retry exhausted');
+}
+
 export class SorobanClient {
   private readonly server: SorobanRpc;
   private readonly contractId: string;
@@ -486,7 +629,10 @@ export class SorobanClient {
   /** Runs a read-only contract method through `simulateTransaction`. */
   private async simulate(method: string, args: xdr.ScVal[]): Promise<xdr.ScVal> {
     const transaction = this.build(method, args, SIMULATION_SOURCE, '0');
-    const simulation = await this.server.simulateTransaction(transaction);
+    const simulation = await withRetry(
+      () => this.server.simulateTransaction(transaction),
+      this.sleep,
+    );
     if (rpc.Api.isSimulationError(simulation)) {
       const code = contractErrorCode(simulation.error);
       throw new ContractCallError(method, code, simulation.error);
@@ -510,7 +656,10 @@ export class SorobanClient {
     const prepared = await this.server.prepareTransaction(transaction);
     prepared.sign(params.signer);
 
-    const sent = await this.server.sendTransaction(prepared);
+    const sent = await withRetry(
+      () => this.server.sendTransaction(prepared),
+      this.sleep,
+    );
     if (sent.status === 'ERROR') {
       const detail = transactionResultName(sent.errorResult?.result);
       throw new SorobanError(`${params.method} was rejected by the RPC (${sent.hash}): ${detail}`);

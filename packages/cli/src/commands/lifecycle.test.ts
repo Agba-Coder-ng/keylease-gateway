@@ -1,7 +1,7 @@
 import { Keypair } from '@stellar/stellar-sdk';
 import { describe, expect, it } from 'vitest';
-import { revokeCommand, settleCommand } from './lifecycle.js';
-import type { LeaseState } from '../client/soroban.js';
+import { revokeCommand, settleCommand, useCallCommand } from './lifecycle.js';
+import { ContractCallError, type LeaseState } from '../client/soroban.js';
 import type { CliIo } from '../index.js';
 
 const consumer = Keypair.random();
@@ -69,6 +69,95 @@ describe('settleCommand', () => {
     await expect(
       settleCommand({ lease: '42', secret: 'nope', json: false }, io, {
         createClient: () => ({ settle: async () => lease() }),
+      }),
+    ).rejects.toThrow(/Stellar secret seed/);
+  });
+});
+
+describe('useCallCommand', () => {
+  it('commits calls with the gateway signer and reports the updated counters', async () => {
+    const { io, out } = captureIo();
+    const seen: Array<{ leaseId: string; count: number; signer: string }> = [];
+
+    const code = await useCallCommand(
+      { lease: '42', count: 3, secret: consumer.secret(), json: false },
+      io,
+      {
+        createClient: () => ({
+          useCalls: async (leaseId: string, count: number, gateway: Keypair) => {
+            seen.push({ leaseId, count, signer: gateway.publicKey() });
+            return lease({ leaseId, callsUsed: 7 });
+          },
+        }),
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(seen).toEqual([{ leaseId: '42', count: 3, signer: consumer.publicKey() }]);
+    expect(out.join('\n')).toContain('calls used  : 7/10');
+  });
+
+  it('supports --json with the updated calls_used and calls_limit', async () => {
+    const { io, out } = captureIo();
+    await useCallCommand(
+      { lease: '42', count: 2, secret: consumer.secret(), json: true },
+      io,
+      { createClient: () => ({ useCalls: async () => lease({ callsUsed: 6 }) }) },
+    );
+
+    expect(JSON.parse(out.join('\n'))).toMatchObject({
+      lease_id: '42',
+      committed: 2,
+      calls_used: 6,
+      calls_limit: 10,
+      remaining_calls: 4,
+    });
+  });
+
+  it('explains an expired lease instead of surfacing the raw contract error', async () => {
+    const { io } = captureIo();
+    await expect(
+      useCallCommand({ lease: '42', count: 1, secret: consumer.secret(), json: false }, io, {
+        createClient: () => ({
+          useCalls: async () => {
+            throw new ContractCallError('use_call', 7, 'LeaseExpired');
+          },
+        }),
+      }),
+    ).rejects.toThrow(/lease 42 has expired/);
+  });
+
+  it('explains when the signer is not the registered gateway', async () => {
+    const { io } = captureIo();
+    await expect(
+      useCallCommand({ lease: '42', count: 1, secret: consumer.secret(), json: false }, io, {
+        createClient: () => ({
+          useCalls: async () => {
+            throw new ContractCallError('use_call', 14, 'Unauthorized');
+          },
+        }),
+      }),
+    ).rejects.toThrow(/not the registered gateway/);
+  });
+
+  it('explains an auth failure reported without a contract code', async () => {
+    const { io } = captureIo();
+    await expect(
+      useCallCommand({ lease: '42', count: 1, secret: consumer.secret(), json: false }, io, {
+        createClient: () => ({
+          useCalls: async () => {
+            throw new ContractCallError('use_call', null, 'invoke_host_function auth failed');
+          },
+        }),
+      }),
+    ).rejects.toThrow(/require_auth|not the registered gateway/);
+  });
+
+  it('rejects an invalid secret before touching the chain', async () => {
+    const { io } = captureIo();
+    await expect(
+      useCallCommand({ lease: '42', count: 1, secret: 'nope', json: false }, io, {
+        createClient: () => ({ useCalls: async () => lease() }),
       }),
     ).rejects.toThrow(/Stellar secret seed/);
   });

@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { Keypair } from '@stellar/stellar-sdk';
 import { mintSessionToken } from '../token.js';
@@ -73,6 +73,25 @@ export interface EnvDeps {
   store?: SessionStore;
   readFile?: (path: string) => Promise<string>;
   writeFile?: (path: string, contents: string) => Promise<void>;
+  chmod?: (path: string, mode: number) => Promise<void>;
+}
+
+/**
+ * Restricts a written env file to the owner. `fs.writeFile({ mode })` only
+ * applies on creation, so an existing 0644 `.env` would otherwise keep its
+ * world-readable permissions while receiving a bearer token. Platforms without
+ * POSIX modes (e.g. Windows) raise here; the command must not fail because of
+ * that, so the error is swallowed.
+ */
+async function restrictEnvFile(
+  path: string,
+  chmodFile: (path: string, mode: number) => Promise<void>,
+): Promise<void> {
+  try {
+    await chmodFile(path, 0o600);
+  } catch {
+    // Best effort: chmod is unsupported or denied on this platform/filesystem.
+  }
 }
 
 function isLeaseSession(value: unknown): value is LeaseSession {
@@ -304,6 +323,7 @@ export async function envCommand(
   const read = deps.readFile ?? ((path: string) => readFile(path, 'utf8'));
   const write =
     deps.writeFile ?? ((path: string, contents: string) => writeFile(path, contents, { mode: 0o600 }));
+  const chmodFile = deps.chmod ?? ((path: string, mode: number) => chmod(path, mode));
 
   const sessions = await store.load();
   const session = sessions[args.service];
@@ -314,9 +334,13 @@ export async function envCommand(
   }
 
   const entries = envEntriesFor(session);
+  // Tighten permissions on the read path too, in case the file already exists
+  // wider than 0600 before new secrets are merged into it.
+  await restrictEnvFile(args.file, chmodFile);
   const existing = await read(args.file).catch(() => '');
   const merged = mergeEnv(existing, entries);
   await write(args.file, merged);
+  await restrictEnvFile(args.file, chmodFile);
 
   const keys = Object.keys(entries);
   if (args.json) {

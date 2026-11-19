@@ -232,6 +232,33 @@ describe('parseArgv', () => {
     expect(parseArgv(['status', '--token', 'kls1.a.b']).command).toBe('status');
   });
 
+  it('parses use-call with a lease, count and secret', () => {
+    expect(
+      parseArgv(['use-call', '--lease', '42', '--count', '3', '--secret', SECRET, '--json']),
+    ).toEqual({
+      command: 'use-call',
+      args: { lease: '42', count: 3, secret: SECRET, json: true },
+    });
+    expectCliError(
+      () => parseArgv(['use-call', '--lease', '42', '--secret', SECRET]),
+      'missing_option',
+    );
+    expectCliError(
+      () => parseArgv(['use-call', '--lease', '42', '--count', '0', '--secret', SECRET]),
+      'invalid_option',
+    );
+  });
+
+  it('parses whoami with optional network flags and secret', () => {
+    expect(parseArgv(['whoami'])).toEqual({
+      command: 'whoami',
+      args: { network: undefined, rpc: undefined, contract: undefined, secret: undefined, json: false },
+    });
+    expect(
+      parseArgv(['whoami', '--network', 'mainnet', '--secret', SECRET, '--json']),
+    ).toMatchObject({ command: 'whoami', args: { network: 'mainnet', secret: SECRET, json: true } });
+  });
+
   it('parses sessions list and prune flags', () => {
     expect(parseArgv(['sessions'])).toEqual({
       command: 'sessions',
@@ -263,6 +290,10 @@ describe('renderHelp', () => {
       'acquire',
       'env',
       'status',
+      'settle',
+      'revoke',
+      'use-call',
+      'whoami',
       'sessions',
       '--prune',
       '--check-chain',

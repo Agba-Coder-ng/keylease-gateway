@@ -13,16 +13,20 @@ import { statusCommand, type StatusArgs, type StatusDeps } from './commands/stat
 import {
   revokeCommand,
   settleCommand,
+  useCallCommand,
   type RevokeArgs,
   type RevokeDeps,
   type SettleArgs,
   type SettleDeps,
+  type UseCallArgs,
+  type UseCallDeps,
 } from './commands/lifecycle.js';
 import {
   sessionsCommand,
   type SessionsArgs,
   type SessionsDeps,
 } from './commands/sessions.js';
+import { whoamiCommand, type WhoamiArgs, type WhoamiDeps } from './commands/config.js';
 
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
@@ -44,7 +48,15 @@ export class CliError extends Error {
   }
 }
 
-export type CommandName = 'acquire' | 'env' | 'status' | 'settle' | 'revoke' | 'sessions';
+export type CommandName =
+  | 'acquire'
+  | 'env'
+  | 'status'
+  | 'settle'
+  | 'revoke'
+  | 'use-call'
+  | 'sessions'
+  | 'whoami';
 
 export type Invocation =
   | { command: 'help' }
@@ -54,7 +66,9 @@ export type Invocation =
   | { command: 'status'; args: StatusArgs }
   | { command: 'settle'; args: SettleArgs }
   | { command: 'revoke'; args: RevokeArgs }
-  | { command: 'sessions'; args: SessionsArgs };
+  | { command: 'use-call'; args: UseCallArgs }
+  | { command: 'sessions'; args: SessionsArgs }
+  | { command: 'whoami'; args: WhoamiArgs };
 
 export interface RunDeps {
   acquire?: AcquireDeps;
@@ -62,12 +76,15 @@ export interface RunDeps {
   status?: StatusDeps;
   settle?: SettleDeps;
   revoke?: RevokeDeps;
+  'use-call'?: UseCallDeps;
   sessions?: SessionsDeps;
+  whoami?: WhoamiDeps;
 }
 
 const OPTION_SPEC = {
   service: { type: 'string' },
   calls: { type: 'string' },
+  count: { type: 'string' },
   duration: { type: 'string' },
   secret: { type: 'string' },
   lease: { type: 'string' },
@@ -233,6 +250,19 @@ export function parseArgv(argv: string[]): Invocation {
         },
       };
     }
+    case 'use-call': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'use-call',
+        args: {
+          ...networkArgs(values),
+          lease: requireString(values, 'lease'),
+          count: requirePositiveInt(values, 'count'),
+          secret: requireString(values, 'secret'),
+          json: values.json === true,
+        },
+      };
+    }
     case 'sessions': {
       ensureNoPositionals(positionals);
       return {
@@ -240,9 +270,20 @@ export function parseArgv(argv: string[]): Invocation {
         args: { prune: values.prune === true, json: values.json === true },
       };
     }
+    case 'whoami': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'whoami',
+        args: {
+          ...networkArgs(values),
+          secret: optionalString(values, 'secret'),
+          json: values.json === true,
+        },
+      };
+    }
     default:
       throw new CliError(
-        `unknown command "${rawCommand}" (expected acquire, env, status, settle, revoke or sessions)`,
+        `unknown command "${rawCommand}" (expected acquire, env, status, settle, revoke, use-call, sessions or whoami)`,
         'unknown_command',
       );
   }
@@ -257,7 +298,9 @@ Usage:
   ${CLI_NAME} status  --lease <id> | --token <session-token> [--check-chain]
   ${CLI_NAME} settle  --lease <id> --secret <key>
   ${CLI_NAME} revoke  --lease <id> --secret <key>
+  ${CLI_NAME} use-call --lease <id> --count <n> --secret <gateway-key>
   ${CLI_NAME} sessions [--prune] [--json]
+  ${CLI_NAME} whoami  [--secret <key>] [--json]
   ${CLI_NAME} help | --version
 
 Commands:
@@ -266,11 +309,15 @@ Commands:
   status    Inspect an on-chain lease, or verify a session token offline
   settle    Settle an expired/exhausted lease: pay the provider, refund the consumer
   revoke    End a lease early and refund its unused calls
+  use-call  Commit served calls on chain as the gateway (WARNING: spends quota
+            without serving a call; use to reconcile after a proxy outage)
   sessions  List locally stored leases or prune expired entries
+  whoami    Show the resolved network, contract, consumer key and stored leases
 
 Options:
   --service <id>       Service identifier the lease is scoped to (required)
   --calls <count>      Number of API calls the lease authorises
+  --count <n>          Number of calls to commit (for "use-call")
   --duration <secs>    Lease lifetime in seconds
   --secret <key>       Stellar secret seed (S...) of the consumer account
   --lease <id>         On-chain lease id (decimal u64)
@@ -331,8 +378,12 @@ export async function run(
         return await settleCommand(invocation.args, io, deps.settle);
       case 'revoke':
         return await revokeCommand(invocation.args, io, deps.revoke);
+      case 'use-call':
+        return await useCallCommand(invocation.args, io, deps['use-call']);
       case 'sessions':
         return await sessionsCommand(invocation.args, io, deps.sessions);
+      case 'whoami':
+        return await whoamiCommand(invocation.args, io, deps.whoami);
     }
   } catch (error) {
     if (error instanceof CliError) {

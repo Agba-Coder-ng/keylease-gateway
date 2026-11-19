@@ -189,16 +189,19 @@ async function checkTokenOnChain(
 }
 
 function renderState(state: LeaseState, io: CliIo, json: boolean): void {
+  const expired = state.expiresAt <= Math.floor(Date.now() / 1000);
+  const remainingCalls = state.settled || !state.active || expired ? 0 : Math.max(0, state.callsLimit - state.callsUsed);
+  
   if (json) {
-    io.out(JSON.stringify(state, null, 2));
+    io.out(JSON.stringify({ ...state, remainingCalls }, null, 2));
     return;
   }
-  const expired = state.expiresAt <= Math.floor(Date.now() / 1000);
   io.out(`Lease ${state.leaseId}`);
   io.out(`  service    : ${state.service}`);
   io.out(`  provider   : ${state.provider}`);
   io.out(`  consumer   : ${state.consumer}`);
   io.out(`  calls      : ${state.callsUsed}/${state.callsLimit}`);
+  io.out(`  remaining  : ${remainingCalls}`);
   io.out(`  escrow     : ${state.pricePaid} (paid into keylease-core)`);
   io.out(`  expires at : ${new Date(state.expiresAt * 1000).toISOString()}${expired ? ' (expired)' : ''}`);
   io.out(`  active     : ${state.active ? 'yes' : 'no'}`);

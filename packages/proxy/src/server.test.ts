@@ -1059,3 +1059,36 @@ describe('in-flight upstream cap', () => {
     }
   });
 });
+
+describe('access log sizes', () => {
+  it('logs request and response byte sizes without the path query', async () => {
+    const { impl } = stubFetch(() => okJson({ hello: 'world' }));
+    const lines: Array<Record<string, unknown>> = [];
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+    app.log.info = ((obj: unknown, msg?: string) => {
+      if (msg === 'access') lines.push(obj as Record<string, unknown>);
+    }) as typeof app.log.info;
+    const res = await app.inject({
+      method: 'POST',
+      url: '/echo?token=secret',
+      headers: { authorization: `Bearer ${mintToken()}`, 'content-type': 'text/plain' },
+      payload: 'abcde',
+    });
+    expect(res.statusCode).toBe(200);
+    await vi.waitFor(() => expect(lines).toHaveLength(1));
+    expect(lines[0]).toMatchObject({
+      method: 'POST',
+      path: '/echo',
+      statusCode: 200,
+      requestBytes: 5,
+      responseBytes: Number(res.headers['content-length']),
+    });
+    expect(Number(res.headers['content-length'])).toBeGreaterThan(0);
+    expect(JSON.stringify(lines[0])).not.toContain('secret');
+    await app.close();
+  });
+});

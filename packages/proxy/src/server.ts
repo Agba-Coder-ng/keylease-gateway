@@ -169,7 +169,22 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
     reply.header(REQUEST_ID_HEADER, request.id);
   });
 
-  app.addHook('onResponse', async () => {
+  app.addHook('onResponse', async (request, reply) => {
+    // Sizes come from headers only; bodies are never buffered or measured here.
+    const requestBytes = Number(request.headers['content-length'] ?? 0);
+    const responseBytes = Number(reply.getHeader('content-length') ?? 0);
+    request.log.info(
+      {
+        requestId: request.id,
+        method: request.method,
+        path: (request.raw.url ?? '/').split('?')[0],
+        statusCode: reply.statusCode,
+        requestBytes: Number.isFinite(requestBytes) ? requestBytes : 0,
+        responseBytes: Number.isFinite(responseBytes) ? responseBytes : 0,
+        durationMs: Math.round(reply.elapsedTime),
+      },
+      'access',
+    );
     inFlightRequests -= 1;
     if (inFlightRequests <= 0) {
       for (const waiter of drainWaiters) {

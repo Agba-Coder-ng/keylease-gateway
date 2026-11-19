@@ -96,7 +96,7 @@ export class LeaseVerifier {
    * capped at min(cacheTtlMs, 5000) so unknown leases do not burn RPC quota.
    */
   private readonly denialCache: TtlCache<true>;
-  private readonly cacheTtlMs: number;
+  readonly cacheTtlMs: number;
   private readonly clock: () => number;
   private readonly maxCounters: number;
   private readonly quotaSink: QuotaSink | undefined;

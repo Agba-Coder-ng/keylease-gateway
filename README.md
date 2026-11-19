@@ -120,8 +120,9 @@ sequenceDiagram
   the proxy follows the contract's ABI instead of its storage layout, and
   contract errors (`Error(Contract, #5)`) map to precise HTTP decisions.
 - **Long-lived entries are bumped.** Leases and services are persistent
-  entries with TTL extension, so a lease does not disappear from state while it
-  is still payable.
+  entries whose TTL is extended on every write **and** every read, so a lease
+  does not disappear from state while it is still payable, even if it is only
+  ever read (the proxy's `get_lease` path).
 
 ---
 
@@ -295,6 +296,11 @@ refuse a major version they do not recognise.
 
 Storage: `Config` in instance storage; `Service(String)` and `Lease(u64)` as
 persistent entries with TTL bumps (`MIN_TTL` 7 days, `EXTEND_TO` 30 days).
+The bump happens on writes (`register_service`, `create_lease`, `use_call`, …)
+and on reads: `load_config`, `load_service` and `load_lease` extend the entry
+when its TTL falls below `MIN_TTL`, so a lease that is only ever simulated or
+read stays alive. `extend_ttl` is a no-op above the threshold, so the hot read
+path costs one storage access and no write.
 Events: `init`, `gateway`, `service_registered`, `lease_created`,
 `calls_committed`, `lease_revoked`, `lease_settled`.
 

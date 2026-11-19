@@ -121,9 +121,8 @@ export class OnChainQuota implements QuotaSink {
     const snapshot = [...this.pending.entries()];
     if (snapshot.length === 0) return this.queue;
     this.pending.clear();
-    this.queue = this.queue.then(() => this.drain(snapshot));
     this.clearRetryTimer();
-    this.queue = this.queue.then(() => this.drain());
+    this.queue = this.queue.then(() => this.drain(snapshot));
     return this.queue;
   }
 
@@ -143,10 +142,6 @@ export class OnChainQuota implements QuotaSink {
   }
 
   private async drain(snapshot: Array<[string, number]>): Promise<void> {
-  private async drain(): Promise<void> {
-    if (this.pending.size === 0) return;
-    const snapshot = [...this.pending.entries()];
-    this.pending.clear();
     let failed = false;
 
     for (const [leaseId, count] of snapshot) {

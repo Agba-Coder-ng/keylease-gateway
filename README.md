@@ -120,8 +120,9 @@ sequenceDiagram
   the proxy follows the contract's ABI instead of its storage layout, and
   contract errors (`Error(Contract, #5)`) map to precise HTTP decisions.
 - **Long-lived entries are bumped.** Leases and services are persistent
-  entries with TTL extension, so a lease does not disappear from state while it
-  is still payable.
+  entries whose TTL is extended on every write **and** every read, so a lease
+  does not disappear from state while it is still payable, even if it is only
+  ever read (the proxy's `get_lease` path).
 
 ---
 
@@ -276,11 +277,13 @@ lease first; if it is corrupt, back it up or repair it before retrying.
 | --- | --- | --- |
 | `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account |
 | `set_gateway(gateway)` | admin | Rotate the account allowed to commit quota |
+| `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
+| `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
 | `register_service(provider, service, price_per_call)` | provider | Register or re-price a service (`price_per_call > 0`) |
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
 | `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
-| `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`) |
+| `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
 | `get_lease(id)` · `get_service(id)` · `get_config()` · `remaining_calls(id)` | – | Views used by the CLI and proxy |
@@ -293,10 +296,22 @@ renamed entry points, changed arguments or storage layout). Bump
 `contracts/keylease-core/Cargo.toml` with every contract change; clients should
 refuse a major version they do not recognise.
 
-Storage: `Config` in instance storage; `Service(String)` and `Lease(u64)` as
+Storage: `Config` and the pending admin (`PendingAdmin`, set by
+`propose_admin`) in instance storage; `Service(String)` and `Lease(u64)` as
 persistent entries with TTL bumps (`MIN_TTL` 7 days, `EXTEND_TO` 30 days).
-Events: `init`, `gateway`, `service_registered`, `lease_created`,
-`calls_committed`, `lease_revoked`, `lease_settled`.
+The bump happens on writes (`register_service`, `create_lease`, `use_call`, …)
+and on reads: `load_config`, `load_service` and `load_lease` extend the entry
+when its TTL falls below `MIN_TTL`, so a lease that is only ever simulated or
+read stays alive. `extend_ttl` is a no-op above the threshold, so the hot read
+path costs one storage access and no write.
+Events: `init`, `gateway`, `admin_proposed`, `admin_changed`,
+`service_registered`, `lease_created`, `calls_committed`, `lease_revoked`,
+`lease_settled`.
+
+`calls_committed` keeps its `(calls_committed, consumer, lease_id)` topic
+tuple, so existing topic filters still match, but its payload is now the pair
+`(calls_used, remaining)`. Both fields are `u32`; indexers that decoded a bare
+`calls_used` value must read the pair (or the first element).
 
 Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 `Error(Contract, #n)`:
@@ -428,7 +443,7 @@ keylease-gateway/
 ## Development
 
 ```bash
-pnpm contract:test # cargo test: 14 contract tests
+pnpm contract:test # cargo test: 36 contract tests
 pnpm contract:build# stellar contract build (wasm32v1-none)
 pnpm build         # tsc emit for both packages (topological order)
 pnpm test          # vitest: 110 tests (58 CLI + 52 proxy)

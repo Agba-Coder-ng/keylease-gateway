@@ -260,6 +260,7 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `KEYLEASE_QUOTA_FLUSH_MS` | no | `10000` | Periodic quota commit interval |
 | `KEYLEASE_CACHE_TTL_MS` | no | `30000` | Lease-state cache TTL |
 | `KEYLEASE_MAX_BODY_BYTES` | no | `33554432` (32 MiB) | Maximum allowed request body size in bytes |
+| `KEYLEASE_TRUST_PROXY` | no | `false` | Trusted edge proxies for `x-forwarded-*`: `true`, a hop count, or a comma-separated IP/CIDR list. When off, inbound `x-forwarded-*` headers are dropped and rebuilt from the socket |
 | `KEYLEASE_FORWARD_AUTH` | no | `false` | Forward the caller's bearer token upstream |
 | `KEYLEASE_METRICS_ENABLED` | no | `false` | Expose Prometheus metrics on `/metrics` |
 | `KEYLEASE_SHUTDOWN_TIMEOUT_MS` | no | `10000` | Graceful shutdown drain timeout in milliseconds |
@@ -274,8 +275,10 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `403 lease_not_found` / `lease_inactive` / `lease_expired` / `consumer_mismatch` | On-chain lease does not permit this call |
 | `403 quota_exhausted` | The lease's call limit has been spent (on chain, locally, or both) |
 | `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) or `/readyz` has no reachable state |
+| `426 upgrade_required` | `Connection: upgrade` requests (e.g. WebSocket) are not supported; rejected before verification, so no call is consumed. The response carries `Upgrade: HTTP/1.1` |
 | `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed) |
 
+Every response carries `x-request-id`: a valid inbound value (1-128 chars of `A-Za-z0-9._:~+=/-`) is reused, anything else is replaced by a generated UUID. It is also forwarded upstream and appears in denial logs.
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
 Forwarded upstream requests also receive these headers set exclusively by the proxy; any client-supplied `x-keylease-*` headers are stripped to prevent spoofing.
 `/healthz` and `/readyz` endpoints provide health and readiness probes without requiring bearer tokens and are never forwarded upstream.

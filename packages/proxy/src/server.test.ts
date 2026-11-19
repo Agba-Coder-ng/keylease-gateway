@@ -812,3 +812,157 @@ describe('resolveConfig KEYLEASE_MAX_BODY_BYTES', () => {
     ).toThrow(ProxyConfigError);
   });
 });
+
+describe('x-request-id propagation', () => {
+  function setup() {
+    const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+    return { app, calls };
+  }
+  const forwardedId = (calls: FetchCall[]) =>
+    (calls[0]?.init as { headers: Record<string, string> }).headers['x-request-id'];
+
+  it('reuses a valid inbound id, forwards it and echoes it', async () => {
+    const { app, calls } = setup();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/',
+      headers: { authorization: `Bearer ${mintToken()}`, 'x-request-id': 'req-123.abc' },
+    });
+    expect(res.headers['x-request-id']).toBe('req-123.abc');
+    expect(forwardedId(calls)).toBe('req-123.abc');
+    await app.close();
+  });
+
+  it('generates an id when none is supplied, including on denials', async () => {
+    const { app, calls } = setup();
+    const ok = await app.inject({
+      method: 'GET',
+      url: '/',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+    expect(ok.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
+    expect(forwardedId(calls)).toBe(ok.headers['x-request-id']);
+    const denied = await app.inject({ method: 'GET', url: '/' });
+    expect(denied.statusCode).toBe(401);
+    expect(denied.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
+    await app.close();
+  });
+
+  it('replaces ids with unsafe characters or excessive length', async () => {
+    const { app } = setup();
+    for (const bad of ['bad id<script>', 'a'.repeat(129), 'tab\tid']) {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/',
+        headers: { authorization: `Bearer ${mintToken()}`, 'x-request-id': bad },
+      });
+      expect(res.headers['x-request-id']).not.toBe(bad);
+      expect(res.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
+    }
+    await app.close();
+  });
+});
+
+describe('WebSocket upgrade requests', () => {
+  it('answers 426 before verification and consumes no quota', async () => {
+    const getLeaseState = vi.fn(async () => leaseState());
+    const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState }),
+      fetchImpl: impl,
+    });
+    const res = await app.inject({
+      method: 'GET',
+      url: '/socket',
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        connection: 'keep-alive, Upgrade',
+        upgrade: 'websocket',
+      },
+    });
+    expect(res.statusCode).toBe(426);
+    expect(res.headers['upgrade']).toBe('HTTP/1.1');
+    expect(res.json()).toMatchObject({ error: 'upgrade_required' });
+    expect(getLeaseState).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+
+    const next = await app.inject({
+      method: 'GET',
+      url: '/',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+    expect(next.headers['x-keylease-calls-remaining']).toBe('9');
+    await app.close();
+  });
+});
+
+describe('trustProxy and x-forwarded-* headers', () => {
+  async function forwarded(trustProxy: boolean | string[], remoteAddress: string) {
+    const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+      trustProxy,
+    });
+    await app.inject({
+      method: 'GET',
+      url: '/',
+      remoteAddress,
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        host: 'proxy.local',
+        'x-forwarded-for': '6.6.6.6',
+        'x-forwarded-proto': 'https',
+        'x-forwarded-host': 'evil.example',
+      },
+    });
+    await app.close();
+    return (calls[0]?.init as { headers: Record<string, string> }).headers;
+  }
+
+  it('drops spoofed x-forwarded-* headers when trust is off (default)', async () => {
+    const headers = await forwarded(false, '192.0.2.10');
+    expect(headers['x-forwarded-for']).toBe('192.0.2.10');
+    expect(headers['x-forwarded-proto']).toBe('http');
+    expect(headers['x-forwarded-host']).toBe('proxy.local');
+  });
+
+  it('derives x-forwarded-* from a trusted edge proxy', async () => {
+    const headers = await forwarded(true, '10.0.0.1');
+    expect(headers['x-forwarded-for']).toBe('6.6.6.6, 10.0.0.1');
+    expect(headers['x-forwarded-proto']).toBe('https');
+    expect(headers['x-forwarded-host']).toBe('evil.example');
+  });
+
+  it('ignores forwarded headers from a peer outside the trusted CIDR list', async () => {
+    const untrusted = await forwarded(['10.0.0.0/8'], '192.0.2.10');
+    expect(untrusted['x-forwarded-for']).toBe('192.0.2.10');
+    expect(untrusted['x-forwarded-proto']).toBe('http');
+    const trusted = await forwarded(['10.0.0.0/8'], '10.1.2.3');
+    expect(trusted['x-forwarded-for']).toBe('6.6.6.6, 10.1.2.3');
+  });
+});
+
+describe('resolveConfig KEYLEASE_TRUST_PROXY', () => {
+  const base = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
+  it('parses false, true, hop counts and CIDR lists', () => {
+    expect(resolveConfig(base).trustProxy).toBe(false);
+    expect(resolveConfig({ ...base, KEYLEASE_TRUST_PROXY: 'true' }).trustProxy).toBe(true);
+    expect(resolveConfig({ ...base, KEYLEASE_TRUST_PROXY: '2' }).trustProxy).toBe(2);
+    expect(
+      resolveConfig({ ...base, KEYLEASE_TRUST_PROXY: '10.0.0.0/8, 127.0.0.1' }).trustProxy,
+    ).toEqual(['10.0.0.0/8', '127.0.0.1']);
+  });
+  it('rejects garbage', () => {
+    expect(() => resolveConfig({ ...base, KEYLEASE_TRUST_PROXY: 'yes please' })).toThrow(
+      ProxyConfigError,
+    );
+  });
+});

@@ -3,6 +3,7 @@
  * token (signature + cached on-chain state + local quota), then forwards
  * allowed requests to the protected upstream API.
  */
+import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import type { LeaseVerifier } from './verifier.js';
 
@@ -36,6 +37,21 @@ export interface ProxyOptions {
   metricsEnabled?: boolean;
   /** Maximum request body size in bytes. Defaults to 32 MiB. */
   maxBodyBytes?: number;
+  /**
+   * Fastify `trustProxy` setting: `true`, a hop count, or CIDR/IP list of
+   * trusted edge proxies. Defaults to `false`, in which case every inbound
+   * `x-forwarded-*` header is dropped instead of forwarded.
+   */
+  trustProxy?: boolean | number | string | string[];
+}
+
+const REQUEST_ID_HEADER = 'x-request-id';
+const VALID_REQUEST_ID = /^[A-Za-z0-9._:~+=/-]{1,128}$/;
+
+/** Returns the inbound request id when it is safe to reuse, otherwise a fresh one. */
+export function resolveRequestId(incoming: string | string[] | undefined): string {
+  if (typeof incoming === 'string' && VALID_REQUEST_ID.test(incoming)) return incoming;
+  return randomUUID();
 }
 
 export const METRICS_LATENCY_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
@@ -71,18 +87,24 @@ export function buildUpstreamHeaders(
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
     if (lower === 'authorization' && options.forwardAuthorization !== true) continue;
     if (lower.startsWith('x-keylease-')) continue;
+    // Forwarding metadata is rebuilt by the proxy from trusted values only.
+    if (lower.startsWith('x-forwarded-')) continue;
     out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
   }
   return out;
 }
 
-function appendForwardedFor(
-  incoming: string | string[] | undefined,
-  remote: string | undefined,
-): string {
-  const existing = Array.isArray(incoming) ? incoming.join(', ') : incoming;
-  if (remote === undefined || remote.length === 0) return existing ?? '';
-  return existing && existing.length > 0 ? `${existing}, ${remote}` : remote;
+function isUpgradeRequest(request: FastifyRequest): boolean {
+  const connection = request.headers.connection;
+  const upgrade = request.headers.upgrade;
+  return (
+    typeof upgrade === 'string' &&
+    upgrade.length > 0 &&
+    typeof connection === 'string' &&
+    connection
+      .split(',')
+      .some((token) => token.trim().toLowerCase() === 'upgrade')
+  );
 }
 
 function allowsBody(method: string): boolean {
@@ -115,7 +137,14 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
   // Parse every payload as a buffer so the proxy forwards bodies untouched.
   const maxBodyBytes = options.maxBodyBytes ?? 32 * 1024 * 1024;
-  const app = Fastify({ logger: options.logger ?? false, bodyLimit: maxBodyBytes });
+  const app = Fastify({
+    logger: options.logger ?? false,
+    bodyLimit: maxBodyBytes,
+    // Fastify accepts a hop count at runtime even though its typings omit `number`.
+    trustProxy: (options.trustProxy ?? false) as boolean,
+    requestIdHeader: false,
+    genReqId: (req) => resolveRequestId(req.headers[REQUEST_ID_HEADER]),
+  });
   app.removeAllContentTypeParsers();
   app.addContentTypeParser('*', { parseAs: 'buffer' }, (_request, body, done) => {
     done(null, body);
@@ -124,8 +153,9 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   let inFlightRequests = 0;
   const drainWaiters = new Set<() => void>();
 
-  app.addHook('onRequest', async () => {
+  app.addHook('onRequest', async (request, reply) => {
     inFlightRequests += 1;
+    reply.header(REQUEST_ID_HEADER, request.id);
   });
 
   app.addHook('onResponse', async () => {
@@ -181,6 +211,18 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   });
   const handler = async (request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> => {
     metrics.requestsTotal += 1;
+    if (isUpgradeRequest(request)) {
+      // Upgrades are never proxied; refuse before the lease is verified or charged.
+      return reply
+        .code(426)
+        .header('connection', 'Upgrade')
+        .header('upgrade', 'HTTP/1.1')
+        .type('application/json; charset=utf-8')
+        .send({
+          error: 'upgrade_required',
+          message: 'protocol upgrades (e.g. WebSocket) are not supported by this proxy',
+        });
+    }
     const decision = await verifier.verifyAuthorization(request.headers.authorization);
     if (!decision.ok) {
       metrics.requestsDenied.set(
@@ -188,7 +230,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
         (metrics.requestsDenied.get(decision.reason) ?? 0) + 1,
       );
       request.log.info(
-        { reason: decision.reason, url: request.url },
+        { reason: decision.reason, url: request.url, requestId: request.id },
         'request denied by lease verifier',
       );
       return reply
@@ -211,8 +253,11 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
       method,
       headers: {
         ...headers,
-        'x-forwarded-for': appendForwardedFor(request.headers['x-forwarded-for'], request.ip),
-        'x-forwarded-host': request.headers.host ?? '',
+        [REQUEST_ID_HEADER]: request.id,
+        // `ips` (only set with trustProxy) is socket-first and stops at the first
+        // untrusted hop, so spoofed entries never reach the upstream chain.
+        'x-forwarded-for': (request.ips ?? [request.ip]).slice().reverse().join(', '),
+        'x-forwarded-host': request.host,
         'x-forwarded-proto': request.protocol,
         'x-keylease-lease-id': decision.lease.leaseId,
         'x-keylease-calls-remaining': String(decision.remainingCalls),
@@ -243,6 +288,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
     reply.code(response.status);
     copyResponseHeaders(reply, response.headers);
+    reply.header(REQUEST_ID_HEADER, request.id);
     reply.header('x-keylease-lease-id', decision.lease.leaseId);
     reply.header('x-keylease-calls-remaining', String(decision.remainingCalls));
 

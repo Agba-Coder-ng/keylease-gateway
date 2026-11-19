@@ -186,6 +186,44 @@ describe('LeaseVerifier on-chain state checks', () => {
   });
 });
 
+describe('LeaseVerifier cache TTL near expiry', () => {
+  it('re-fetches a lease expiring in 2s after 2s, not after the full TTL', async () => {
+    const { verifier, provider, nowMs } = makeVerifier({
+      lease: leaseState({ expiresAt: START + 2 }),
+    });
+    const header = `Bearer ${tokenFor('lease-1')}`;
+    expect((await verifier.verifyAuthorization(header)).ok).toBe(true);
+    nowMs.value += 1_000;
+    expect((await verifier.verifyAuthorization(header)).ok).toBe(true);
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(1);
+    nowMs.value += 1_000;
+    const result = await verifier.verifyAuthorization(header);
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ ok: false, reason: 'lease_expired' });
+  });
+
+  it('keeps the full TTL for long-lived leases', async () => {
+    const { verifier, provider, nowMs } = makeVerifier({
+      lease: leaseState({ expiresAt: START + 3_600 }),
+    });
+    const header = `Bearer ${tokenFor('lease-1')}`;
+    await verifier.verifyAuthorization(header);
+    nowMs.value += 29_000;
+    await verifier.verifyAuthorization(header);
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(1);
+    nowMs.value += 2_000;
+    await verifier.verifyAuthorization(header);
+    expect(provider.getLeaseState).toHaveBeenCalledTimes(2);
+  });
+
+  it('denies an already-expired lease without leaving a cache entry', async () => {
+    const { verifier } = makeVerifier({ lease: leaseState({ expiresAt: START - 1 }) });
+    const result = await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(result).toMatchObject({ ok: false, status: 403, reason: 'lease_expired' });
+    expect(await verifier.isReady()).toBe(false); // isReady requires a cached lease
+  });
+});
+
 describe('LeaseVerifier local call counter', () => {
   it('allows exactly `callsLimit` requests before refusing', async () => {
     const { verifier } = makeVerifier({ lease: leaseState({ callsLimit: 2 }) });

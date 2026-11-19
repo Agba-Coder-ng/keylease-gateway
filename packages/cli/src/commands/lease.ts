@@ -5,7 +5,25 @@ import { mintSessionToken } from '../token.js';
 import { SorobanClient, type CreateLeaseResult } from '../client/soroban.js';
 import type { CliIo } from '../index.js';
 
-/** Where acquired leases are remembered so `keylease env` can find them. */
+/**
+ * Where acquired leases are remembered so `keylease env` can find them.
+ *
+ * Storage format (v2):
+ *   {
+ *     "[service-id]": [
+ *       { leaseId, consumer, token, callsLimit, issuedAt, expiresAt, ... },
+ *       { ... }
+ *     ]
+ *   }
+ *
+ * Multiple leases per service support parallel acquisitions and renewals.
+ * This file is git-ignored and should not be committed to version control.
+ * The store is read-only from the CLI's perspective (no mutations via env command).
+ *
+ * Backward compatibility:
+ *   Old v1 format { "[service]": LeaseSession } is automatically migrated
+ *   to v2 format on first load, converting single sessions to arrays.
+ */
 export const SESSION_STORE_PATH = '.keylease/sessions.json';
 
 export interface NetworkArgs {
@@ -26,6 +44,7 @@ export interface EnvArgs {
   service: string;
   file: string;
   json: boolean;
+  lease?: string;
 }
 
 /** A locally stored lease session produced by `keylease acquire`. */
@@ -42,9 +61,9 @@ export interface LeaseSession {
 }
 
 export interface SessionStore {
-  load(): Promise<Record<string, LeaseSession>>;
+  load(): Promise<Record<string, LeaseSession[]>>;
   save(session: LeaseSession): Promise<void>;
-  saveAll(sessions: Record<string, LeaseSession>): Promise<void>;
+  saveAll(sessions: Record<string, LeaseSession[]>): Promise<void>;
 }
 
 export class SessionStoreError extends Error {
@@ -73,6 +92,7 @@ export interface EnvDeps {
   store?: SessionStore;
   readFile?: (path: string) => Promise<string>;
   writeFile?: (path: string, contents: string) => Promise<void>;
+  now?: () => number;
 }
 
 function isLeaseSession(value: unknown): value is LeaseSession {
@@ -94,14 +114,99 @@ function isLeaseSession(value: unknown): value is LeaseSession {
   );
 }
 
-/** File-backed store, one JSON document keyed by service id. */
+/** Migrates v1 format { [service]: LeaseSession } to v2 format { [service]: LeaseSession[] } */
+function migrateSessionsV1ToV2(
+  parsed: unknown,
+): Record<string, LeaseSession[]> {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {};
+  }
+
+  const result: Record<string, LeaseSession[]> = {};
+  for (const [service, value] of Object.entries(parsed)) {
+    // Check if this is a v1 single session or already v2 array format
+    if (Array.isArray(value)) {
+      // v2 format: validate each item
+      const sessions: LeaseSession[] = [];
+      for (const item of value) {
+        if (isLeaseSession(item)) {
+          sessions.push(item);
+        }
+      }
+      if (sessions.length > 0) {
+        result[service] = sessions;
+      }
+    } else if (isLeaseSession(value)) {
+      // v1 format: wrap single session in array
+      result[service] = [value];
+    }
+  }
+  return result;
+}
+
+/**
+ * Selects the best lease for a service: newest unexpired, or explicit by ID.
+ *
+ * Selection logic:
+ *   - If leaseId is provided: returns that lease (even if expired), or undefined if not found
+ *   - Otherwise: returns the newest unexpired lease by issuedAt, or undefined if all expired
+ *
+ * This enables:
+ *   - Default behavior: env picks the most recent valid lease automatically
+ *   - Explicit override: --lease <id> forces a specific lease
+ *   - Renewal support: multiple concurrent leases are tracked, with newer ones preferred
+ *
+ * @param sessions - All leases for a service
+ * @param now - Current time in seconds (Unix epoch)
+ * @param leaseId - Optional explicit lease ID to select
+ * @returns The selected lease or undefined if selection fails
+ */
+export function selectLease(
+  sessions: LeaseSession[],
+  now: number,
+  leaseId?: string,
+): LeaseSession | undefined {
+  if (leaseId) {
+    // Explicit lease selection
+    return sessions.find((s) => s.leaseId === leaseId);
+  }
+
+  // Find newest unexpired lease
+  const unexpired = sessions.filter((s) => s.expiresAt > now);
+  if (unexpired.length === 0) return undefined;
+
+  // Sort by issuedAt descending (most recent first)
+  return unexpired.sort((a, b) => b.issuedAt - a.issuedAt)[0];
+}
+
+/**
+ * File-backed store for lease sessions, one JSON document keyed by service id.
+ *
+ * Storage schema (v2):
+ *   {
+ *     "[service-id]": [LeaseSession, LeaseSession, ...],
+ *     ...
+ *   }
+ *
+ * Migration from v1:
+ *   The store automatically detects and migrates the old single-session format
+ *   { "[service]": LeaseSession } to the new array format on load. This is
+ *   transparent to callers; save() always writes v2 format.
+ *
+ * Idempotent saves:
+ *   save() replaces any lease with the same leaseId (keeping array size constant
+ *   for a given lease), ensuring multiple saves of the same acquisition are safe.
+ *
+ * File permissions:
+ *   Created with mode 0o600 (owner read/write only) to protect sensitive tokens.
+ */
 export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
   const path = isAbsolute(SESSION_STORE_PATH)
     ? SESSION_STORE_PATH
     : join(cwd, SESSION_STORE_PATH);
 
   return {
-    async load(): Promise<Record<string, LeaseSession>> {
+    async load(): Promise<Record<string, LeaseSession[]>> {
       let raw: string;
       try {
         raw = await readFile(path, 'utf8');
@@ -118,28 +223,36 @@ export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
         throw new SessionStoreError('corrupt', path);
       }
 
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      const sessions = migrateSessionsV1ToV2(parsed);
+      if (Object.keys(sessions).length === 0 && raw.trim().length > 0) {
+        // Had content but no valid sessions were migrated
         throw new SessionStoreError('corrupt', path);
-      }
-      const sessions: Record<string, LeaseSession> = {};
-      for (const [service, session] of Object.entries(parsed)) {
-        if (!isLeaseSession(session)) throw new SessionStoreError('corrupt', path);
-        sessions[service] = session;
       }
       return sessions;
     },
     async save(session: LeaseSession): Promise<void> {
-      let sessions: Record<string, LeaseSession>;
+      let sessions: Record<string, LeaseSession[]>;
       try {
         sessions = await this.load();
       } catch (error) {
         if (!(error instanceof SessionStoreError) || error.code !== 'missing') throw error;
         sessions = {};
       }
-      sessions[session.service] = session;
+
+      // Add or update lease in array (idempotent: replace if same leaseId exists)
+      if (!sessions[session.service]) {
+        sessions[session.service] = [];
+      }
+      const idx = sessions[session.service].findIndex((s) => s.leaseId === session.leaseId);
+      if (idx >= 0) {
+        sessions[session.service][idx] = session;
+      } else {
+        sessions[session.service].push(session);
+      }
+
       await this.saveAll(sessions);
     },
-    async saveAll(sessions: Record<string, LeaseSession>): Promise<void> {
+    async saveAll(sessions: Record<string, LeaseSession[]>): Promise<void> {
       await mkdir(dirname(path), { recursive: true });
       await writeFile(path, `${JSON.stringify(sessions, null, 2)}\n`, { mode: 0o600 });
     },
@@ -195,8 +308,14 @@ function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): v
 /**
  * `keylease acquire --service <id> --calls <count> --duration <secs> --secret <key>`
  *
- * Invokes `create_lease` on `keylease-core`, then mints an ed25519-signed
- * session bearer token bound to `(lease_id, consumer)`.
+ * Invokes `create_lease` on the keylease-core contract, then mints an ed25519-signed
+ * session bearer token bound to `(lease_id, consumer)`. Appends the lease to the
+ * service's lease list in the session store.
+ *
+ * Multiple acquisitions for the same service are supported and idempotent:
+ *   - New lease: appended to the service's array
+ *   - Same leaseId: replaced in-place (e.g., on retry or renewal with tx hash update)
+ *   - env command: automatically selects newest unexpired lease
  */
 export async function acquireCommand(
   args: AcquireArgs,
@@ -291,10 +410,11 @@ export function mergeEnv(existing: string, entries: Record<string, string>): str
 }
 
 /**
- * `keylease env --service <id> [--file .env]`
+ * `keylease env --service <id> [--file .env] [--lease <id>]`
  *
  * Writes the temporary session keys of a previously acquired lease into a local
- * `.env` file so shell tooling can pick them up.
+ * `.env` file so shell tooling can pick them up. Selects the newest unexpired lease
+ * by default, or explicit lease via --lease.
  */
 export async function envCommand(
   args: EnvArgs,
@@ -305,12 +425,24 @@ export async function envCommand(
   const read = deps.readFile ?? ((path: string) => readFile(path, 'utf8'));
   const write =
     deps.writeFile ?? ((path: string, contents: string) => writeFile(path, contents, { mode: 0o600 }));
+  const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
 
-  const sessions = await store.load();
-  const session = sessions[args.service];
-  if (!session) {
+  const allSessions = await store.load();
+  const sessions = allSessions[args.service];
+  if (!sessions || sessions.length === 0) {
     io.err(`no lease found for service "${args.service}"`);
     io.err('run: keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>');
+    return 1;
+  }
+
+  const session = selectLease(sessions, now(), args.lease);
+  if (!session) {
+    io.err(`no valid lease found for service "${args.service}"`);
+    if (args.lease) {
+      io.err(`  (requested lease ${args.lease} not found or expired)`);
+    } else {
+      io.err(`  (all ${sessions.length} leases expired)`);
+    }
     return 1;
   }
 

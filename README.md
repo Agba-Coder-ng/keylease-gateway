@@ -246,7 +246,13 @@ return exit code 1.
 process — it is not printed, logged, or written to disk.
 
 `acquire` remembers the lease in `.keylease/sessions.json` (git-ignored) so
-`env` can find it later. `env` merges these keys, replacing existing ones and
+`env` can find it later. The store is a local cache with best-effort locking:
+writes are serialized within a process, guarded across processes by an
+exclusive `.keylease/sessions.json.lock` (2 s wait; a lock older than 10 s is
+treated as abandoned and removed once), and land via an atomic temp-file
+rename, so parallel `acquire` runs for different services keep every session.
+If the lock stays held, the command fails with a `locked` error naming the
+lock file. `env` merges these keys, replacing existing ones and
 preserving everything else in the file:
 
 ```
@@ -273,11 +279,19 @@ lease first; if it is corrupt, back it up or repair it before retrying.
 | `register_service(provider, service, price_per_call)` | provider | Register or re-price a service (`price_per_call > 0`) |
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
-| `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id |
+| `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
 | `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`) |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
 | `get_lease(id)` · `get_service(id)` · `get_config()` · `remaining_calls(id)` | – | Views used by the CLI and proxy |
+| `version()` | – | Contract ABI version as a `String`, equal to the crate version in `Cargo.toml`; callable before `init` |
+
+`version()` follows semver on the contract ABI: **patch** for internal fixes
+with no interface change, **minor** for additive changes (new entry points,
+views, error variants or events), **major** for breaking changes (removed or
+renamed entry points, changed arguments or storage layout). Bump
+`contracts/keylease-core/Cargo.toml` with every contract change; clients should
+refuse a major version they do not recognise.
 
 Storage: `Config` in instance storage; `Service(String)` and `Lease(u64)` as
 persistent entries with TTL bumps (`MIN_TTL` 7 days, `EXTEND_TO` 30 days).
@@ -297,6 +311,7 @@ Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 | 8 | `LeaseNotSettleable` | `settle` before expiry/exhaustion |
 | 9 | `AlreadySettled` | Escrow already paid out |
 | 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation |
+| 15 | `InvalidConsumer` | `create_lease` consumer is the contract's own address |
 
 Escrow invariant: the contract only ever pays out `price_paid` once per lease,
 split as `used/total` to the provider and `(total-used)/total` to the consumer.

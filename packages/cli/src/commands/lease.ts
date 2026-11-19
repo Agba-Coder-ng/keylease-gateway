@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { Keypair } from '@stellar/stellar-sdk';
 import { mintSessionToken } from '../token.js';
@@ -49,17 +49,95 @@ export interface SessionStore {
 
 export class SessionStoreError extends Error {
   constructor(
-    readonly code: 'missing' | 'corrupt' | 'unreadable',
+    readonly code: 'missing' | 'corrupt' | 'unreadable' | 'locked',
     path: string,
   ) {
-    const guidance =
-      code === 'missing'
-        ? 'Run `keylease acquire` to create a stored lease.'
-        : code === 'corrupt'
-          ? 'Back up or repair the file, then run this command again.'
-          : 'Check file permissions and try again.';
-    super(`Cannot read session store at ${path}: ${code}. ${guidance}`);
+    if (code === 'locked') {
+      super(
+        `Cannot write session store at ${path}: locked. Another keylease process holds ` +
+          `${path}.lock; wait for it to finish, or delete the lock file if no keylease ` +
+          'command is running.',
+      );
+    } else {
+      const guidance =
+        code === 'missing'
+          ? 'Run `keylease acquire` to create a stored lease.'
+          : code === 'corrupt'
+            ? 'Back up or repair the file, then run this command again.'
+            : 'Check file permissions and try again.';
+      super(`Cannot read session store at ${path}: ${code}. ${guidance}`);
+    }
     this.name = 'SessionStoreError';
+  }
+}
+
+export interface FileSessionStoreOptions {
+  /** How long to wait for another process's lock before giving up. */
+  lockTimeoutMs?: number;
+  /** A lock file older than this is considered abandoned and removed once. */
+  staleLockMs?: number;
+}
+
+const DEFAULT_LOCK_TIMEOUT_MS = 2_000;
+const DEFAULT_STALE_LOCK_MS = 10_000;
+const LOCK_POLL_MS = 25;
+
+/** Per-path tail of the in-process write queue. */
+const pendingWrites = new Map<string, Promise<unknown>>();
+
+function errorCode(error: unknown): unknown {
+  return error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+}
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Takes an exclusive `<path>.lock` (O_CREAT | O_EXCL) for cross-process
+ * safety. A lock older than `staleLockMs` is removed and retried once; if the
+ * lock is still held after `timeoutMs`, fails with a `locked` error.
+ */
+async function acquireLock(
+  path: string,
+  timeoutMs: number,
+  staleLockMs: number,
+): Promise<() => Promise<void>> {
+  const lockPath = `${path}.lock`;
+  const deadline = Date.now() + timeoutMs;
+  let removedStale = false;
+  for (;;) {
+    try {
+      const handle = await open(lockPath, 'wx', 0o600);
+      await handle.writeFile(`${process.pid}\n`);
+      await handle.close();
+      return async () => {
+        await unlink(lockPath).catch(() => undefined);
+      };
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') throw error;
+    }
+
+    if (!removedStale) {
+      const info = await stat(lockPath).catch(() => null);
+      if (info && Date.now() - info.mtimeMs > staleLockMs) {
+        removedStale = true;
+        await unlink(lockPath).catch(() => undefined);
+        continue;
+      }
+    }
+    if (Date.now() >= deadline) throw new SessionStoreError('locked', path);
+    await delay(LOCK_POLL_MS);
+  }
+}
+
+/** Writes `contents` to a sibling temp file, then renames it over `path`. */
+async function writeAtomic(path: string, contents: string): Promise<void> {
+  const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    await writeFile(tmp, contents, { mode: 0o600 });
+    await rename(tmp, path);
+  } catch (error) {
+    await unlink(tmp).catch(() => undefined);
+    throw error;
   }
 }
 
@@ -94,11 +172,48 @@ function isLeaseSession(value: unknown): value is LeaseSession {
   );
 }
 
-/** File-backed store, one JSON document keyed by service id. */
-export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
+/**
+ * File-backed store, one JSON document keyed by service id.
+ *
+ * This is a local cache, not a database. Writes are serialized per path within
+ * the process, guarded across processes by a best-effort `<path>.lock` file,
+ * and land via an atomic temp-file rename so readers never see a torn file.
+ */
+export function fileSessionStore(
+  cwd: string = process.cwd(),
+  options: FileSessionStoreOptions = {},
+): SessionStore {
   const path = isAbsolute(SESSION_STORE_PATH)
     ? SESSION_STORE_PATH
     : join(cwd, SESSION_STORE_PATH);
+  const lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+  const staleLockMs = options.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
+
+  /** Runs `task` after every earlier write to `path` in this process, under the file lock. */
+  function exclusive<T>(task: () => Promise<T>): Promise<T> {
+    const previous = pendingWrites.get(path) ?? Promise.resolve();
+    const run = previous
+      .catch(() => undefined)
+      .then(async () => {
+        await mkdir(dirname(path), { recursive: true });
+        const release = await acquireLock(path, lockTimeoutMs, staleLockMs);
+        try {
+          return await task();
+        } finally {
+          await release();
+        }
+      });
+    pendingWrites.set(path, run);
+    void run
+      .finally(() => {
+        if (pendingWrites.get(path) === run) pendingWrites.delete(path);
+      })
+      .catch(() => undefined);
+    return run;
+  }
+
+  const writeSessions = (sessions: Record<string, LeaseSession>): Promise<void> =>
+    writeAtomic(path, `${JSON.stringify(sessions, null, 2)}\n`);
 
   return {
     async load(): Promise<Record<string, LeaseSession>> {
@@ -106,9 +221,7 @@ export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
       try {
         raw = await readFile(path, 'utf8');
       } catch (error) {
-        const code =
-          error && typeof error === 'object' && 'code' in error ? error.code : undefined;
-        throw new SessionStoreError(code === 'ENOENT' ? 'missing' : 'unreadable', path);
+        throw new SessionStoreError(errorCode(error) === 'ENOENT' ? 'missing' : 'unreadable', path);
       }
 
       let parsed: unknown;
@@ -129,19 +242,20 @@ export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
       return sessions;
     },
     async save(session: LeaseSession): Promise<void> {
-      let sessions: Record<string, LeaseSession>;
-      try {
-        sessions = await this.load();
-      } catch (error) {
-        if (!(error instanceof SessionStoreError) || error.code !== 'missing') throw error;
-        sessions = {};
-      }
-      sessions[session.service] = session;
-      await this.saveAll(sessions);
+      await exclusive(async () => {
+        let sessions: Record<string, LeaseSession>;
+        try {
+          sessions = await this.load();
+        } catch (error) {
+          if (!(error instanceof SessionStoreError) || error.code !== 'missing') throw error;
+          sessions = {};
+        }
+        sessions[session.service] = session;
+        await writeSessions(sessions);
+      });
     },
     async saveAll(sessions: Record<string, LeaseSession>): Promise<void> {
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, `${JSON.stringify(sessions, null, 2)}\n`, { mode: 0o600 });
+      await exclusive(() => writeSessions(sessions));
     },
   };
 }

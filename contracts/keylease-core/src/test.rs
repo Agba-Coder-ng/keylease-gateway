@@ -1,6 +1,6 @@
 extern crate std;
 
-use crate::{Error, KeyleaseCore, KeyleaseCoreClient, Lease};
+use crate::{Error, KeyleaseCore, KeyleaseCoreClient, Lease, CONTRACT_VERSION};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
@@ -65,6 +65,21 @@ fn init_is_one_time_and_exposes_config() {
 }
 
 #[test]
+fn version_matches_the_crate_version() {
+    let h = setup();
+    assert_eq!(CONTRACT_VERSION, env!("CARGO_PKG_VERSION"));
+    assert_eq!(h.client.version(), String::from_str(&h.env, CONTRACT_VERSION));
+}
+
+#[test]
+fn version_is_readable_before_init() {
+    let env = Env::default();
+    let contract_id = env.register(KeyleaseCore, ());
+    let client = KeyleaseCoreClient::new(&env, &contract_id);
+    assert_eq!(client.version(), String::from_str(&env, env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
 fn reading_before_init_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -102,6 +117,46 @@ fn quote_prices_a_batch_of_calls() {
     let err = h.client.try_quote(&service_id(&h.env), &0).unwrap_err();
     assert_eq!(err.unwrap(), Error::InvalidCalls);
 
+    let unknown = String::from_str(&h.env, "nope");
+    let err = h.client.try_quote(&unknown, &1).unwrap_err();
+    assert_eq!(err.unwrap(), Error::UnknownService);
+}
+
+#[test]
+fn quote_rejects_overflowing_totals() {
+    let h = setup();
+    h.client
+        .register_service(&h.provider, &service_id(&h.env), &i128::MAX);
+
+    // A single call still fits in i128.
+    assert_eq!(h.client.quote(&service_id(&h.env), &1), i128::MAX);
+    // i128::MAX * 2 overflows: checked_mul must surface InvalidAmount, not trap.
+    let err = h.client.try_quote(&service_id(&h.env), &2).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidAmount);
+    let err = h.client.try_quote(&service_id(&h.env), &u32::MAX).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidAmount);
+}
+
+#[test]
+fn quote_rejects_zero_calls() {
+    let h = setup();
+    register(&h);
+    let err = h.client.try_quote(&service_id(&h.env), &0).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidCalls);
+}
+
+#[test]
+fn quote_rejects_zero_calls_before_looking_up_the_service() {
+    let h = setup();
+    let unknown = String::from_str(&h.env, "nope");
+    let err = h.client.try_quote(&unknown, &0).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidCalls);
+}
+
+#[test]
+fn quote_rejects_an_unknown_service() {
+    let h = setup();
+    register(&h);
     let unknown = String::from_str(&h.env, "nope");
     let err = h.client.try_quote(&unknown, &1).unwrap_err();
     assert_eq!(err.unwrap(), Error::UnknownService);
@@ -169,6 +224,39 @@ fn create_lease_validates_its_arguments() {
         .try_create_lease(&h.consumer, &service_id(&h.env), &10, &60)
         .unwrap_err();
     assert_eq!(err.unwrap(), Error::ServiceInactive);
+}
+
+#[test]
+fn create_lease_rejects_the_contract_as_consumer() {
+    let h = setup();
+    register(&h);
+    let escrow_before = balance(&h, &h.client.address);
+
+    let err = h
+        .client
+        .try_create_lease(&h.client.address, &service_id(&h.env), &10, &60)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidConsumer);
+    assert_eq!(balance(&h, &h.client.address), escrow_before);
+    assert_eq!(h.client.get_config().lease_count, 0);
+}
+
+#[test]
+fn create_lease_allows_admin_and_gateway_as_consumers() {
+    let h = setup();
+    register(&h);
+    let sac = StellarAssetClient::new(&h.env, &h.token);
+    sac.mint(&h.admin, &10_000);
+    sac.mint(&h.gateway, &10_000);
+
+    let id = h
+        .client
+        .create_lease(&h.admin, &service_id(&h.env), &1, &60);
+    assert_eq!(h.client.get_lease(&id).consumer, h.admin);
+    let id = h
+        .client
+        .create_lease(&h.gateway, &service_id(&h.env), &1, &60);
+    assert_eq!(h.client.get_lease(&id).consumer, h.gateway);
 }
 
 #[test]

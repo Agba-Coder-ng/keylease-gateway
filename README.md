@@ -222,6 +222,7 @@ friendbot, writes `deployments.json` (public) and
 | Command | Purpose |
 | --- | --- |
 | `keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>` | Invokes `create_lease` (paying the SAC token into escrow) and prints a signed session bearer token |
+| `keylease env --service <id> [--file .env] [--lease <id>]` | Writes the temporary keys of an acquired lease into a local `.env`. Selects newest unexpired lease by default, or explicit lease via `--lease <id>` |
 | `keylease acquire --service <id> --calls <n> --duration <secs> --dry-run` | Quotes the price of those calls without signing, creating a lease or storing a session |
 | `keylease env --service <id> [--file .env]` | Writes the temporary keys of an acquired lease into a local `.env` |
 | `keylease status --lease <id>` | Reads live lease state by simulating `get_lease` |
@@ -258,6 +259,10 @@ the consumer address the lease would use. Add `--json` for machine-readable
 output (`dry_run: true`, `price`, `expires_at`).
 
 `acquire` remembers the lease in `.keylease/sessions.json` (git-ignored) so
+`env` can find it later. The store maintains multiple leases per service to
+support parallel acquisitions and renewals. `env` selects the newest unexpired
+lease automatically, or use `--lease <id>` to pick a specific one. `env` then
+merges these keys, replacing existing ones and preserving everything else in the file:
 `env` can find it later. The store is a local cache with best-effort locking:
 writes are serialized within a process, guarded across processes by an
 exclusive `.keylease/sessions.json.lock` (2 s wait; a lock older than 10 s is
@@ -297,6 +302,67 @@ lease is active or expired. Add `--json` for machine-readable output, or
 `--prune` to remove expired entries. If the session store is missing, acquire a
 lease first; if it is corrupt, back it up or repair it before retrying.
 
+#### Environment file merge rule
+
+When `keylease env` writes to a `.env` file, it merges the new session keys with
+existing content according to these rules:
+
+- Matching keys are replaced in place, preserving their relative line order and
+  any `export` prefix from the original assignment
+- Duplicate assignments of the same key (whether prefixed with `export` or not)
+  are deduplicated — only the first occurrence is kept, updated with the new
+  value; subsequent duplicates are dropped
+- Non-matching lines and comments are preserved as-is
+- New keys that don't already exist are appended at the end
+- The file always ends with a single newline
+
+Example: starting with this `.env`:
+
+```bash
+export KEYLEASE_SESSION_TOKEN=old_value
+OTHER_VAR=keep_me
+KEYLEASE_SESSION_TOKEN=duplicate  # This line will be dropped
+# My comment
+```
+
+Running `keylease env --service my-api` with a new token produces:
+
+```bash
+export KEYLEASE_SESSION_TOKEN=new_value
+OTHER_VAR=keep_me
+# My comment
+KEYLEASE_SERVICE=my-api
+KEYLEASE_LEASE_ID=...
+```
+
+This ensures that stale or duplicate exported tokens cannot accidentally shadow
+the active lease credentials in shells that process both lines.
+
+#### Session store format
+
+The `.keylease/sessions.json` file stores acquired leases keyed by service id.
+Each service maps to an array of `LeaseSession` objects:
+
+```json
+{
+  "weather-api": [
+    { "leaseId": "123", "consumer": "GCC...", "token": "kls1...", ... },
+    { "leaseId": "456", "consumer": "GCC...", "token": "kls1...", ... }
+  ]
+}
+```
+
+**Multiple leases per service:** `acquire` appends new leases to the service's
+array. This supports parallel acquisitions (e.g., CI jobs) and renewals without
+losing earlier leases' remaining quota. Saving the same `leaseId` twice replaces
+that entry idempotently (e.g., on retry with updated tx hash).
+
+**Automatic migration:** If an older v1 store exists with the format
+`{ "service": LeaseSession }` (single session per service), it is automatically
+converted to v2 on first read. The migration is transparent and saves in v2 format.
+
+**Git-ignored:** `.keylease/sessions.json` contains sensitive session tokens and
+is git-ignored. Never commit it or share the tokens with untrusted parties.
 ### Configuration file
 
 `keylease` reads an optional `.keyleaserc.json` from the working directory once

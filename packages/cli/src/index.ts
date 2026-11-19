@@ -273,7 +273,7 @@ Options:
   --calls <count>      Number of API calls the lease authorises
   --duration <secs>    Lease lifetime in seconds
   --secret <key>       Stellar secret seed (S...) of the consumer account
-  --lease <id>         On-chain lease id (decimal u64)
+  --lease <id>         On-chain lease id (canonical decimal: 0 or [1-9][0-9]*)
   --token <token>      Session bearer token to verify offline
   --check-chain        Check the token's current lease over Soroban RPC
   --file <path>        Target env file for "env" (default: .env)

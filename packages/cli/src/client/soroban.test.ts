@@ -27,15 +27,30 @@ const LEASE: LeaseState = {
 };
 
 describe('parseLeaseId', () => {
-  it('accepts decimal u64 ids', () => {
+  it('accepts canonical decimal form', () => {
+    expect(parseLeaseId('0')).toBe(0n);
     expect(parseLeaseId('1')).toBe(1n);
+    expect(parseLeaseId('7')).toBe(7n);
+    expect(parseLeaseId('42')).toBe(42n);
     expect(parseLeaseId('18446744073709551615')).toBe(0xffff_ffff_ffff_ffffn);
   });
 
-  it('rejects anything else', () => {
-    expect(() => parseLeaseId('lease-1')).toThrow(/decimal u64/);
-    expect(() => parseLeaseId('0')).toThrow(/out of the u64 range/);
+  it('rejects leading zeros', () => {
+    expect(() => parseLeaseId('00')).toThrow(/canonical decimal form/);
+    expect(() => parseLeaseId('007')).toThrow(/canonical decimal form/);
+    expect(() => parseLeaseId('01')).toThrow(/canonical decimal form/);
+  });
+
+  it('rejects out-of-range u64 values', () => {
     expect(() => parseLeaseId('18446744073709551616')).toThrow(/out of the u64 range/);
+    expect(() => parseLeaseId('99999999999999999999')).toThrow(/out of the u64 range/);
+  });
+
+  it('rejects non-decimal formats', () => {
+    expect(() => parseLeaseId('lease-1')).toThrow(/canonical decimal form/);
+    expect(() => parseLeaseId('0x7')).toThrow(/canonical decimal form/);
+    expect(() => parseLeaseId('1.5')).toThrow(/canonical decimal form/);
+    expect(() => parseLeaseId('1e5')).toThrow(/canonical decimal form/);
   });
 });
 

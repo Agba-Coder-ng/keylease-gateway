@@ -172,6 +172,39 @@ fn create_lease_validates_its_arguments() {
 }
 
 #[test]
+fn create_lease_rejects_the_contract_as_consumer() {
+    let h = setup();
+    register(&h);
+    let escrow_before = balance(&h, &h.client.address);
+
+    let err = h
+        .client
+        .try_create_lease(&h.client.address, &service_id(&h.env), &10, &60)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidConsumer);
+    assert_eq!(balance(&h, &h.client.address), escrow_before);
+    assert_eq!(h.client.get_config().lease_count, 0);
+}
+
+#[test]
+fn create_lease_allows_admin_and_gateway_as_consumers() {
+    let h = setup();
+    register(&h);
+    let sac = StellarAssetClient::new(&h.env, &h.token);
+    sac.mint(&h.admin, &10_000);
+    sac.mint(&h.gateway, &10_000);
+
+    let id = h
+        .client
+        .create_lease(&h.admin, &service_id(&h.env), &1, &60);
+    assert_eq!(h.client.get_lease(&id).consumer, h.admin);
+    let id = h
+        .client
+        .create_lease(&h.gateway, &service_id(&h.env), &1, &60);
+    assert_eq!(h.client.get_lease(&id).consumer, h.gateway);
+}
+
+#[test]
 fn use_call_accumulates_and_clamps_at_the_limit() {
     let h = setup();
     register(&h);

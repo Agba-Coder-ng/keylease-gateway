@@ -142,6 +142,10 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   const fetchImpl: typeof fetch = options.fetchImpl ?? globalThis.fetch;
   const forwardAuthorization = options.forwardAuthorization === true;
   const requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+  const verificationRetryAfterSeconds = Math.max(
+    1,
+    Math.ceil(Math.min(verifier.cacheTtlMs, 30_000) / 1_000),
+  );
 
   // Parse every payload as a buffer so the proxy forwards bodies untouched.
   const maxBodyBytes = options.maxBodyBytes ?? 32 * 1024 * 1024;
@@ -282,10 +286,11 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
         { reason: decision.reason, url: request.url, requestId: request.id },
         'request denied by lease verifier',
       );
-      return reply
-        .code(decision.status)
-        .type('application/json; charset=utf-8')
-        .send({ error: decision.reason, message: decision.message });
+      const deniedReply = reply.code(decision.status).type('application/json; charset=utf-8');
+      if (decision.status === 503) {
+        deniedReply.header('retry-after', String(verificationRetryAfterSeconds));
+      }
+      return deniedReply.send({ error: decision.reason, message: decision.message });
     }
 
     metrics.requestsAllowed += 1;
@@ -297,6 +302,15 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
       allowsBody(method) && Buffer.isBuffer(request.body) && request.body.length > 0
         ? request.body
         : undefined;
+    const clientAbortController = new AbortController();
+    const socket = request.raw.socket;
+    const abortOnDisconnect = () => clientAbortController.abort();
+    if (socket.destroyed) {
+      abortOnDisconnect();
+    } else {
+      socket.once('close', abortOnDisconnect);
+    }
+    const timeoutSignal = requestTimeoutMs > 0 ? AbortSignal.timeout(requestTimeoutMs) : undefined;
 
     const init: ForwardedRequestInit = {
       method,
@@ -312,46 +326,63 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
         'x-keylease-calls-remaining': String(decision.remainingCalls),
       },
       body: payload,
-      signal: requestTimeoutMs > 0 ? AbortSignal.timeout(requestTimeoutMs) : undefined,
+      signal:
+        timeoutSignal === undefined
+          ? clientAbortController.signal
+          : AbortSignal.any([timeoutSignal, clientAbortController.signal]),
     };
 
-    const startTime = performance.now();
-    let response: Response;
     try {
-      response = await fetchImpl(target, init);
-    } catch (error) {
+      if (clientAbortController.signal.aborted) return reply;
+
+      const startTime = performance.now();
+      let response: Response;
+      try {
+        response = await fetchImpl(target, init);
+      } catch (error) {
+        recordLatency((performance.now() - startTime) / 1000);
+        if (clientAbortController.signal.aborted) return reply;
+        const timedOut =
+          error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+        request.log.error({ err: error, target }, 'upstream request failed');
+        return reply
+          .code(timedOut ? 504 : 502)
+          .type('application/json; charset=utf-8')
+          .send({
+            error: timedOut ? 'gateway_timeout' : 'bad_gateway',
+            message: timedOut ? 'upstream did not respond in time' : 'upstream is unreachable',
+          });
+      }
+
       recordLatency((performance.now() - startTime) / 1000);
-      const timedOut =
-        error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
-      request.log.error({ err: error, target }, 'upstream request failed');
-      return reply
-        .code(timedOut ? 504 : 502)
-        .type('application/json; charset=utf-8')
-        .send({
-          error: timedOut ? 'gateway_timeout' : 'bad_gateway',
-          message: timedOut ? 'upstream did not respond in time' : 'upstream is unreachable',
-        });
+
+      reply.code(response.status);
+      copyResponseHeaders(reply, response.headers);
+      reply.header(REQUEST_ID_HEADER, request.id);
+      reply.header('x-keylease-lease-id', decision.lease.leaseId);
+      reply.header('x-keylease-calls-remaining', String(decision.remainingCalls));
+
+      const emptyBody =
+        method === 'HEAD' || response.status === 204 || response.status === 304;
+      if (emptyBody) {
+        return reply.send();
+      }
+
+      let responseBody: ArrayBuffer;
+      try {
+        responseBody = await response.arrayBuffer();
+      } catch (error) {
+        if (clientAbortController.signal.aborted) return reply;
+        throw error;
+      }
+      if (clientAbortController.signal.aborted) return reply;
+      if (!response.headers.has('content-type')) {
+        reply.type('application/octet-stream');
+      }
+      return reply.send(Buffer.from(responseBody));
+    } finally {
+      socket.off('close', abortOnDisconnect);
     }
-
-    recordLatency((performance.now() - startTime) / 1000);
-
-    reply.code(response.status);
-    copyResponseHeaders(reply, response.headers);
-    reply.header(REQUEST_ID_HEADER, request.id);
-    reply.header('x-keylease-lease-id', decision.lease.leaseId);
-    reply.header('x-keylease-calls-remaining', String(decision.remainingCalls));
-
-    const emptyBody =
-      method === 'HEAD' || response.status === 204 || response.status === 304;
-    if (emptyBody) {
-      return reply.send();
-    }
-
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (!response.headers.has('content-type')) {
-      reply.type('application/octet-stream');
-    }
-    return reply.send(buffer);
   };
 
   app.get('/healthz', async (_request, reply) => {
@@ -365,6 +396,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
     }
     return reply
       .code(503)
+      .header('retry-after', String(verificationRetryAfterSeconds))
       .type('application/json; charset=utf-8')
       .send({
         error: 'verification_unavailable',

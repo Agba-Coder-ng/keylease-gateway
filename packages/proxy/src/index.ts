@@ -30,7 +30,7 @@ import { Keypair } from '@stellar/stellar-sdk';
 import { SorobanClient } from '@keylease/cli/soroban';
 import { buildProxyServer, DEFAULT_MAX_IN_FLIGHT, drainProxyServer } from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
-import { OnChainQuota, type QuotaSink } from './quota.js';
+import { OnChainQuota, QuotaCapacityWarning, type QuotaSink } from './quota.js';
 
 export * from './cache.js';
 export * from './quota.js';
@@ -235,7 +235,9 @@ export function quotaSinkFrom(
     onError: (error, leaseId, count) => {
       logger.warn(
         { err: error, leaseId, count },
-        'on-chain quota commit failed; calls requeued',
+        error instanceof QuotaCapacityWarning
+          ? 'on-chain quota lease limit reached; flushing pending calls early'
+          : 'on-chain quota commit failed; calls requeued',
       );
     },
   });

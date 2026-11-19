@@ -1,3 +1,4 @@
+import { request as httpRequest } from 'node:http';
 import { Keypair } from '@stellar/stellar-sdk';
 import { mintSessionToken } from '@keylease/cli/token';
 import type { LeaseState } from '@keylease/cli/soroban';
@@ -39,8 +40,8 @@ function mintToken(leaseId = 'lease-1', signer = consumer): string {
   });
 }
 
-function makeVerifier(provider: LeaseStateProvider): LeaseVerifier {
-  return new LeaseVerifier({ provider, cacheTtlMs: 30_000 });
+function makeVerifier(provider: LeaseStateProvider, cacheTtlMs = 30_000): LeaseVerifier {
+  return new LeaseVerifier({ provider, cacheTtlMs });
 }
 
 interface FetchCall {
@@ -330,11 +331,14 @@ describe('proxy routing', () => {
     const { impl } = stubFetch(() => okJson({ ok: true }));
     const app = buildProxyServer({
       upstream: 'https://api.example.com',
-      verifier: makeVerifier({
-        getLeaseState: async () => {
-          throw new Error('ECONNREFUSED');
+      verifier: makeVerifier(
+        {
+          getLeaseState: async () => {
+            throw new Error('ECONNREFUSED');
+          },
         },
-      }),
+        12_500,
+      ),
       fetchImpl: impl,
     });
 
@@ -345,6 +349,7 @@ describe('proxy routing', () => {
     });
 
     expect(res.statusCode).toBe(503);
+    expect(res.headers['retry-after']).toBe('13');
     expect(res.json()).toMatchObject({ error: 'verification_unavailable' });
     await app.close();
   });
@@ -385,6 +390,67 @@ describe('proxy routing', () => {
     expect(slowRes.statusCode).toBe(504);
     expect(slowRes.json()).toMatchObject({ error: 'gateway_timeout' });
     await slow.close();
+  });
+
+  it('aborts the upstream request when the client disconnects without logging a proxy error', async () => {
+    let markFetchStarted!: () => void;
+    let markSignalAborted!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => {
+      markFetchStarted = resolve;
+    });
+    const signalAborted = new Promise<void>((resolve) => {
+      markSignalAborted = resolve;
+    });
+    let upstreamSignal: AbortSignal | undefined;
+    const { impl } = stubFetch((_url, init) => {
+      upstreamSignal = init?.signal as AbortSignal | undefined;
+      markFetchStarted();
+      return new Promise<Response>((_resolve, reject) => {
+        const abort = () => {
+          markSignalAborted();
+          reject(upstreamSignal?.reason);
+        };
+        if (upstreamSignal?.aborted) {
+          abort();
+        } else {
+          upstreamSignal?.addEventListener('abort', abort, { once: true });
+        }
+      });
+    });
+    const verifier = makeVerifier({ getLeaseState: async () => leaseState() });
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier,
+      fetchImpl: impl,
+    });
+    let proxyErrorLogged = false;
+    app.addHook('onRequest', async (request) => {
+      vi.spyOn(request.log, 'error').mockImplementation(() => {
+        proxyErrorLogged = true;
+      });
+    });
+
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const client = httpRequest(address, {
+      method: 'GET',
+      path: '/v1/data',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+    client.on('error', () => {});
+    client.end();
+
+    try {
+      await fetchStarted;
+      client.destroy();
+      await signalAborted;
+
+      expect(upstreamSignal?.aborted).toBe(true);
+      expect(verifier.localCalls('lease-1')).toBe(1);
+      expect(proxyErrorLogged).toBe(false);
+    } finally {
+      client.destroy();
+      await app.close();
+    }
   });
 
   it('forwards multi-value Set-Cookie headers', async () => {
@@ -560,11 +626,14 @@ describe('proxy routing', () => {
 
     it('returns 503 verification_unavailable on /readyz when RPC is down / cold', async () => {
       const { impl, calls } = stubFetch(() => okJson({ upstream: true }));
-      const verifier = makeVerifier({
-        getLeaseState: async () => {
-          throw new Error('ECONNREFUSED');
+      const verifier = makeVerifier(
+        {
+          getLeaseState: async () => {
+            throw new Error('ECONNREFUSED');
+          },
         },
-      });
+        45_000,
+      );
 
       const app = buildProxyServer({
         upstream: 'https://api.example.com',
@@ -574,6 +643,7 @@ describe('proxy routing', () => {
 
       const res = await app.inject({ method: 'GET', url: '/readyz' });
       expect(res.statusCode).toBe(503);
+      expect(res.headers['retry-after']).toBe('30');
       expect(res.json()).toMatchObject({ error: 'verification_unavailable' });
       expect(calls).toHaveLength(0);
       await app.close();

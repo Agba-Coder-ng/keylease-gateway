@@ -218,7 +218,7 @@ impl KeyleaseCore {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
-        env.storage().instance().extend_ttl(MIN_TTL, EXTEND_TO);
+        bump_instance_ttl(&env);
         env.events().publish(
             (Symbol::new(&env, "admin_proposed"), config.admin, new_admin),
             env.ledger().timestamp(),
@@ -230,13 +230,13 @@ impl KeyleaseCore {
     /// auth and clears the pending entry, so accepting twice fails with
     /// `Unauthorized` (there is no proposal left to accept).
     pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let mut config = load_config(&env)?;
         let pending: Address = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
             .ok_or(Error::Unauthorized)?;
         pending.require_auth();
-        let mut config = load_config(&env)?;
         config.admin = pending.clone();
         env.storage().instance().remove(&DataKey::PendingAdmin);
         store_config(&env, &config);

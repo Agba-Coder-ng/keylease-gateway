@@ -296,7 +296,8 @@ renamed entry points, changed arguments or storage layout). Bump
 `contracts/keylease-core/Cargo.toml` with every contract change; clients should
 refuse a major version they do not recognise.
 
-Storage: `Config` in instance storage; `Service(String)` and `Lease(u64)` as
+Storage: `Config` and the pending admin (`PendingAdmin`, set by
+`propose_admin`) in instance storage; `Service(String)` and `Lease(u64)` as
 persistent entries with TTL bumps (`MIN_TTL` 7 days, `EXTEND_TO` 30 days).
 The bump happens on writes (`register_service`, `create_lease`, `use_call`, …)
 and on reads: `load_config`, `load_service` and `load_lease` extend the entry
@@ -442,7 +443,7 @@ keylease-gateway/
 ## Development
 
 ```bash
-pnpm contract:test # cargo test: 14 contract tests
+pnpm contract:test # cargo test: 36 contract tests
 pnpm contract:build# stellar contract build (wasm32v1-none)
 pnpm build         # tsc emit for both packages (topological order)
 pnpm test          # vitest: 110 tests (58 CLI + 52 proxy)

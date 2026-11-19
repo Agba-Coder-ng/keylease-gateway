@@ -1,11 +1,12 @@
-import { Keypair, nativeToScVal } from '@stellar/stellar-sdk';
-import { describe, expect, it } from 'vitest';
+import { BASE_FEE, Keypair, nativeToScVal } from '@stellar/stellar-sdk';
+import { describe, expect, it, vi } from 'vitest';
 import {
   LeaseNotFoundError,
   SorobanClient,
   parseLeaseId,
   parseLeaseState,
   encodeLeaseState,
+  type Transaction,
   type LeaseState,
   type SorobanRpc,
 } from './soroban.js';
@@ -84,5 +85,49 @@ describe('getLeaseState', () => {
     });
 
     await expect(client.getLeaseState('9')).rejects.toThrow(/Error\(6\)/);
+  });
+});
+
+describe('transaction envelope options', () => {
+  it('uses the supplied fee and timeout and preserves defaults when omitted', async () => {
+    const transactions: Transaction[] = [];
+    const server = {
+      simulateTransaction: async (transaction: Transaction) => {
+        transactions.push(transaction);
+        return {
+          _parsed: true,
+          id: '1',
+          latestLedger: 1,
+          events: [],
+          result: { retval: nativeToScVal(1_000, { type: 'i128' }) },
+        };
+      },
+    } as unknown as SorobanRpc;
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2024-01-01T00:00:00.000Z'));
+    try {
+      const custom = new SorobanClient({
+        server,
+        contractId: 'CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC',
+        networkPassphrase: 'Test SDF Network ; September 2015',
+        fee: 2_500,
+        timeout: 90,
+      });
+      await custom.quote('weather-api', 1);
+      expect(transactions[0]?.fee).toBe('2500');
+      expect(transactions[0]?.timeBounds?.maxTime).toBe('1704067290');
+
+      const defaults = new SorobanClient({
+        server,
+        contractId: 'CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC',
+        networkPassphrase: 'Test SDF Network ; September 2015',
+      });
+      await defaults.quote('weather-api', 1);
+      expect(transactions[1]?.fee).toBe(String(BASE_FEE));
+      expect(transactions[1]?.timeBounds?.maxTime).toBe('1704067260');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

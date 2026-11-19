@@ -14,7 +14,12 @@ export interface NetworkArgs {
   contract?: string | undefined;
 }
 
-export interface AcquireArgs extends NetworkArgs {
+export interface TransactionArgs extends NetworkArgs {
+  fee?: number | undefined;
+  timeout?: number | undefined;
+}
+
+export interface AcquireArgs extends TransactionArgs {
   service: string;
   calls: number;
   duration: number;
@@ -35,6 +40,10 @@ export interface LeaseSession {
   consumer: string;
   token: string;
   callsLimit: number;
+  /** Total escrowed amount in token smallest units. Optional for legacy sessions. */
+  pricePaid?: number;
+  /** Amount per call in token smallest units. Optional for legacy sessions. */
+  pricePerCall?: number;
   issuedAt: number;
   expiresAt: number;
   txHash: string | null;
@@ -64,7 +73,7 @@ export class SessionStoreError extends Error {
 }
 
 export interface AcquireDeps {
-  createClient?: (args: AcquireArgs) => Pick<SorobanClient, 'createLease'>;
+  createClient?: (args: AcquireArgs) => Pick<SorobanClient, 'createLease' | 'quote' | 'getLeaseState'>;
   store?: SessionStore;
   now?: () => number;
 }
@@ -85,6 +94,10 @@ function isLeaseSession(value: unknown): value is LeaseSession {
     typeof session['token'] === 'string' &&
     typeof session['callsLimit'] === 'number' &&
     Number.isFinite(session['callsLimit']) &&
+    (session['pricePaid'] === undefined ||
+      (typeof session['pricePaid'] === 'number' && Number.isFinite(session['pricePaid']))) &&
+    (session['pricePerCall'] === undefined ||
+      (typeof session['pricePerCall'] === 'number' && Number.isFinite(session['pricePerCall']))) &&
     typeof session['issuedAt'] === 'number' &&
     Number.isFinite(session['issuedAt']) &&
     typeof session['expiresAt'] === 'number' &&
@@ -154,12 +167,14 @@ export function parseConsumerSecret(secret: string): Keypair {
   }
 }
 
-function defaultCreateClient(args: AcquireArgs): Pick<SorobanClient, 'createLease'> {
+function defaultCreateClient(
+  args: AcquireArgs,
+): Pick<SorobanClient, 'createLease' | 'quote' | 'getLeaseState'> {
   return SorobanClient.fromEnv({
     KEYLEASE_NETWORK: args.network,
     KEYLEASE_RPC_URL: args.rpc,
     KEYLEASE_CONTRACT_ID: args.contract,
-  });
+  }, undefined, { fee: args.fee, timeout: args.timeout });
 }
 
 function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): void {
@@ -171,6 +186,8 @@ function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): v
           lease_id: session.leaseId,
           consumer: session.consumer,
           calls: session.callsLimit,
+          price_paid: session.pricePaid,
+          price_per_call: session.pricePerCall,
           issued_at: session.issuedAt,
           expires_at: session.expiresAt,
           tx_hash: session.txHash,
@@ -186,6 +203,8 @@ function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): v
   io.out(`Lease ${session.leaseId} acquired for service "${session.service}"`);
   io.out(`  consumer   : ${session.consumer}`);
   io.out(`  calls      : ${session.callsLimit} (prepaid into contract escrow)`);
+  if (session.pricePaid !== undefined) io.out(`  price paid : ${session.pricePaid}`);
+  if (session.pricePerCall !== undefined) io.out(`  price/call : ${session.pricePerCall}`);
   io.out(`  expires at : ${new Date(session.expiresAt * 1000).toISOString()}`);
   if (session.txHash) io.out(`  tx hash    : ${session.txHash}`);
   io.out('');
@@ -207,13 +226,28 @@ export async function acquireCommand(
   const createClient = deps.createClient ?? defaultCreateClient;
   const store = deps.store ?? fileSessionStore();
   const now = deps.now ?? (() => Date.now());
+  const client = createClient(args);
+  const quotedPricePaid = await client.quote(args.service, args.calls);
+  if (
+    !Number.isSafeInteger(quotedPricePaid) ||
+    quotedPricePaid <= 0 ||
+    quotedPricePaid % args.calls !== 0
+  ) {
+    throw new Error(`contract returned an invalid lease quote: ${quotedPricePaid}`);
+  }
 
-  const result: CreateLeaseResult = await createClient(args).createLease({
+  const result: CreateLeaseResult = await client.createLease({
     service: args.service,
     calls: args.calls,
     duration: args.duration,
     consumer,
   });
+  const chainState = await client.getLeaseState(result.leaseId);
+  if (chainState.pricePaid !== quotedPricePaid) {
+    io.err(
+      `warning: quoted ${quotedPricePaid}, but the lease escrowed ${chainState.pricePaid}; recording the on-chain amount`,
+    );
+  }
 
   const issuedAt = Math.floor(now() / 1000);
   const expiresAt = issuedAt + args.duration;
@@ -230,6 +264,8 @@ export async function acquireCommand(
     consumer: consumer.publicKey(),
     token,
     callsLimit: args.calls,
+    pricePaid: chainState.pricePaid,
+    pricePerCall: chainState.pricePaid / args.calls,
     issuedAt,
     expiresAt,
     txHash: result.txHash,

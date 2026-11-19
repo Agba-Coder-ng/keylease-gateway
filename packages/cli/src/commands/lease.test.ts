@@ -76,6 +76,7 @@ describe('acquireCommand', () => {
         now: () => NOW_MS,
         store,
         createClient: () => ({
+          quote: async () => 7_000,
           createLease: async (params) => {
             calls.push({
               service: params.service,
@@ -85,6 +86,18 @@ describe('acquireCommand', () => {
             });
             return { leaseId: 'lease-xyz', txHash: 'aaaa1111' };
           },
+          getLeaseState: async () => ({
+            leaseId: 'lease-xyz',
+            service: 'weather-api',
+            provider: 'GPROVIDER',
+            consumer: consumer.publicKey(),
+            callsLimit: 7,
+            callsUsed: 0,
+            expiresAt: NOW + 600,
+            active: true,
+            settled: false,
+            pricePaid: 7_000,
+          }),
         }),
       },
     );
@@ -98,6 +111,8 @@ describe('acquireCommand', () => {
     expect(session.leaseId).toBe('lease-xyz');
     expect(session.consumer).toBe(consumer.publicKey());
     expect(session.expiresAt).toBe(NOW + 600);
+    expect(session.pricePaid).toBe(7_000);
+    expect(session.pricePerCall).toBe(1_000);
 
     const payload = verifySessionToken(session.token, { now: NOW + 1 });
     expect(payload.lease_id).toBe('lease-xyz');
@@ -114,7 +129,20 @@ describe('acquireCommand', () => {
         now: () => NOW_MS,
         store: memoryStore(),
         createClient: () => ({
+          quote: async () => 2_000,
           createLease: async () => ({ leaseId: 'lease-json', txHash: 'beef' }),
+          getLeaseState: async () => ({
+            leaseId: 'lease-json',
+            service: 'weather-api',
+            provider: 'GPROVIDER',
+            consumer: consumer.publicKey(),
+            callsLimit: 1,
+            callsUsed: 0,
+            expiresAt: NOW + 60,
+            active: true,
+            settled: false,
+            pricePaid: 2_000,
+          }),
         }),
       },
     );
@@ -122,7 +150,50 @@ describe('acquireCommand', () => {
     expect(code).toBe(0);
     const parsed = JSON.parse(out.join('\n')) as Record<string, unknown>;
     expect(parsed['lease_id']).toBe('lease-json');
+    expect(parsed['price_paid']).toBe(2_000);
+    expect(parsed['price_per_call']).toBe(2_000);
     expect(String(parsed['session_token'])).toContain('kls1.');
+  });
+
+  it('records the actual escrow amount when the service price changes after quoting', async () => {
+    const store = memoryStore();
+    const { io, err } = captureIo();
+    const sequence: string[] = [];
+
+    await acquireCommand(
+      { service: 'weather-api', calls: 2, duration: 60, secret: consumer.secret(), json: true },
+      io,
+      {
+        store,
+        createClient: () => ({
+          quote: async () => {
+            sequence.push('quote');
+            return 2_000;
+          },
+          createLease: async () => {
+            sequence.push('create');
+            return { leaseId: 'lease-changed', txHash: 'beef' };
+          },
+          getLeaseState: async () => ({
+            leaseId: 'lease-changed',
+            service: 'weather-api',
+            provider: 'GPROVIDER',
+            consumer: consumer.publicKey(),
+            callsLimit: 2,
+            callsUsed: 0,
+            expiresAt: NOW + 60,
+            active: true,
+            settled: false,
+            pricePaid: 4_000,
+          }),
+        }),
+      },
+    );
+
+    expect(sequence).toEqual(['quote', 'create']);
+    expect(store.sessions['weather-api']?.pricePaid).toBe(4_000);
+    expect(store.sessions['weather-api']?.pricePerCall).toBe(2_000);
+    expect(err.join('\n')).toContain('quoted 2000, but the lease escrowed 4000');
   });
 
   it('rejects an invalid secret before touching the chain', async () => {
@@ -278,6 +349,8 @@ describe('fileSessionStore', () => {
       consumer: consumer.publicKey(),
       token: 'kls1.x.y',
       callsLimit: 1,
+      pricePaid: 12_000,
+      pricePerCall: 12_000,
       issuedAt: NOW,
       expiresAt: NOW + 60,
       txHash: null,
@@ -286,6 +359,32 @@ describe('fileSessionStore', () => {
 
     const reloaded = await fileSessionStore(dir).load();
     expect(reloaded['weather-api']?.leaseId).toBe('lease-1');
+    expect(reloaded['weather-api']?.pricePaid).toBe(12_000);
+  });
+
+  it('continues to load legacy sessions without cost fields', async () => {
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    await mkdir(join(dir, '.keylease'), { recursive: true });
+    await writeFile(
+      join(dir, '.keylease', 'sessions.json'),
+      JSON.stringify({
+        'weather-api': {
+          service: 'weather-api',
+          leaseId: 'lease-old',
+          consumer: consumer.publicKey(),
+          token: 'kls1.x.y',
+          callsLimit: 1,
+          issuedAt: NOW,
+          expiresAt: NOW + 60,
+          txHash: null,
+          network: 'testnet',
+        },
+      }),
+    );
+
+    await expect(fileSessionStore(dir).load()).resolves.toMatchObject({
+      'weather-api': { leaseId: 'lease-old' },
+    });
   });
 
   it('rejects a corrupt store with an actionable error', async () => {

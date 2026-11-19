@@ -70,7 +70,9 @@ const OPTION_SPEC = {
   calls: { type: 'string' },
   duration: { type: 'string' },
   secret: { type: 'string' },
-  lease: { type: 'string' },
+  lease: { type: 'string', multiple: true },
+  fee: { type: 'string' },
+  timeout: { type: 'string' },
   token: { type: 'string' },
   network: { type: 'string' },
   rpc: { type: 'string' },
@@ -83,9 +85,14 @@ const OPTION_SPEC = {
 } as const;
 
 type ParsedOptions = {
-  [K in keyof typeof OPTION_SPEC]?: (typeof OPTION_SPEC)[K]['type'] extends 'string'
-    ? string
-    : boolean;
+  [K in keyof typeof OPTION_SPEC]?: (typeof OPTION_SPEC)[K] extends {
+    type: 'string';
+    multiple: true;
+  }
+    ? string[]
+    : (typeof OPTION_SPEC)[K]['type'] extends 'string'
+      ? string
+      : boolean;
 };
 
 function readOptions(args: string[]): { values: ParsedOptions; positionals: string[] } {
@@ -112,7 +119,11 @@ function requireString(values: ParsedOptions, name: keyof ParsedOptions): string
 }
 
 function optionalString(values: ParsedOptions, name: keyof ParsedOptions): string | undefined {
-  const value = values[name];
+  const raw = values[name];
+  if (Array.isArray(raw) && raw.length > 1) {
+    throw new CliError(`--${name} may only be specified once here`, 'invalid_option');
+  }
+  const value = Array.isArray(raw) ? raw[0] : raw;
   if (value === undefined) return undefined;
   if (typeof value !== 'string' || value.length === 0) {
     throw new CliError(`--${name} must be a non-empty value`, 'invalid_option');
@@ -120,8 +131,28 @@ function optionalString(values: ParsedOptions, name: keyof ParsedOptions): strin
   return value;
 }
 
+function requireLeaseIds(values: ParsedOptions): string[] {
+  const raw = values.lease;
+  if (raw === undefined) throw new CliError('--lease is required', 'missing_option');
+  const valuesToSplit = Array.isArray(raw) ? raw : [raw];
+  const leaseIds = valuesToSplit.flatMap((value) => value.split(',').map((id) => id.trim()));
+  if (leaseIds.some((id) => id.length === 0)) {
+    throw new CliError('--lease must contain non-empty lease IDs', 'invalid_option');
+  }
+  return [...new Set(leaseIds)];
+}
+
 function requirePositiveInt(values: ParsedOptions, name: keyof ParsedOptions): number {
   const raw = requireString(values, name);
+  return parsePositiveInt(raw, name);
+}
+
+function optionalPositiveInt(values: ParsedOptions, name: keyof ParsedOptions): number | undefined {
+  const raw = optionalString(values, name);
+  return raw === undefined ? undefined : parsePositiveInt(raw, name);
+}
+
+function parsePositiveInt(raw: string, name: keyof ParsedOptions): number {
   if (!/^[0-9]+$/.test(raw)) {
     throw new CliError(`--${name} must be a positive integer, got "${raw}"`, 'invalid_option');
   }
@@ -141,6 +172,20 @@ function networkArgs(values: ParsedOptions): {
     network: optionalString(values, 'network'),
     rpc: optionalString(values, 'rpc'),
     contract: optionalString(values, 'contract'),
+  };
+}
+
+function transactionArgs(values: ParsedOptions): {
+  network?: string | undefined;
+  rpc?: string | undefined;
+  contract?: string | undefined;
+  fee?: number | undefined;
+  timeout?: number | undefined;
+} {
+  return {
+    ...networkArgs(values),
+    fee: optionalPositiveInt(values, 'fee'),
+    timeout: optionalPositiveInt(values, 'timeout'),
   };
 }
 
@@ -174,7 +219,7 @@ export function parseArgv(argv: string[]): Invocation {
     case 'acquire': {
       ensureNoPositionals(positionals);
       const args: AcquireArgs = {
-        ...networkArgs(values),
+        ...transactionArgs(values),
         service: requireString(values, 'service'),
         calls: requirePositiveInt(values, 'calls'),
         duration: requirePositiveInt(values, 'duration'),
@@ -214,8 +259,8 @@ export function parseArgv(argv: string[]): Invocation {
       return {
         command: 'settle',
         args: {
-          ...networkArgs(values),
-          lease: requireString(values, 'lease'),
+          ...transactionArgs(values),
+          lease: requireLeaseIds(values),
           secret: requireString(values, 'secret'),
           json: values.json === true,
         },
@@ -226,8 +271,8 @@ export function parseArgv(argv: string[]): Invocation {
       return {
         command: 'revoke',
         args: {
-          ...networkArgs(values),
-          lease: requireString(values, 'lease'),
+          ...transactionArgs(values),
+          lease: requireLeaseIds(values),
           secret: requireString(values, 'secret'),
           json: values.json === true,
         },
@@ -252,11 +297,11 @@ export function renderHelp(): string {
   return `${CLI_NAME} ${CLI_VERSION} - Soroban lease manager for KeyLease gateways
 
 Usage:
-  ${CLI_NAME} acquire --service <id> --calls <count> --duration <secs> --secret <key>
+  ${CLI_NAME} acquire --service <id> --calls <count> --duration <secs> --secret <key> [--fee <stroops>] [--timeout <seconds>]
   ${CLI_NAME} env     --service <id> [--file <path>]
   ${CLI_NAME} status  --lease <id> | --token <session-token> [--check-chain]
-  ${CLI_NAME} settle  --lease <id> --secret <key>
-  ${CLI_NAME} revoke  --lease <id> --secret <key>
+  ${CLI_NAME} settle  --lease <id>[,<id>...] [--lease <id> ...] --secret <key> [--fee <stroops>] [--timeout <seconds>]
+  ${CLI_NAME} revoke  --lease <id>[,<id>...] [--lease <id> ...] --secret <key> [--fee <stroops>] [--timeout <seconds>]
   ${CLI_NAME} sessions [--prune] [--json]
   ${CLI_NAME} help | --version
 
@@ -273,7 +318,9 @@ Options:
   --calls <count>      Number of API calls the lease authorises
   --duration <secs>    Lease lifetime in seconds
   --secret <key>       Stellar secret seed (S...) of the consumer account
-  --lease <id>         On-chain lease id (decimal u64)
+  --lease <id>         On-chain lease id (repeatable or comma-separated for settle/revoke)
+  --fee <stroops>      Transaction inclusion fee in stroops (positive integer)
+  --timeout <seconds>  Transaction envelope timeout (positive integer; default: 60)
   --token <token>      Session bearer token to verify offline
   --check-chain        Check the token's current lease over Soroban RPC
   --file <path>        Target env file for "env" (default: .env)

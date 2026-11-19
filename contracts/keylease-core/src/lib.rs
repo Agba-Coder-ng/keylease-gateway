@@ -103,6 +103,8 @@ pub struct Lease {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Config,
+    /// Admin nominated by the current admin, awaiting `accept_admin`.
+    PendingAdmin,
     Service(soroban_sdk::String),
     Lease(u64),
 }
@@ -179,6 +181,44 @@ impl KeyleaseCore {
         store_config(&env, &config);
         env.events()
             .publish((Symbol::new(&env, "gateway"), gateway), env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Admin-only: nominate the next admin. The handover only takes effect
+    /// once the nominee calls `accept_admin`, so a typo in the new address
+    /// cannot permanently lock out admin rotation.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        env.storage().instance().extend_ttl(MIN_TTL, EXTEND_TO);
+        env.events().publish(
+            (Symbol::new(&env, "admin_proposed"), config.admin, new_admin),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Completes a handover started by `propose_admin`. Requires the nominee's
+    /// auth and clears the pending entry, so accepting twice fails with
+    /// `Unauthorized` (there is no proposal left to accept).
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::Unauthorized)?;
+        pending.require_auth();
+        let mut config = load_config(&env)?;
+        config.admin = pending.clone();
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        store_config(&env, &config);
+        env.events().publish(
+            (Symbol::new(&env, "admin_changed"), pending),
+            env.ledger().timestamp(),
+        );
         Ok(())
     }
 

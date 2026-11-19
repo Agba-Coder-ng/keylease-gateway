@@ -384,6 +384,98 @@ fn gateway_can_be_rotated_by_the_admin() {
 }
 
 #[test]
+fn admin_transfer_is_two_step() {
+    let h = setup();
+    let next = Address::generate(&h.env);
+
+    h.client.propose_admin(&next);
+    // The proposal alone changes nothing: the nominee has not accepted yet.
+    assert_eq!(h.client.get_config().admin, h.admin);
+
+    h.client.accept_admin();
+    assert_eq!(h.client.get_config().admin, next);
+
+    // The pending slot is cleared on accept, so a second accept is rejected.
+    let err = h.client.try_accept_admin().unwrap_err();
+    assert_eq!(err.unwrap(), Error::Unauthorized);
+}
+
+#[test]
+fn accept_admin_without_a_proposal_is_rejected() {
+    let h = setup();
+    let err = h.client.try_accept_admin().unwrap_err();
+    assert_eq!(err.unwrap(), Error::Unauthorized);
+}
+
+#[test]
+fn proposing_a_new_admin_requires_the_current_admin() {
+    let h = setup();
+    let next = Address::generate(&h.env);
+    h.env.mock_auths(&[]);
+    let err = h.client.try_propose_admin(&next).unwrap_err();
+    assert!(err.is_err(), "only the current admin may propose a successor");
+    assert_eq!(h.client.get_config().admin, h.admin);
+}
+
+#[test]
+fn accepting_the_handover_requires_the_nominee() {
+    let h = setup();
+    let next = Address::generate(&h.env);
+    h.client.propose_admin(&next);
+    h.env.mock_auths(&[]);
+    let err = h.client.try_accept_admin().unwrap_err();
+    assert!(err.is_err(), "the nominee must authorise the handover");
+    assert_eq!(h.client.get_config().admin, h.admin);
+}
+
+#[test]
+fn admin_transfer_emits_proposal_and_change_events() {
+    use soroban_sdk::{testutils::Events as _, IntoVal, Symbol, Vec as SVec};
+
+    let h = setup();
+    let next = Address::generate(&h.env);
+    h.client.propose_admin(&next);
+    assert_eq!(
+        h.env.events().all(),
+        SVec::from_array(
+            &h.env,
+            [(
+                h.client.address.clone(),
+                SVec::from_array(
+                    &h.env,
+                    [
+                        Symbol::new(&h.env, "admin_proposed").into_val(&h.env),
+                        h.admin.clone().into_val(&h.env),
+                        next.clone().into_val(&h.env),
+                    ],
+                ),
+                h.env.ledger().timestamp().into_val(&h.env),
+            )],
+        ),
+    );
+
+    h.client.accept_admin();
+    assert_eq!(
+        h.env.events().all(),
+        SVec::from_array(
+            &h.env,
+            [(
+                h.client.address.clone(),
+                SVec::from_array(
+                    &h.env,
+                    [
+                        Symbol::new(&h.env, "admin_changed").into_val(&h.env),
+                        next.clone().into_val(&h.env),
+                    ],
+                ),
+                h.env.ledger().timestamp().into_val(&h.env),
+            )],
+        ),
+    );
+    assert_eq!(h.client.get_config().admin, next);
+}
+
+#[test]
 fn escrow_survives_many_leases() {
     let h = setup();
     StellarAssetClient::new(&h.env, &h.token).mint(&h.consumer, &10_000_000);

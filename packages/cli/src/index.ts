@@ -283,6 +283,10 @@ Options:
   --prune              Remove expired sessions (for "sessions")
   --json               Machine-readable JSON output
   -h, --help           Show this help
+
+Contract failures surface as Error(Contract, #n). The error table is in the
+README "Contract reference" section:
+  https://github.com/KeyLease-Security/keylease-gateway/blob/main/README.md#contract-reference
 `;
 }
 

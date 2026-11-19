@@ -206,7 +206,7 @@ node packages/cli/dist/index.js status --token "$KEYLEASE_SESSION_TOKEN"
 Redeploying the contract from source (needs Rust + `stellar-cli` ≥ 25.2):
 
 ```bash
-pnpm contract:test          # 14 Rust tests against a real SAC instance
+pnpm contract:test          # 40 Rust tests against a real SAC instance
 pnpm contract:build         # wasm32v1-none artifact
 pnpm deploy:testnet         # upload → create → init → register → demo lease
 ```
@@ -271,12 +271,13 @@ lease first; if it is corrupt, back it up or repair it before retrying.
 ## Contract reference
 
 `contracts/keylease-core` is a Soroban contract (`soroban-sdk` 29, built for
-`wasm32v1-none`, 13.8 KB wasm).
+`wasm32v1-none`).
 
 | Entry point | Auth | Description |
 | --- | --- | --- |
 | `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account |
 | `set_gateway(gateway)` | admin | Rotate the account allowed to commit quota |
+| `set_paused(paused)` | admin | Emergency pause: while `true`, `create_lease` fails with `Paused` before any escrow moves; existing leases keep being served, revoked and settled |
 | `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
 | `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
 | `register_service(provider, service, price_per_call)` | provider | Register or re-price a service (`price_per_call > 0`) |
@@ -306,18 +307,46 @@ read stays alive. `extend_ttl` is a no-op above the threshold, so the hot read
 path costs one storage access and no write.
 Events: `init`, `gateway`, `admin_proposed`, `admin_changed`,
 `service_registered`, `lease_created`, `calls_committed`, `lease_revoked`,
-`lease_settled`.
+`lease_settled`, `paused`, `unpaused`.
+
+`Config` gained the `paused` flag in 0.3.0. The repo's deploys create a fresh
+contract, so a deployment from an earlier source must be redeployed
+(`pnpm deploy:testnet`) rather than reused: its instance storage holds the
+older `Config` shape and will not decode against the new layout.
 
 `calls_committed` keeps its `(calls_committed, consumer, lease_id)` topic
 tuple, so existing topic filters still match, but its payload is now the pair
 `(calls_used, remaining)`. Both fields are `u32`; indexers that decoded a bare
 `calls_used` value must read the pair (or the first element).
 
+Escrow invariant: the contract only ever pays out `price_paid` once per lease,
+split as `used/total` to the provider and `(total-used)/total` to the consumer.
+
+### Emergency pause
+
+`set_paused(true)` is the admin's circuit breaker for new exposure. It is the
+only entry point the flag affects: `create_lease` returns `Error::Paused`
+before the escrow transfer, so no tokens move and no lease id is allocated.
+Everything that unwinds existing exposure keeps working — `use_call`,
+`revoke`, `settle`, `quote`, `register_service`, `set_service_active` and every
+view — and escrow is never touched, so prepaid leases can still be consumed,
+revoked and settled while the contract is paused. Resuming with
+`set_paused(false)` needs no other state change. Each transition emits `paused`
+or `unpaused` with the acting admin in the topic and the new state as the
+payload, and `get_config()` exposes `paused`. The pause is admin-only, so treat
+it as an incident-response action and record why it was taken (see
+[SECURITY.md](./SECURITY.md)).
+
+### Contract errors
+
 Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
-`Error(Contract, #n)`:
+`Error(Contract, #n)`. The numeric codes are part of the ABI and are only ever
+appended, so the table below is stable across additive releases:
 
 | Code | Variant | Meaning |
 | --- | --- | --- |
+| 1 | `AlreadyInitialized` | `init` ran more than once |
+| 2 | `NotInitialized` | `init` has not been called yet |
 | 3 | `UnknownService` | Service id was never registered |
 | 4 | `ServiceInactive` | Service paused by its provider |
 | 5 | `LeaseNotFound` | No lease with that id (proxy → `403 lease_not_found`) |
@@ -325,11 +354,21 @@ Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 | 7 | `LeaseExpired` | Lease past `expires_at` |
 | 8 | `LeaseNotSettleable` | `settle` before expiry/exhaustion |
 | 9 | `AlreadySettled` | Escrow already paid out |
-| 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation |
+| 10 | `InvalidCalls` | Call count is zero or otherwise invalid |
+| 11 | `InvalidDuration` | Lease duration is zero |
+| 12 | `InvalidPrice` | Service price is not positive |
+| 13 | `InvalidAmount` | Amount overflowed `i128` |
+| 14 | `Unauthorized` | The signer is not the consumer, provider, admin or gateway |
 | 15 | `InvalidConsumer` | `create_lease` consumer is the contract's own address |
+| 16 | `Paused` | `create_lease` blocked by the admin emergency pause |
 
-Escrow invariant: the contract only ever pays out `price_paid` once per lease,
-split as `used/total` to the provider and `(total-used)/total` to the consumer.
+Where the codes are mapped: the CLI parses the code out of the RPC error
+(`contractErrorCode` in `packages/cli/src/client/soroban.ts`) and exposes it as
+`ContractCallError.code`, turning `5` into `LeaseNotFoundError`. The proxy
+consumes that in `packages/proxy/src/verifier.ts`: a missing lease becomes
+`403 lease_not_found` (cached briefly), while every other contract or transport
+failure fails closed as `503 verification_unavailable`. `keylease help` links
+back to this table.
 
 ---
 
@@ -443,10 +482,10 @@ keylease-gateway/
 ## Development
 
 ```bash
-pnpm contract:test # cargo test: 36 contract tests
+pnpm contract:test # cargo test: 40 contract tests
 pnpm contract:build# stellar contract build (wasm32v1-none)
 pnpm build         # tsc emit for both packages (topological order)
-pnpm test          # vitest: 110 tests (58 CLI + 52 proxy)
+pnpm test          # vitest: 177 tests (73 CLI + 104 proxy)
 pnpm lint          # eslint (flat config, typescript-eslint)
 pnpm typecheck     # build, then tsc --noEmit in every package
 ```

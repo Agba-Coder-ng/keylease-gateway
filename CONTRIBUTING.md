@@ -14,12 +14,12 @@ workspace plus the Soroban contract the whole system runs on:
 ```bash
 pnpm install        # Node >= 20.11, pnpm 12 (see "packageManager")
 pnpm build          # tsc emit for both packages
-pnpm test           # vitest (108 tests)
+pnpm test           # vitest (177 tests)
 pnpm lint           # eslint
 pnpm typecheck      # build + tsc --noEmit
 
 # contract (needs Rust + stellar-cli)
-pnpm contract:test  # cargo test (22 tests)
+pnpm contract:test  # cargo test (40 tests)
 pnpm contract:build # stellar contract build -> wasm32v1-none
 ```
 

@@ -40,7 +40,16 @@ fn setup() -> Harness {
     let client = KeyleaseCoreClient::new(&env, &contract_id);
     client.init(&admin, &token, &gateway);
 
-    Harness { env, contract_id, admin, gateway, consumer, provider, token, client }
+    Harness {
+        env,
+        contract_id,
+        admin,
+        gateway,
+        consumer,
+        provider,
+        token,
+        client,
+    }
 }
 
 fn register(h: &Harness) {
@@ -61,7 +70,10 @@ fn init_is_one_time_and_exposes_config() {
     assert_eq!(config.token, h.token);
     assert_eq!(config.lease_count, 0);
 
-    let err = h.client.try_init(&h.admin, &h.token, &h.gateway).unwrap_err();
+    let err = h
+        .client
+        .try_init(&h.admin, &h.token, &h.gateway)
+        .unwrap_err();
     assert_eq!(err.unwrap(), Error::AlreadyInitialized);
 }
 
@@ -69,7 +81,10 @@ fn init_is_one_time_and_exposes_config() {
 fn version_matches_the_crate_version() {
     let h = setup();
     assert_eq!(CONTRACT_VERSION, env!("CARGO_PKG_VERSION"));
-    assert_eq!(h.client.version(), String::from_str(&h.env, CONTRACT_VERSION));
+    assert_eq!(
+        h.client.version(),
+        String::from_str(&h.env, CONTRACT_VERSION)
+    );
 }
 
 #[test]
@@ -77,7 +92,10 @@ fn version_is_readable_before_init() {
     let env = Env::default();
     let contract_id = env.register(KeyleaseCore, ());
     let client = KeyleaseCoreClient::new(&env, &contract_id);
-    assert_eq!(client.version(), String::from_str(&env, env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        client.version(),
+        String::from_str(&env, env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]
@@ -107,7 +125,10 @@ fn register_service_rejects_non_positive_price() {
         .register_service(&h.provider, &service_id(&h.env), &1_000);
     assert!(svc.active);
     assert_eq!(svc.price_per_call, 1_000);
-    assert_eq!(h.client.get_service(&service_id(&h.env)).provider, h.provider);
+    assert_eq!(
+        h.client.get_service(&service_id(&h.env)).provider,
+        h.provider
+    );
 }
 
 #[test]
@@ -134,7 +155,10 @@ fn quote_rejects_overflowing_totals() {
     // i128::MAX * 2 overflows: checked_mul must surface InvalidAmount, not trap.
     let err = h.client.try_quote(&service_id(&h.env), &2).unwrap_err();
     assert_eq!(err.unwrap(), Error::InvalidAmount);
-    let err = h.client.try_quote(&service_id(&h.env), &u32::MAX).unwrap_err();
+    let err = h
+        .client
+        .try_quote(&service_id(&h.env), &u32::MAX)
+        .unwrap_err();
     assert_eq!(err.unwrap(), Error::InvalidAmount);
 }
 
@@ -279,6 +303,114 @@ fn use_call_accumulates_and_clamps_at_the_limit() {
 
     let err = h.client.try_use_call(&id, &0).unwrap_err();
     assert_eq!(err.unwrap(), Error::InvalidCalls);
+}
+
+#[test]
+fn pause_blocks_new_leases_and_resumes_cleanly() {
+    let h = setup();
+    register(&h);
+    assert!(!h.client.get_config().paused);
+
+    let escrow_before = balance(&h, &h.client.address);
+    assert!(h.client.set_paused(&true));
+    assert!(h.client.get_config().paused);
+
+    // A paused contract allocates no lease and moves no tokens.
+    let consumer_before = balance(&h, &h.consumer);
+    let err = h
+        .client
+        .try_create_lease(&h.consumer, &service_id(&h.env), &10, &60)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::Paused);
+    assert_eq!(balance(&h, &h.consumer), consumer_before);
+    assert_eq!(balance(&h, &h.client.address), escrow_before);
+    assert_eq!(h.client.get_config().lease_count, 0);
+
+    // Resuming needs no other state change.
+    assert!(!h.client.set_paused(&false));
+    assert!(!h.client.get_config().paused);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    assert_eq!(id, 1);
+}
+
+#[test]
+fn existing_leases_stay_usable_revocable_and_settleable_while_paused() {
+    let h = setup();
+    register(&h);
+    let settling = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &4, &60);
+    let revocable = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &4, &3_600);
+
+    h.client.set_paused(&true);
+
+    // The gateway can still commit served calls on existing leases.
+    let lease = h.client.use_call(&settling, &2);
+    assert_eq!(lease.calls_used, 2);
+    assert_eq!(h.client.remaining_calls(&settling), 2);
+
+    // The consumer can still revoke and be refunded for unused calls.
+    let consumer_before = balance(&h, &h.consumer);
+    h.client.revoke(&revocable);
+    assert_eq!(balance(&h, &h.consumer), consumer_before + 4_000);
+    assert_eq!(balance(&h, &h.client.address), 4_000);
+
+    // Settlement still pays the provider for consumed calls.
+    h.env.ledger().with_mut(|li| li.timestamp = 61);
+    let settled = h.client.settle(&settling);
+    assert!(settled.settled && !settled.active);
+    assert_eq!(balance(&h, &h.provider), 2_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+}
+
+#[test]
+fn pause_and_resume_emit_events() {
+    use soroban_sdk::{testutils::Events as _, IntoVal, Symbol, Vec as SVec};
+
+    let h = setup();
+
+    h.client.set_paused(&true);
+    assert_eq!(
+        h.env.events().all(),
+        SVec::from_array(
+            &h.env,
+            [(
+                h.client.address.clone(),
+                SVec::from_array(
+                    &h.env,
+                    [
+                        Symbol::new(&h.env, "paused").into_val(&h.env),
+                        h.admin.clone().into_val(&h.env),
+                    ],
+                ),
+                true.into_val(&h.env),
+            )],
+        ),
+    );
+
+    h.client.set_paused(&false);
+    assert_eq!(
+        h.env.events().all(),
+        SVec::from_array(
+            &h.env,
+            [(
+                h.client.address.clone(),
+                SVec::from_array(
+                    &h.env,
+                    [
+                        Symbol::new(&h.env, "unpaused").into_val(&h.env),
+                        h.admin.clone().into_val(&h.env),
+                    ],
+                ),
+                false.into_val(&h.env),
+            )],
+        ),
+    );
+    assert!(!h.client.get_config().paused);
 }
 
 #[test]
@@ -457,11 +589,18 @@ mod unauthorised {
             .try_register_service(&h.provider, &service_id(&h.env), &1_000)
             .unwrap_err();
         assert!(err.is_err(), "a provider signature is required");
-        let err = h
-            .client
-            .try_get_service(&service_id(&h.env))
-            .unwrap_err();
+        let err = h.client.try_get_service(&service_id(&h.env)).unwrap_err();
         assert_eq!(err.unwrap(), Error::UnknownService);
+    }
+
+    #[test]
+    fn set_paused_requires_the_admin() {
+        let h = setup();
+        clear_auths(&h);
+
+        let err = h.client.try_set_paused(&true).unwrap_err();
+        assert!(err.is_err(), "only the admin may pause new leases");
+        assert!(!h.client.get_config().paused);
     }
 
     #[test]
@@ -592,7 +731,10 @@ fn proposing_a_new_admin_requires_the_current_admin() {
     let next = Address::generate(&h.env);
     h.env.mock_auths(&[]);
     let err = h.client.try_propose_admin(&next).unwrap_err();
-    assert!(err.is_err(), "only the current admin may propose a successor");
+    assert!(
+        err.is_err(),
+        "only the current admin may propose a successor"
+    );
     assert_eq!(h.client.get_config().admin, h.admin);
 }
 
@@ -680,7 +822,11 @@ fn calls_committed_event_publishes_used_and_remaining() {
         h.env.events().all(),
         SVec::from_array(
             &h.env,
-            [(h.client.address.clone(), topics(), (3u32, 7u32).into_val(&h.env))],
+            [(
+                h.client.address.clone(),
+                topics(),
+                (3u32, 7u32).into_val(&h.env)
+            )],
         ),
     );
 
@@ -690,7 +836,11 @@ fn calls_committed_event_publishes_used_and_remaining() {
         h.env.events().all(),
         SVec::from_array(
             &h.env,
-            [(h.client.address.clone(), topics(), (10u32, 0u32).into_val(&h.env))],
+            [(
+                h.client.address.clone(),
+                topics(),
+                (10u32, 0u32).into_val(&h.env)
+            )],
         ),
     );
 }

@@ -1114,3 +1114,96 @@ describe('describeConfig', () => {
     expect(Object.keys(summary)).not.toContain('gatewaySecret');
   });
 });
+
+describe('buildUpstreamHeaders property test (request-smuggling vectors)', () => {
+  // Dependency-free: a seeded mulberry32 PRNG keeps every run reproducible.
+  function prng(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const pick = <T>(rand: () => number, items: readonly T[]): T =>
+    items[Math.floor(rand() * items.length)]!;
+  const mixCase = (rand: () => number, name: string): string =>
+    [...name].map((c) => (rand() < 0.5 ? c.toUpperCase() : c.toLowerCase())).join('');
+
+  const FORBIDDEN = [
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+    'host',
+    'content-length',
+    'x-forwarded-for',
+    'x-forwarded-host',
+    'x-forwarded-proto',
+    'x-forwarded-port',
+    'x-keylease-lease-id',
+    'x-keylease-calls-remaining',
+    'authorization',
+  ];
+  const VALUES = [
+    'chunked',
+    'chunked, identity',
+    '0',
+    '5',
+    '-1',
+    'close',
+    'keep-alive, Upgrade',
+    'websocket',
+    '1.2.3.4',
+    'evil.example.com',
+    'Bearer stolen',
+    'x',
+  ];
+  const BENIGN = ['accept', 'content-type', 'user-agent', 'x-custom', 'cookie', 'x-request-id'];
+
+  it('never forwards hop-by-hop, forwarding or lease headers in any casing', () => {
+    const rand = prng(0x5eed);
+    for (let run = 0; run < 500; run += 1) {
+      const input: Record<string, string | string[]> = {};
+      const count = 1 + Math.floor(rand() * 12);
+      for (let i = 0; i < count; i += 1) {
+        const name = mixCase(rand, rand() < 0.6 ? pick(rand, FORBIDDEN) : pick(rand, BENIGN));
+        const value = pick(rand, VALUES);
+        input[name] = rand() < 0.2 ? [value, pick(rand, VALUES)] : value;
+      }
+      const out = buildUpstreamHeaders(input);
+      for (const key of Object.keys(out)) {
+        expect(key, `run ${run}: ${JSON.stringify(input)}`).toBe(key.toLowerCase());
+        expect(FORBIDDEN, `run ${run}: ${JSON.stringify(input)}`).not.toContain(key);
+        expect(key.startsWith('x-keylease-')).toBe(false);
+        expect(key.startsWith('x-forwarded-')).toBe(false);
+      }
+    }
+  });
+
+  it('keeps authorization only when forwarding is enabled and preserves benign headers', () => {
+    const rand = prng(0xc0ffee);
+    for (let run = 0; run < 200; run += 1) {
+      const name = mixCase(rand, pick(rand, BENIGN.filter((n) => n !== 'cookie')));
+      const value = pick(rand, VALUES);
+      const input = { [name]: value, [mixCase(rand, 'Authorization')]: 'Bearer t' };
+      expect(buildUpstreamHeaders(input)[name.toLowerCase()]).toBe(value);
+      expect(buildUpstreamHeaders(input).authorization).toBeUndefined();
+      expect(buildUpstreamHeaders(input, { forwardAuthorization: true }).authorization).toBe(
+        'Bearer t',
+      );
+    }
+  });
+
+  it('is deterministic for a given seed', () => {
+    const a = prng(42);
+    const b = prng(42);
+    expect([a(), a(), a()]).toEqual([b(), b(), b()]);
+  });
+});

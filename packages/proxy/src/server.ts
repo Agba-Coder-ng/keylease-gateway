@@ -3,6 +3,7 @@
  * token (signature + cached on-chain state + local quota), then forwards
  * allowed requests to the protected upstream API.
  */
+import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import type { LeaseVerifier } from './verifier.js';
 
@@ -36,6 +37,15 @@ export interface ProxyOptions {
   metricsEnabled?: boolean;
   /** Maximum request body size in bytes. Defaults to 32 MiB. */
   maxBodyBytes?: number;
+}
+
+const REQUEST_ID_HEADER = 'x-request-id';
+const VALID_REQUEST_ID = /^[A-Za-z0-9._:~+=/-]{1,128}$/;
+
+/** Returns the inbound request id when it is safe to reuse, otherwise a fresh one. */
+export function resolveRequestId(incoming: string | string[] | undefined): string {
+  if (typeof incoming === 'string' && VALID_REQUEST_ID.test(incoming)) return incoming;
+  return randomUUID();
 }
 
 export const METRICS_LATENCY_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
@@ -115,7 +125,12 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
   // Parse every payload as a buffer so the proxy forwards bodies untouched.
   const maxBodyBytes = options.maxBodyBytes ?? 32 * 1024 * 1024;
-  const app = Fastify({ logger: options.logger ?? false, bodyLimit: maxBodyBytes });
+  const app = Fastify({
+    logger: options.logger ?? false,
+    bodyLimit: maxBodyBytes,
+    requestIdHeader: false,
+    genReqId: (req) => resolveRequestId(req.headers[REQUEST_ID_HEADER]),
+  });
   app.removeAllContentTypeParsers();
   app.addContentTypeParser('*', { parseAs: 'buffer' }, (_request, body, done) => {
     done(null, body);
@@ -124,8 +139,9 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   let inFlightRequests = 0;
   const drainWaiters = new Set<() => void>();
 
-  app.addHook('onRequest', async () => {
+  app.addHook('onRequest', async (request, reply) => {
     inFlightRequests += 1;
+    reply.header(REQUEST_ID_HEADER, request.id);
   });
 
   app.addHook('onResponse', async () => {
@@ -188,7 +204,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
         (metrics.requestsDenied.get(decision.reason) ?? 0) + 1,
       );
       request.log.info(
-        { reason: decision.reason, url: request.url },
+        { reason: decision.reason, url: request.url, requestId: request.id },
         'request denied by lease verifier',
       );
       return reply
@@ -211,6 +227,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
       method,
       headers: {
         ...headers,
+        [REQUEST_ID_HEADER]: request.id,
         'x-forwarded-for': appendForwardedFor(request.headers['x-forwarded-for'], request.ip),
         'x-forwarded-host': request.headers.host ?? '',
         'x-forwarded-proto': request.protocol,
@@ -243,6 +260,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
     reply.code(response.status);
     copyResponseHeaders(reply, response.headers);
+    reply.header(REQUEST_ID_HEADER, request.id);
     reply.header('x-keylease-lease-id', decision.lease.leaseId);
     reply.header('x-keylease-calls-remaining', String(decision.remainingCalls));
 

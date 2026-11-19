@@ -812,3 +812,59 @@ describe('resolveConfig KEYLEASE_MAX_BODY_BYTES', () => {
     ).toThrow(ProxyConfigError);
   });
 });
+
+describe('x-request-id propagation', () => {
+  function setup() {
+    const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+    return { app, calls };
+  }
+  const forwardedId = (calls: FetchCall[]) =>
+    (calls[0]?.init as { headers: Record<string, string> }).headers['x-request-id'];
+
+  it('reuses a valid inbound id, forwards it and echoes it', async () => {
+    const { app, calls } = setup();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/',
+      headers: { authorization: `Bearer ${mintToken()}`, 'x-request-id': 'req-123.abc' },
+    });
+    expect(res.headers['x-request-id']).toBe('req-123.abc');
+    expect(forwardedId(calls)).toBe('req-123.abc');
+    await app.close();
+  });
+
+  it('generates an id when none is supplied, including on denials', async () => {
+    const { app, calls } = setup();
+    const ok = await app.inject({
+      method: 'GET',
+      url: '/',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+    expect(ok.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
+    expect(forwardedId(calls)).toBe(ok.headers['x-request-id']);
+    const denied = await app.inject({ method: 'GET', url: '/' });
+    expect(denied.statusCode).toBe(401);
+    expect(denied.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
+    await app.close();
+  });
+
+  it('replaces ids with unsafe characters or excessive length', async () => {
+    const { app } = setup();
+    for (const bad of ['bad id<script>', 'a'.repeat(129), 'tab\tid']) {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/',
+        headers: { authorization: `Bearer ${mintToken()}`, 'x-request-id': bad },
+      });
+      expect(res.headers['x-request-id']).not.toBe(bad);
+      expect(res.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
+    }
+    await app.close();
+  });
+});
+

@@ -26,7 +26,7 @@ Everything the system depends on is Soroban:
 
 ```
 contracts/keylease-core  →  Soroban contract (Rust, soroban-sdk 29)
-packages/cli             →  @keylease/cli     acquire / env / status / settle / revoke
+packages/cli             →  @keylease/cli     acquire / env / status / sessions / settle / revoke
 packages/proxy           →  @keylease/proxy   lease-verifying reverse proxy
 ```
 
@@ -224,12 +224,22 @@ friendbot, writes `deployments.json` (public) and
 | `keylease env --service <id> [--file .env]` | Writes the temporary keys of an acquired lease into a local `.env` |
 | `keylease status --lease <id>` | Reads live lease state by simulating `get_lease` |
 | `keylease status --token <token>` | Verifies a session token offline |
+| `keylease status --token <token> --check-chain [--json]` | Also checks the referenced lease's on-chain active state, consumer, and remaining quota |
+| `keylease sessions [--json]` | Lists locally stored leases with expiry and status |
+| `keylease sessions --prune [--json]` | Removes locally stored leases that have expired |
 | `keylease settle --lease <id> --secret <key>` | Settles an expired/exhausted lease: provider payout + consumer refund |
 | `keylease revoke --lease <id> --secret <key>` | Ends a lease early and refunds its unused calls |
 | `keylease help` · `keylease --version` | Help / version |
 
 Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
 `--contract <id>`, `--json` (machine-readable output).
+
+`status --token` checks the token signature and expiry offline. Add
+`--check-chain` to also simulate `get_lease` and check that the lease is active,
+belongs to the token's consumer, and has calls remaining. The result includes
+the on-chain service; service and call limits are not claims encoded in the
+current session token. Chain lookup failures are reported as failed checks and
+return exit code 1.
 
 `--secret` is the consumer account's **Stellar secret seed**. It signs the
 `create_lease` transaction and the session token, and it never leaves the
@@ -243,6 +253,11 @@ preserving everything else in the file:
 KEYLEASE_SERVICE KEYLEASE_LEASE_ID KEYLEASE_CONSUMER KEYLEASE_SESSION_TOKEN
 KEYLEASE_CALLS_LIMIT KEYLEASE_ISSUED_AT KEYLEASE_EXPIRES_AT
 ```
+
+`keylease sessions` lists the stored service, lease ID, expiry, and whether the
+lease is active or expired. Add `--json` for machine-readable output, or
+`--prune` to remove expired entries. If the session store is missing, acquire a
+lease first; if it is corrupt, back it up or repair it before retrying.
 
 ---
 

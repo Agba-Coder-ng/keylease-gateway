@@ -27,6 +27,10 @@ function memoryStore(initial: Record<string, LeaseSession> = {}) {
     save: async (session: LeaseSession) => {
       sessions[session.service] = session;
     },
+    saveAll: async (next: Record<string, LeaseSession>) => {
+      for (const service of Object.keys(sessions)) delete sessions[service];
+      Object.assign(sessions, next);
+    },
   };
 }
 
@@ -227,12 +231,44 @@ describe('parseArgv', () => {
     expect(parseArgv(['status', '--lease', 'lease-1']).command).toBe('status');
     expect(parseArgv(['status', '--token', 'kls1.a.b']).command).toBe('status');
   });
+
+  it('parses sessions list and prune flags', () => {
+    expect(parseArgv(['sessions'])).toEqual({
+      command: 'sessions',
+      args: { prune: false, json: false },
+    });
+    expect(parseArgv(['sessions', '--prune', '--json'])).toEqual({
+      command: 'sessions',
+      args: { prune: true, json: true },
+    });
+  });
+
+  it('parses --check-chain only with status tokens', () => {
+    expect(parseArgv(['status', '--token', 'kls1.a.b'])).toEqual({
+      command: 'status',
+      args: { lease: undefined, token: 'kls1.a.b', checkChain: false, json: false },
+    });
+    expect(parseArgv(['status', '--token', 'kls1.a.b', '--check-chain', '--json'])).toEqual({
+      command: 'status',
+      args: { lease: undefined, token: 'kls1.a.b', checkChain: true, json: true },
+    });
+    expectCliError(() => parseArgv(['status', '--lease', '42', '--check-chain']), 'invalid_option');
+  });
 });
 
 describe('renderHelp', () => {
   it('documents every command', () => {
     const help = renderHelp();
-    for (const needle of ['acquire', 'env', 'status', '--secret', '--service']) {
+    for (const needle of [
+      'acquire',
+      'env',
+      'status',
+      'sessions',
+      '--prune',
+      '--check-chain',
+      '--secret',
+      '--service',
+    ]) {
       expect(help).toContain(needle);
     }
   });
@@ -327,5 +363,37 @@ describe('run', () => {
     const code = await run(['env', '--service', 'missing'], io, { env: { store: memoryStore() } });
     expect(code).toBe(1);
     expect(err.join('\n')).toContain('no lease found');
+  });
+
+  it('dispatches sessions to the command with injected dependencies', async () => {
+    const now = Math.floor(NOW_MS / 1000);
+    const store = memoryStore({
+      'weather-api': {
+        service: 'weather-api',
+        leaseId: 'lease-abc',
+        consumer: 'GCONSUMER',
+        token: 'kls1.payload.signature',
+        callsLimit: 5,
+        issuedAt: now - 60,
+        expiresAt: now + 60,
+        txHash: null,
+        network: 'testnet',
+      },
+    });
+    const { io, out } = captureIo();
+
+    expect(
+      await run(['sessions', '--json'], io, {
+        sessions: { store, now: () => NOW_MS },
+      }),
+    ).toBe(0);
+    expect(JSON.parse(out.join('\n'))).toEqual([
+      {
+        service: 'weather-api',
+        lease_id: 'lease-abc',
+        expires_at: now + 60,
+        status: 'active',
+      },
+    ]);
   });
 });

@@ -8,8 +8,8 @@
  * every proxy instance sees the same remaining quota.
  *
  * Commits are fire-and-forget from the request path: a failed commit is
- * reported through `onError` and retried on the next flush, never surfaced as
- * a 5xx to the caller (the chain stays authoritative for settlement).
+ * reported through `onError` and retried with bounded backoff, never surfaced
+ * as a 5xx to the caller (the chain stays authoritative for settlement).
  */
 export interface CallCommitter {
   useCalls(leaseId: string, count: number): Promise<unknown>;
@@ -35,6 +35,13 @@ export interface OnChainQuotaOptions {
   /** Periodic flush interval in ms; `0` disables the timer. Defaults to 10s. */
   flushIntervalMs?: number;
   /** Called when the lease bound triggers a flush or a commit fails. Failed counts are queued again. */
+  /** Maximum total commit attempts for a pending batch. Defaults to 5. */
+  maxRetryAttempts?: number;
+  /** Base retry delay in ms before jitter. Defaults to 1s. */
+  retryBaseDelayMs?: number;
+  /** Maximum retry delay in ms. Defaults to 30s. */
+  retryMaxDelayMs?: number;
+  /** Called when a commit fails; failed counts are queued again. */
   onError?: (error: unknown, leaseId: string, count: number) => void;
 }
 
@@ -50,9 +57,14 @@ export class OnChainQuota implements QuotaSink {
   private readonly batchSize: number;
   private readonly maxTrackedLeases: number;
   private readonly flushIntervalMs: number;
+  private readonly maxRetryAttempts: number;
+  private readonly retryBaseDelayMs: number;
+  private readonly retryMaxDelayMs: number;
   private readonly onError: (error: unknown, leaseId: string, count: number) => void;
   private readonly pending = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryAttempts = 0;
   private queue: Promise<void> = Promise.resolve();
 
   constructor(options: OnChainQuotaOptions) {
@@ -64,10 +76,21 @@ export class OnChainQuota implements QuotaSink {
     }
     this.maxTrackedLeases = maxTrackedLeases;
     this.flushIntervalMs = options.flushIntervalMs ?? 10_000;
+    this.maxRetryAttempts = Math.max(1, options.maxRetryAttempts ?? 5);
+    this.retryBaseDelayMs = Math.max(0, options.retryBaseDelayMs ?? 1_000);
+    this.retryMaxDelayMs = Math.max(
+      this.retryBaseDelayMs,
+      options.retryMaxDelayMs ?? 30_000,
+    );
     this.onError = options.onError ?? (() => {});
     if (this.flushIntervalMs > 0) {
       this.timer = setInterval(() => {
-        void this.flush();
+        if (
+          this.retryTimer === null &&
+          this.retryAttempts < this.maxRetryAttempts
+        ) {
+          void this.flush();
+        }
       }, this.flushIntervalMs);
       // Never keep the process alive just to flush quota.
       this.timer.unref?.();
@@ -83,7 +106,8 @@ export class OnChainQuota implements QuotaSink {
 
     const next = (this.pending.get(leaseId) ?? 0) + 1;
     this.pending.set(leaseId, next);
-    if (this.totalPending() >= this.batchSize) {
+    if (this.retryAttempts >= this.maxRetryAttempts) this.retryAttempts = 0;
+    if (this.totalPending() >= this.batchSize && this.retryTimer === null) {
       void this.flush();
     }
   }
@@ -98,6 +122,8 @@ export class OnChainQuota implements QuotaSink {
     if (snapshot.length === 0) return this.queue;
     this.pending.clear();
     this.queue = this.queue.then(() => this.drain(snapshot));
+    this.clearRetryTimer();
+    this.queue = this.queue.then(() => this.drain());
     return this.queue;
   }
 
@@ -106,6 +132,7 @@ export class OnChainQuota implements QuotaSink {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.clearRetryTimer();
     await this.flush();
   }
 
@@ -116,13 +143,46 @@ export class OnChainQuota implements QuotaSink {
   }
 
   private async drain(snapshot: Array<[string, number]>): Promise<void> {
+  private async drain(): Promise<void> {
+    if (this.pending.size === 0) return;
+    const snapshot = [...this.pending.entries()];
+    this.pending.clear();
+    let failed = false;
+
     for (const [leaseId, count] of snapshot) {
       try {
         await this.committer.useCalls(leaseId, count);
       } catch (error) {
+        failed = true;
         this.pending.set(leaseId, (this.pending.get(leaseId) ?? 0) + count);
         this.onError(error, leaseId, count);
       }
+    }
+
+    if (failed) {
+      this.retryAttempts += 1;
+      this.scheduleRetry();
+    } else {
+      this.retryAttempts = 0;
+    }
+  }
+
+  private scheduleRetry(): void {
+    if (this.retryAttempts >= this.maxRetryAttempts || this.retryTimer !== null) return;
+    const exponentialDelay = this.retryBaseDelayMs * 2 ** (this.retryAttempts - 1);
+    const delayCap = Math.min(this.retryMaxDelayMs, exponentialDelay);
+    const delay = Math.floor(Math.random() * delayCap);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.flush();
+    }, delay);
+    this.retryTimer.unref?.();
+  }
+
+  private clearRetryTimer(): void {
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
     }
   }
 }

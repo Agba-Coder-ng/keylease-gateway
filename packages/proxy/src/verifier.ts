@@ -279,7 +279,9 @@ export class LeaseVerifier {
       try {
         const lease = await this.provider.getLeaseState(leaseId);
         this.rpcDown = false;
-        this.cache.set(leaseId, lease);
+        // Never cache past the lease's own expiry; non-positive TTLs are not cached.
+        const untilExpiryMs = lease.expiresAt * 1000 - this.clock();
+        this.cache.set(leaseId, lease, Math.min(this.cacheTtlMs, untilExpiryMs));
         return lease;
       } catch (error) {
         if (isLeaseNotFound(error)) {

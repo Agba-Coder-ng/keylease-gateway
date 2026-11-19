@@ -56,6 +56,77 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  pr-title:
+    name: PR title · conventional commits
+    # Dependabot PRs carry generated titles; their content is reviewed like any
+    # other change. Every contributor PR, including forks, is validated.
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # pnpm version comes from the "packageManager" field in package.json
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The pull request title is the message that lands on main for a squash
+      # merge, so it is what this check validates. The rules live in
+      # commitlint.config.mjs and scripts/conventional-commits.mjs.
+      - name: Validate the pull request title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          # Titles generated from merge commits are not authored messages.
+          if [[ "$PR_TITLE" == Merge\ * ]]; then
+            echo "Skipping: merge-commit title."
+            exit 0
+          fi
+
+          if [[ -z "${PR_TITLE//[[:space:]]/}" ]]; then
+            echo "::error::The pull request title is empty; use '<type>(<scope>): <subject>'."
+            exit 1
+          fi
+
+          status=0
+          printf '%s\n' "$PR_TITLE" | pnpm exec commitlint --config commitlint.config.mjs || status=$?
+          if [[ $status -eq 0 ]]; then
+            echo "PR title follows Conventional Commits."
+            exit 0
+          fi
+
+          suggestion="$(node scripts/pr-title-suggestion.mjs "$PR_TITLE" 2>/dev/null || echo 'feat: describe the change')"
+          echo "::error::PR title must follow Conventional Commits. Suggested title: $suggestion"
+          {
+            echo '### PR title does not follow Conventional Commits'
+            echo
+            echo 'The pull request title is validated by CI. Use this title instead:'
+            echo
+            echo '```text'
+            echo "$suggestion"
+            echo '```'
+            echo
+            echo 'See [CONTRIBUTING.md](https://github.com/${{ github.repository }}/blob/main/CONTRIBUTING.md#commit-messages-and-pr-titles).'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
   contract:
     name: contract · test · wasm
     runs-on: ubuntu-latest

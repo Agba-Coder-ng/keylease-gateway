@@ -246,7 +246,13 @@ return exit code 1.
 process — it is not printed, logged, or written to disk.
 
 `acquire` remembers the lease in `.keylease/sessions.json` (git-ignored) so
-`env` can find it later. `env` merges these keys, replacing existing ones and
+`env` can find it later. The store is a local cache with best-effort locking:
+writes are serialized within a process, guarded across processes by an
+exclusive `.keylease/sessions.json.lock` (2 s wait; a lock older than 10 s is
+treated as abandoned and removed once), and land via an atomic temp-file
+rename, so parallel `acquire` runs for different services keep every session.
+If the lock stays held, the command fails with a `locked` error naming the
+lock file. `env` merges these keys, replacing existing ones and
 preserving everything else in the file:
 
 ```

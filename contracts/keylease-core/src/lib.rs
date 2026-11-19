@@ -21,6 +21,17 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
 };
 
+/// Contract ABI version burned into the wasm. Taken from `Cargo.toml` at
+/// compile time so the two can never drift.
+///
+/// Compatibility policy (semver on the contract ABI):
+/// * patch — internal fixes, no change to entry points, types or errors;
+/// * minor — additive only (new entry points, views, error variants or
+///   events); existing callers keep working;
+/// * major — breaking (removed/renamed entry points, changed argument or
+///   storage layouts). Clients should refuse a major they do not know.
+pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Ledgers are ~5s; keep long-lived entries alive for a month at a time.
 const DAY_IN_LEDGERS: u32 = 17_280;
 /// Extend an entry when it has less than a week of TTL left.
@@ -394,6 +405,12 @@ impl KeyleaseCore {
     /// Contract configuration plus the number of leases ever created.
     pub fn get_config(env: Env) -> Result<Config, Error> {
         load_config(&env)
+    }
+
+    /// Contract ABI version (the crate version, e.g. `"0.2.0"`). Works before
+    /// `init`, so deploy verification can check it in one simulated call.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
     }
 
     /// Calls left on a lease (`0` for unknown or settled leases).

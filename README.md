@@ -222,18 +222,21 @@ friendbot, writes `deployments.json` (public) and
 | Command | Purpose |
 | --- | --- |
 | `keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>` | Invokes `create_lease` (paying the SAC token into escrow) and prints a signed session bearer token |
+| `keylease acquire --service <id> --calls <n> --duration <secs> --dry-run` | Quotes the price of those calls without signing, creating a lease or storing a session |
 | `keylease env --service <id> [--file .env]` | Writes the temporary keys of an acquired lease into a local `.env` |
 | `keylease status --lease <id>` | Reads live lease state by simulating `get_lease` |
 | `keylease status --token <token>` | Verifies a session token offline |
 | `keylease status --token <token> --check-chain [--json]` | Also checks the referenced lease's on-chain active state, consumer, and remaining quota |
 | `keylease sessions [--json]` | Lists locally stored leases with expiry and status |
 | `keylease sessions --prune [--json]` | Removes locally stored leases that have expired |
+| `keylease completions <shell>` | Prints a bash, zsh or fish completion script (`bash`, `zsh`, `fish`) |
 | `keylease settle --lease <id> --secret <key>` | Settles an expired/exhausted lease: provider payout + consumer refund |
 | `keylease revoke --lease <id> --secret <key>` | Ends a lease early and refunds its unused calls |
 | `keylease help` · `keylease --version` | Help / version |
 
 Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
-`--contract <id>`, `--json` (machine-readable output).
+`--contract <id>`, `--json` (machine-readable output), `--dry-run`
+(`acquire` only).
 
 `status --token` checks the token signature and expiry offline. Add
 `--check-chain` to also simulate `get_lease` and check that the lease is active,
@@ -246,6 +249,14 @@ return exit code 1.
 `create_lease` transaction and the session token, and it never leaves the
 process — it is not printed, logged, or written to disk.
 
+`acquire --dry-run` calls `quote` on `keylease-core` first and prints the
+service, call count, duration, quoted price (token smallest units) and the
+expiry the lease would get — then stops. Nothing is signed, no lease is created
+and nothing is written to `.keylease/sessions.json`, so a typo in `--calls`
+costs no testnet XLM. `--secret` is optional with `--dry-run`; pass it to see
+the consumer address the lease would use. Add `--json` for machine-readable
+output (`dry_run: true`, `price`, `expires_at`).
+
 `acquire` remembers the lease in `.keylease/sessions.json` (git-ignored) so
 `env` can find it later. The store is a local cache with best-effort locking:
 writes are serialized within a process, guarded across processes by an
@@ -256,15 +267,92 @@ If the lock stays held, the command fails with a `locked` error naming the
 lock file. `env` merges these keys, replacing existing ones and
 preserving everything else in the file:
 
+```dotenv
+KEYLEASE_SERVICE=weather-api
+KEYLEASE_LEASE_ID=42
+KEYLEASE_CONSUMER=GDUKMGUGDZQK6YHYA5Z6AY2G4XDSZPSZ3SW5UN3ARVMO6QSRDWP5YLEX
+KEYLEASE_SESSION_TOKEN=kls1.eyJ...signature
+KEYLEASE_CALLS_LIMIT=25
+KEYLEASE_ISSUED_AT=1700000000
+KEYLEASE_EXPIRES_AT=1700003600
 ```
-KEYLEASE_SERVICE KEYLEASE_LEASE_ID KEYLEASE_CONSUMER KEYLEASE_SESSION_TOKEN
-KEYLEASE_CALLS_LIMIT KEYLEASE_ISSUED_AT KEYLEASE_EXPIRES_AT
+
+The file is meant to be sourced, so values are shell-quoted: plain values made
+of `A-Z a-z 0-9 _ . : @ / -` are written bare, and anything else is
+double-quoted with `\`, `"` and `$` escaped. A service id containing a space or
+`#` therefore reads back intact:
+
+```dotenv
+KEYLEASE_SERVICE="weather api #1"
+KEYLEASE_SESSION_TOKEN="kls1.a\$b.c\"d"
+```
+
+```bash
+set -a; . ./.env; set +a
+# KEYLEASE_SERVICE is now exactly `weather api #1`
 ```
 
 `keylease sessions` lists the stored service, lease ID, expiry, and whether the
 lease is active or expired. Add `--json` for machine-readable output, or
 `--prune` to remove expired entries. If the session store is missing, acquire a
 lease first; if it is corrupt, back it up or repair it before retrying.
+
+### Configuration file
+
+`keylease` reads an optional `.keyleaserc.json` from the working directory once
+per invocation; a missing file is ignored. CI jobs and teams can check one in
+instead of repeating the same network triple:
+
+```json
+{
+  "network": "testnet",
+  "rpc": "https://soroban-testnet.stellar.org",
+  "contract": "CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC",
+  "defaultService": "weather-api"
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `network` | `testnet` \| `mainnet` \| `local` |
+| `rpc` | Soroban RPC endpoint override |
+| `contract` | `keylease-core` contract id |
+| `defaultService` | service id used when `--service` is omitted (`acquire`, `env`) |
+
+Unknown keys, invalid JSON and values that are not non-empty strings are
+rejected with a usage error naming the file, so a typo in a checked-in config
+fails loudly instead of being ignored. `keylease help` and `keylease --version`
+never read the file and keep working when it is broken.
+
+Precedence for every key, highest first:
+
+| Layer | Source |
+| --- | --- |
+| 1 | command-line flag (`--network`, `--rpc`, `--contract`, `--service`) |
+| 2 | environment (`KEYLEASE_NETWORK`, `KEYLEASE_RPC_URL`, `KEYLEASE_CONTRACT_ID` or `KEYLEASE_CONTRACT`, `KEYLEASE_SERVICE`) |
+| 3 | `.keyleaserc.json` |
+| 4 | built-in default (`network=testnet`; no rpc, contract or service) |
+
+### Shell completions
+
+`keylease completions <shell>` prints a static completion script for `bash`,
+`zsh` or `fish` covering every command, flag and `--network` value. It only
+writes to stdout:
+
+```bash
+# bash — current session
+source <(keylease completions bash)
+# bash — persist
+keylease completions bash | sudo tee /etc/bash_completion.d/keylease >/dev/null
+
+# zsh
+keylease completions zsh > "${fpath[1]}/_keylease"
+
+# fish
+keylease completions fish > ~/.config/fish/completions/keylease.fish
+```
+
+An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 
 ---
 
@@ -446,7 +534,7 @@ keylease-gateway/
 pnpm contract:test # cargo test: 36 contract tests
 pnpm contract:build# stellar contract build (wasm32v1-none)
 pnpm build         # tsc emit for both packages (topological order)
-pnpm test          # vitest: 110 tests (58 CLI + 52 proxy)
+pnpm test          # vitest: 213 tests (109 CLI + 104 proxy)
 pnpm lint          # eslint (flat config, typescript-eslint)
 pnpm typecheck     # build, then tsc --noEmit in every package
 ```

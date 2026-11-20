@@ -4,6 +4,7 @@ import { CliError, parseArgv, renderHelp, run, type CliIo } from './index.js';
 import type { AcquireArgs, LeaseSession } from './commands/lease.js';
 
 const NOW_MS = 1_700_000_000_000;
+const NOW = NOW_MS / 1000;
 const SECRET = Keypair.random().secret();
 
 function captureIo(): { io: CliIo; out: string[]; err: string[] } {
@@ -92,12 +93,16 @@ describe('parseArgv', () => {
       '--duration=60',
       `--secret=${SECRET}`,
       '--network=local',
+      '--fee=2500',
+      '--timeout=90',
       '--json',
     ]);
     expect(invocation.command).toBe('acquire');
     const args = (invocation as { args: AcquireArgs }).args;
     expect(args.service).toBe('weather-api');
     expect(args.network).toBe('local');
+    expect(args.fee).toBe(2_500);
+    expect(args.timeout).toBe(90);
     expect(args.json).toBe(true);
   });
 
@@ -406,6 +411,64 @@ describe('parseArgv', () => {
     });
   });
 
+  it('parses repeated and comma-separated lifecycle lease ids without duplicates', () => {
+    expect(
+      parseArgv([
+        'settle',
+        '--lease',
+        '1,2',
+        '--lease',
+        '2',
+        '--lease=3',
+        '--secret',
+        SECRET,
+        '--fee',
+        '5000',
+        '--timeout',
+        '120',
+      ]),
+    ).toEqual({
+      command: 'settle',
+      args: {
+        lease: ['1', '2', '3'],
+        secret: SECRET,
+        json: false,
+        fee: 5_000,
+        timeout: 120,
+      },
+    });
+    expect(
+      parseArgv(['revoke', '--lease', '4', '--lease', '5,6', '--secret', SECRET, '--json']),
+    ).toEqual({
+      command: 'revoke',
+      args: {
+        lease: ['4', '5', '6'],
+        secret: SECRET,
+        json: true,
+      },
+    });
+    expectCliError(
+      () => parseArgv(['acquire', '--service', 'x', '--calls', '1', '--duration', '1', '--secret', SECRET, '--fee', '0']),
+      'invalid_option',
+    );
+    expectCliError(
+      () => parseArgv(['revoke', '--lease', '1', '--secret', SECRET, '--timeout', '1.5']),
+      'invalid_option',
+    );
+    expectCliError(
+      () => parseArgv(['settle', '--lease', '1', '--secret', SECRET, '--fee', '9007199254740992']),
+      'invalid_option',
+    );
+    expectCliError(
+      () => parseArgv(['settle', '--lease', '1,,2', '--secret', SECRET]),
+      'invalid_option',
+    );
+    expectCliError(
+      () => parseArgv(['status', '--lease', '1', '--lease', '2']),
+      'invalid_option',
+    );
+  });
+
   it('parses --check-chain only with status tokens', () => {
     expect(parseArgv(['status', '--token', 'kls1.a.b'])).toEqual({
       command: 'status',
@@ -486,11 +549,24 @@ describe('run', () => {
           now: () => NOW_MS,
           store,
           createClient: () => ({
+            quote: async () => 5_000,
             quote: async () => 10,
             createLease: async (params) => {
               seen.push(params);
               return { leaseId: 'lease-abc', txHash: 'deadbeef' };
             },
+            getLeaseState: async () => ({
+              leaseId: 'lease-abc',
+              service: 'weather-api',
+              provider: 'GPROVIDER',
+              consumer: Keypair.fromSecret(SECRET).publicKey(),
+              callsLimit: 5,
+              callsUsed: 0,
+              expiresAt: NOW + 300,
+              active: true,
+              settled: false,
+              pricePaid: 5_000,
+            }),
           }),
         },
       },
@@ -514,9 +590,13 @@ describe('run', () => {
       {
         acquire: {
           createClient: () => ({
+            quote: async () => 1_000,
             quote: async () => 10,
             createLease: async () => {
               throw new Error('rpc exploded');
+            },
+            getLeaseState: async () => {
+              throw new Error('should not be called');
             },
           }),
         },

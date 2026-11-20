@@ -228,8 +228,24 @@ friendbot, writes `deployments.json` (public) and
 | `keylease status --lease <id>` | Reads live lease state by simulating `get_lease` |
 | `keylease status --token <token>` | Verifies a session token offline |
 | `keylease status --token <token> --check-chain [--json]` | Also checks the referenced lease's on-chain active state, consumer, and remaining quota |
-| `keylease sessions [--json]` | Lists locally stored leases with expiry and status |
+| `keylease sessions [--json]` | Lists locally stored leases with cost, expiry, and status |
 | `keylease sessions --prune [--json]` | Removes locally stored leases that have expired |
+| `keylease settle --lease <id>[,<id>...] [--lease <id> ...] --secret <key>` | Settles multiple expired/exhausted leases |
+| `keylease revoke --lease <id>[,<id>...] [--lease <id> ...] --secret <key>` | Revokes multiple leases and refunds unused calls |
+| `keylease help` · `keylease --version` | Help / version |
+
+Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
+`--contract <id>`, `--json` (machine-readable output). Transaction commands
+`acquire`, `settle`, and `revoke` also accept `--fee <stroops>` (positive
+integer; defaults to the Stellar SDK base fee) and `--timeout <seconds>`
+(positive integer; defaults to 60 seconds).
+
+`settle` and `revoke` accept repeated `--lease` flags or comma-separated IDs.
+IDs are de-duplicated and each lease gets an outcome in the summary table; with
+`--json`, the command prints an array of per-lease results. An already-settled
+lease is reported as `already_settled` and does not stop the batch. Both
+commands continue through all IDs and return exit code 1 if any lease has a
+real failure, or 0 if all leases succeeded or were already settled.
 | `keylease completions <shell>` | Prints a bash, zsh or fish completion script (`bash`, `zsh`, `fish`) |
 | `keylease settle --lease <id> --secret <key>` | Settles an expired/exhausted lease: provider payout + consumer refund |
 | `keylease revoke --lease <id> --secret <key>` | Ends a lease early and refunds its unused calls |
@@ -297,10 +313,17 @@ set -a; . ./.env; set +a
 # KEYLEASE_SERVICE is now exactly `weather api #1`
 ```
 
-`keylease sessions` lists the stored service, lease ID, expiry, and whether the
-lease is active or expired. Add `--json` for machine-readable output, or
-`--prune` to remove expired entries. If the session store is missing, acquire a
-lease first; if it is corrupt, back it up or repair it before retrying.
+Each stored session also records `pricePaid` and `pricePerCall`, in the token's
+smallest units. Acquisition quotes before creating the lease and checks the
+resulting on-chain escrow; if the price changed between those steps, the session
+records the on-chain amount and acquisition warns about the mismatch. Existing
+session files without these optional fields remain valid.
+
+`keylease sessions` lists the stored service, lease ID, cost, expiry, and
+whether the lease is active or expired. Add `--json` for machine-readable
+output, or `--prune` to remove expired entries. `status --lease` shows the
+on-chain escrow total and cost per call. If the session store is missing,
+acquire a lease first; if it is corrupt, back it up or repair it before retrying.
 
 #### Environment file merge rule
 
@@ -641,6 +664,13 @@ conventions and the issue templates (trivial 100 / medium 150 / high 200
 points). Found a security issue (token forgery, quota bypass, escrow payout,
 RPC spoofing)? Follow [SECURITY.md](./SECURITY.md) instead of opening a public
 issue.
+
+CLI human-readable output is checked against fixtures in
+`packages/cli/test/golden/`. After intentionally changing command formatting,
+run `UPDATE_GOLDEN=1 pnpm --filter @keylease/cli test` to regenerate the
+fixtures, review the fixture diff, then run `pnpm --filter @keylease/cli test`
+without the variable. JSON output is validated separately with schema
+assertions rather than golden files.
 
 ## Community
 

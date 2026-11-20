@@ -18,6 +18,8 @@ export interface SessionsDeps {
 interface SessionRow {
   service: string;
   lease_id: string;
+  price_paid?: number;
+  price_per_call?: number;
   expires_at: number;
   status: 'active' | 'expired';
 }
@@ -30,6 +32,8 @@ function sessionRows(sessions: Record<string, LeaseSession[]>, now: number): Ses
       return {
         service: session.service,
         lease_id: session.leaseId,
+        ...(session.pricePaid === undefined ? {} : { price_paid: session.pricePaid }),
+        ...(session.pricePerCall === undefined ? {} : { price_per_call: session.pricePerCall }),
         expires_at: session.expiresAt,
         status,
       };
@@ -46,10 +50,12 @@ function formatExpiry(expiresAt: number): string {
 }
 
 function renderSessionTable(rows: SessionRow[], io: CliIo): void {
-  const headers = ['SERVICE', 'LEASE ID', 'EXPIRES AT', 'STATUS'];
+  const headers = ['SERVICE', 'LEASE ID', 'PRICE PAID', 'PRICE/CALL', 'EXPIRES AT', 'STATUS'];
   const values = rows.map((row) => [
     row.service,
     row.lease_id,
+    row.price_paid === undefined ? '-' : String(row.price_paid),
+    row.price_per_call === undefined ? '-' : String(row.price_per_call),
     formatExpiry(row.expires_at),
     row.status,
   ]);

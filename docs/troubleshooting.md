@@ -127,18 +127,18 @@ signature failures on `require_auth` are **not** `Error(Contract, #14)`.
 | Code | Variant | Raised by | Meaning / next action |
 | --- | --- | --- | --- |
 | 1 | `AlreadyInitialized` | `init` | Setup already happened; do not call `init` again |
-| 2 | `NotInitialized` | `set_gateway`, `propose_admin`, `accept_admin`, `register_service`, `create_lease`, `use_call`, `revoke`, `settle`, `get_config` (any path that loads config) | Contract was deployed but not initialized; contact the operator |
-| 3 | `UnknownService` | `quote`, `create_lease`, `get_service`, `set_service_active` | `Service was never registered`. Check `--service`; ask the provider to call `register_service(provider, service, price_per_call)` on the configured contract |
+| 2 | `NotInitialized` | `set_gateway`, `propose_admin`, `accept_admin`, `register_service`, `create_lease`, `extend_lease`, `use_call`, `revoke`, `settle`, `get_config` (any path that loads config) | Contract was deployed but not initialized; contact the operator. Views that only load a service or lease do not raise this code |
+| 3 | `UnknownService` | `quote`, `create_lease`, `extend_lease`, `get_service`, `set_service_active` | `Service was never registered`. Check `--service`; ask the provider to call `register_service(provider, service, price_per_call)` on the configured contract |
 | 4 | `ServiceInactive` | `create_lease` | Provider paused the service; ask them to call `set_service_active(..., true)` |
-| 5 | `LeaseNotFound` | `use_call`, `revoke`, `settle`, `get_lease`, `load_lease` paths | Check `--lease` and the network/contract triple; the proxy returns `403 lease_not_found` |
-| 6 | `LeaseInactive` | `use_call` | Lease was revoked or settled; acquire a new lease |
-| 7 | `LeaseExpired` | `use_call` | `expires_at` has passed; settle the old lease and acquire a new one |
+| 5 | `LeaseNotFound` | `use_call`, `extend_lease`, `revoke`, `settle`, `get_lease`, `load_lease` paths | Check `--lease` and the network/contract triple; the proxy returns `403 lease_not_found` |
+| 6 | `LeaseInactive` | `use_call`, `extend_lease` | Lease was revoked or settled; acquire a new lease |
+| 7 | `LeaseExpired` | `use_call`, `extend_lease` | `expires_at` has passed; settle the old lease and acquire a new one. An expired lease cannot be extended |
 | 8 | `LeaseNotSettleable` | `settle` | Settlement is only allowed after expiry or quota exhaustion; wait or exhaust the calls |
-| 9 | `AlreadySettled` | `revoke`, `settle` | Escrow was already paid out; payouts cannot repeat |
-| 10 | `InvalidCalls` | `quote`, `create_lease`, `use_call` | Call count must be positive; use `--calls 25` or a positive `count` |
-| 11 | `InvalidDuration` | `create_lease` | Duration must be positive seconds; use `--duration 3600` |
+| 9 | `AlreadySettled` | `revoke`, `settle`, `extend_lease` | Escrow was already paid out; payouts cannot repeat and a settled lease cannot be extended |
+| 10 | `InvalidCalls` | `quote`, `create_lease`, `extend_lease`, `use_call` | Call count must be positive; use `--calls 25` or a positive `count`. For `extend_lease` this also means both `extra_calls` and `extra_duration` were zero, or `calls_limit` would overflow |
+| 11 | `InvalidDuration` | `create_lease`, `extend_lease` | Duration must be positive seconds; use `--duration 3600`. For `extend_lease` this also means `expires_at` would overflow |
 | 12 | `InvalidPrice` | `register_service` | `price_per_call` must be positive; provider must fix the registration |
-| 13 | `InvalidAmount` | `quote`, `create_lease` | `price_per_call × calls` overflowed or produced an invalid amount; reduce the call count |
+| 13 | `InvalidAmount` | `quote`, `create_lease`, `extend_lease` | `price_per_call × calls` overflowed or produced an invalid amount; reduce the call count. For `extend_lease` this is the `extra_calls × price_per_call` top-up |
 | 14 | `Unauthorized` | `accept_admin` (no pending proposal), `set_service_active` (provider mismatch) | Use the correct account/role; a missing signature is a host auth error, not this code |
 | 15 | `InvalidConsumer` | `create_lease` | Consumer cannot be the contract's own address; pass a real Stellar account as `consumer` |
 
@@ -146,6 +146,23 @@ The CLI's `mapContractError` currently maps codes 1–14; code 15 comes from the
 contract source and will be shown by the CLI as an unknown contract error until
 the mapper is extended. Codes 10–13 in the README are expanded above because
 each has a different entry point and fix.
+
+### Extending an existing lease
+
+`extend_lease(lease_id, extra_calls, extra_duration)` is a consumer-authorised
+contract entry point. It extends only an active, unexpired, unsettled lease, and
+at least one of the two amounts must be nonzero: pass `0` for `extra_calls` to
+buy time only, or `0` for `extra_duration` to buy calls only. The top-up is
+priced with the same `extra_calls × price_per_call` formula as `create_lease`,
+added to `price_paid` and escrow, and reported in a `lease_extended` event with
+topics `(lease_extended, consumer, lease_id)`.
+
+There is no CLI `extend` subcommand yet, so invoke the contract entry point
+directly with the lease consumer's signature. After extending, re-run
+`node packages/cli/dist/index.js status --lease <id>` to see the new
+`calls_limit`, `expires_at` and remaining quota. An offline `status --token`
+check still describes the old token; the token payload does not carry lease
+limits and must not be read as proof of the extension.
 
 ## Proxy 401 and 403 decisions
 

@@ -8,9 +8,10 @@ with the pre-1.0 policy below. Entries are grouped as `Added`, `Changed`,
 `Fixed` and `Security`.
 
 There are no Git release tags in this repository at the time of writing.
-Version numbers below come from the checked-in manifests:
-`contracts/keylease-core/Cargo.toml` (`0.2.0`), `packages/cli/package.json`
-(`0.1.0`), `packages/proxy/package.json` (`0.1.0`) and `package.json` (`0.1.0`).
+Version numbers below come from the checked-in manifests. The historical core
+baseline is `0.2.0`; `contracts/keylease-core/Cargo.toml` is bumped to `0.3.0`
+in `Unreleased` for the additive `extend_lease` ABI change below. The TypeScript
+packages and workspace remain at `0.1.0`.
 
 ## [Unreleased]
 
@@ -23,10 +24,22 @@ Version numbers below come from the checked-in manifests:
   `git clone` through a reviewable PR, with the repository's label/point scheme
   and three real open good-first issues.
 - This changelog, linked from the README and CONTRIBUTING.
+- `keylease-core` entry point `extend_lease(lease_id, extra_calls,
+  extra_duration)`: consumer-authorised top-up of an active, unexpired,
+  unsettled lease. One dimension may be zero; both may not. The top-up uses the
+  `create_lease` price formula with checked arithmetic, adds to escrow and
+  `price_paid`, grows `calls_limit` / `expires_at`, and emits a dedicated
+  `lease_extended` event.
+- Contract and troubleshooting documentation for the new entry point. The CLI
+  has no `extend` command yet; call the contract directly.
 
 ### Changed
 
-- Documentation only; no runtime behaviour changed in this section.
+- `contracts/keylease-core` is bumped from `0.2.0` to `0.3.0` because the new
+  entry point and event are additive ABI changes. No release tag is created by
+  this change.
+- `docs/troubleshooting.md` now lists `extend_lease` among the raising entry
+  points for contract codes 2, 3, 5, 6, 7, 9, 10, 11 and 13.
 
 ### Fixed
 
@@ -34,15 +47,17 @@ Version numbers below come from the checked-in manifests:
 
 ### Security
 
-- No security behaviour changed in this section. The pre-1.0, unaudited policy
-  in [SECURITY.md](./SECURITY.md) remains in force.
+- `extend_lease` adds a second escrow transfer path to review: it must require
+  the stored lease consumer's auth, refuse settled/inactive/expired leases,
+  price only the added calls, and never double-pay on settlement. The pre-1.0,
+  unaudited policy in [SECURITY.md](./SECURITY.md) remains in force.
 
 ## [0.2.0] - keylease-core
 
-Current version in `contracts/keylease-core/Cargo.toml`. No Git tag exists for
-it; the entries below are derived from that manifest, the current source and the
-commit history (starting with `9aad5c5 feat: make keylease-core an escrowed
-Soroban contract in this repo`).
+Historical baseline before this branch. No Git tag exists for it; the entries
+below are derived from the prior manifest, the current source and the commit
+history (starting with `9aad5c5 feat: make keylease-core an escrowed Soroban
+contract in this repo`).
 
 ### Added
 

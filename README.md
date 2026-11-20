@@ -113,8 +113,9 @@ sequenceDiagram
   chain reflects real traffic and every instance sees the same remaining quota.
 - **The signature check is offline.** A bearer token is
   `kls1.<base64url(payload)>.<ed25519 signature>` where the payload carries
-  `(v, lease_id, consumer, iat, exp)` and the signature is produced by the
-  consumer's Stellar key. Forged or expired tokens never reach the RPC layer.
+  `(v, lease_id, consumer, iat, exp)` plus an optional `service` claim, and
+  the signature is produced by the consumer's Stellar key. Forged or expired
+  tokens never reach the RPC layer (see [Session token payload](#session-token-payload)).
 - **Reads go through simulation.** Lease state is read by simulating
   `get_lease` over Soroban RPC rather than poking at raw contract storage, so
   the proxy follows the contract's ABI instead of its storage layout, and
@@ -308,9 +309,38 @@ without wrapping.
 `status --token` checks the token signature and expiry offline. Add
 `--check-chain` to also simulate `get_lease` and check that the lease is active,
 belongs to the token's consumer, and has calls remaining. The result includes
-the on-chain service; service and call limits are not claims encoded in the
-current session token. Chain lookup failures are reported as failed checks and
-return exit code 1.
+the on-chain service; call limits are not claims encoded in the session token.
+Chain lookup failures are reported as failed checks and return exit code 1.
+
+#### Session token payload
+
+`keylease acquire` prints a `kls1.<base64url(payload JSON)>.<base64url(ed25519 signature)>`
+bearer token signed by the consumer key. The payload is:
+
+| Claim | Type | Meaning |
+| --- | --- | --- |
+| `v` | number | Token format version, `1` |
+| `lease_id` | string | On-chain lease id |
+| `consumer` | string | Stellar public key (`G...`) that owns the lease and signed the token |
+| `iat` · `exp` | number | Issued-at / expiry, unix seconds |
+| `service` | string, optional | Service id passed to `acquire --service`, i.e. the service the lease was bought for |
+
+`service` is an **additive, optional v1 claim**: the version stays `1`, and a
+token without it (anything minted before service binding) is still a valid v1
+token. Verification with `verifySessionToken(token, { expectedService })`
+(exported from `@keylease/cli/token`) follows one rule:
+
+- token carries `service` and it differs from `expectedService` → rejected with
+  the `service_mismatch` token error code;
+- token carries a matching `service` → accepted;
+- legacy token without `service` → accepted (the on-chain lease is still the
+  authority on which service it pays for, as before);
+- no `expectedService` given → the claim is not checked.
+
+The claim is covered by the signature, so it cannot be edited without failing
+with `bad_signature`. A `service` that is present but not a non-empty string is
+`malformed_token`. Verifiers that predate the claim ignore it, so new tokens
+keep working with them.
 
 `keylease status --lease 42` reads the on-chain lease state and reports the network and contract address:
 
@@ -550,7 +580,7 @@ without ever printing the seed. Stored sessions are listed with their expiry.
 | `set_gateway(gateway)` | admin | Rotate the account allowed to commit quota |
 | `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
 | `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
-| `register_service(provider, service, price_per_call)` | provider | Register or re-price a service (`price_per_call > 0`) |
+| `register_service(provider, service, price_per_call)` | provider | Register a new service, or re-price one you own (`price_per_call > 0`). Another provider's id → `Unauthorized` |
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
 | `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
@@ -558,7 +588,9 @@ without ever printing the seed. Stored sessions are listed with their expiry.
 | `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
+| `upgrade(new_wasm_hash)` | admin | Replace the contract wasm in place (same address, same storage); emits `contract_updated`. See [Upgrades](#upgrades) |
 | `get_lease(id)` · `get_service(id)` · `get_config()` · `remaining_calls(id)` | – | Views used by the CLI and proxy |
+| `get_consumer_leases(consumer, start, limit)` | – | One page (`Vec<u64>`) of the lease ids `consumer` created, oldest first. See [Consumer lease index](#consumer-lease-index) |
 | `version()` | – | Contract ABI version as a `String`, equal to the crate version in `Cargo.toml`; callable before `init` |
 
 `version()` follows semver on the contract ABI: **patch** for internal fixes
@@ -568,8 +600,81 @@ renamed entry points, changed arguments or storage layout). Bump
 `contracts/keylease-core/Cargo.toml` with every contract change; clients should
 refuse a major version they do not recognise.
 
+#### Service ownership
+
+A service id belongs to the provider that first registered it. Only that
+provider can change it afterwards:
+
+- `register_service` by the owner updates the price (and marks the service
+  active, as it always has);
+- `register_service` by any other provider fails with `Unauthorized` and leaves
+  the stored service (name, price, provider, status) untouched, so nobody can
+  redirect another provider's future lease payouts;
+- `set_service_active` has the same owner check.
+
+Existing leases are never affected by a re-price: each lease snapshots its
+`provider` and escrowed `price_paid` at `create_lease`, and settlement pays
+that snapshot.
+
+#### Consumer lease index
+
+`create_lease` appends each new lease id to its consumer's index in the same
+invocation, so the index and the lease commit or fail together.
+`get_consumer_leases(consumer, start, limit) -> Vec<u64>` reads it:
+
+- **Ordering:** ascending creation order, which is also ascending lease id. The
+  index is append-only, so a position never changes once written.
+- **`start`** is a zero-based offset into that list; **`limit`** is the page
+  size, clamped to `MAX_CONSUMER_LEASES_PAGE` (**50**). `limit = 0`, or a
+  `start` at or past the end, returns an empty page (no error).
+- To walk every lease, call with `start = 0`, then `start += page.len()` until a
+  page is shorter than the clamped limit.
+- Settled and revoked leases stay listed; use `get_lease` for their status.
+
+Storage is one persistent `ConsumerLeases(Address)` count plus one
+`ConsumerLease(Address, u32)` entry per lease, so `create_lease` does constant
+work and a page read touches at most 51 entries regardless of how many leases
+a consumer has. Both get the same TTL policy as leases (set on write, extended
+on read).
+
+#### Upgrades
+
+`upgrade(new_wasm_hash)` requires the admin's authorisation and swaps the
+executable of this contract instance via the Soroban deployer
+(`update_current_contract` with a wasm hash). The address, the escrowed token
+balance, instance storage and every persistent entry are untouched. The wasm
+must already be uploaded (`stellar contract upload`), otherwise the host traps
+and nothing changes. The swap applies when the invocation succeeds, and
+`contract_updated` (topics `(contract_updated, admin)`, data `new_wasm_hash`)
+is published in the same invocation. Executable references are deliberately not
+accepted. The risk model is in [SECURITY.md](./SECURITY.md#contract-upgrades).
+
+**Migration note (0.2.0 → 0.3.0).** 0.3.0 is additive: it adds the `upgrade`
+and `get_consumer_leases` entry points, the `ConsumerLeases`/`ConsumerLease`
+storage keys and the `contract_updated` event, and tightens the
+`register_service` ownership check. No existing key or stored type changed, so
+0.2.0 state reads unchanged. A 0.2.0 deployment cannot be upgraded in place,
+because it has no `upgrade` entry point; it needs a fresh deploy. From 0.3.0
+on, upgrades keep the address. Leases created before 0.3.0 (or before an
+upgrade that introduced the index) are not in any consumer index; the index
+only covers leases created by a version that maintains it. Before every
+upgrade:
+
+1. Build the new wasm reproducibly (`stellar contract build`) from a reviewed
+   tag and compare its hash with the hash you are about to install.
+2. Check storage compatibility: no `DataKey` variant or stored struct
+   (`Config`, `Service`, `Lease`) may be removed, reordered or retyped, and new
+   fields need a migration path. `upgrade` itself must stay in the new wasm, or
+   the contract becomes immutable.
+3. Deploy the same wasm to testnet over a copy of real state, upgrade, and run
+   `get_config`, `get_service`, `get_lease`, `get_consumer_leases` and a full
+   `create_lease → use_call → settle` cycle against it.
+4. Upload the wasm, call `upgrade`, then confirm `version()` and the
+   `contract_updated` event show what you expect.
+
 Storage: `Config` and the pending admin (`PendingAdmin`, set by
-`propose_admin`) in instance storage; `Service(String)` and `Lease(u64)` as
+`propose_admin`) in instance storage; `Service(String)`, `Lease(u64)`,
+`ConsumerLeases(Address)` and `ConsumerLease(Address, u32)` as
 persistent entries with TTL bumps (`MIN_TTL` 7 days, `EXTEND_TO` 30 days).
 The bump happens on writes (`register_service`, `create_lease`, `use_call`, …)
 and on reads: `load_config`, `load_service` and `load_lease` extend the entry
@@ -577,6 +682,8 @@ when its TTL falls below `MIN_TTL`, so a lease that is only ever simulated or
 read stays alive. `extend_ttl` is a no-op above the threshold, so the hot read
 path costs one storage access and no write.
 Events: `init`, `gateway`, `admin_proposed`, `admin_changed`,
+`service_registered`, `lease_created`, `calls_committed`, `lease_revoked`,
+`lease_settled`, `contract_updated`.
 `service_registered`, `lease_created`, `lease_extended`, `calls_committed`,
 `lease_revoked`, `lease_settled`. `lease_extended` keeps the
 `(lease_extended, consumer, lease_id)` topics and publishes
@@ -599,6 +706,9 @@ Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 | 6 | `LeaseInactive` | Lease revoked or settled |
 | 7 | `LeaseExpired` | Lease past `expires_at` |
 | 8 | `LeaseNotSettleable` | `settle` before expiry/exhaustion |
+| 9 | `AlreadySettled` | Escrow already paid out |
+| 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation |
+| 14 | `Unauthorized` | Caller does not own the service it tried to change (`register_service`, `set_service_active`), or no admin handover is pending |
 | 9 | `AlreadySettled` | Escrow already paid out; also rejects `extend_lease` |
 | 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation; `extend_lease` uses 10 when both extension arguments are zero or `calls_limit` would overflow, 11 when expiry would overflow and 13 when the top-up price would overflow |
 | 15 | `InvalidConsumer` | `create_lease` consumer is the contract's own address |
@@ -761,6 +871,8 @@ extend_lease(lease_id: u64, extra_calls: u32, extra_duration: u64) -> Lease
 use_call(lease_id: u64, count: u32) -> Lease
 revoke(lease_id: u64) -> Lease
 settle(lease_id: u64) -> Lease
+get_consumer_leases(consumer: Address, start: u32, limit: u32) -> Vec<u64>
+upgrade(new_wasm_hash: BytesN<32>)
 ```
 
 `Lease` struct: `id, service, provider, consumer, calls_limit, calls_used,

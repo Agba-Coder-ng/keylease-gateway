@@ -221,6 +221,8 @@ friendbot, writes `deployments.json` (public) and
 
 | Command | Purpose |
 | --- | --- |
+| `keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>` | Invokes `create_lease` (paying the SAC token into escrow) and prints a signed session bearer token; `--duration` max is 365 days |
+| `keylease acquire --service <id> --calls <n> --duration <secs> --dry-run` | Quotes the price of those calls without signing, creating a lease or storing a session; `--duration` max is 365 days |
 | `keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>` | Invokes `create_lease` (paying the SAC token into escrow) and prints a signed session bearer token |
 | `keylease env --service <id> [--file .env] [--lease <id>]` | Writes the temporary keys of an acquired lease into a local `.env`. Selects newest unexpired lease by default, or explicit lease via `--lease <id>` |
 | `keylease acquire --service <id> --calls <n> --duration <secs> --dry-run` | Quotes the price of those calls without signing, creating a lease or storing a session |
@@ -255,6 +257,52 @@ Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
 `--contract <id>`, `--json` (machine-readable output), `--dry-run`
 (`acquire` only).
 
+#### Error responses with `--json`
+
+When `--json` is set, errors are emitted to stderr as machine-readable JSON
+instead of plain text. The format is stable across all commands:
+
+```json
+{
+  "error": {
+    "code": "missing_option",
+    "message": "--duration is required",
+    "hint": "run \"keylease help\" for usage"
+  }
+}
+```
+
+The `error` object always contains:
+- `code` (string): A stable machine-readable error identifier
+- `message` (string): Human-readable error description
+- `hint` (string, optional): Actionable suggestion (hints are omitted for token and runtime errors)
+
+**Error codes** are drawn from three categories:
+
+**CLI validation errors** (exit code 2):
+- `parse_error` — Invalid argument syntax or unknown flag
+- `missing_option` — Required flag not provided
+- `invalid_option` — Flag value failed validation (not a number, not a Stellar key, etc.)
+- `unexpected_argument` — Positional argument where none expected
+- `unknown_command` — Unrecognized command name
+- `usage_error` — Generic validation issue
+
+**Token verification errors** (exit code 1):
+- `malformed_token` — Token format invalid (wrong prefix, not base64url, missing fields)
+- `unsupported_version` — Token version mismatch
+- `invalid_consumer` — Consumer public key invalid
+- `bad_signature` — Ed25519 signature does not verify
+- `consumer_mismatch` — Token consumer doesn't match expected
+- `lease_mismatch` — Token lease_id doesn't match requested
+- `token_expired` — Token past expiry time
+- `token_not_yet_valid` — Token's issued-at time hasn't arrived (clock skew)
+
+**Runtime errors** (exit code 1):
+- `internal_error` — Unhandled exceptions, RPC failures, etc.
+
+Success output remains unchanged: `--json` renders structured data to stdout
+without wrapping.
+
 `status --token` checks the token signature and expiry offline. Add
 `--check-chain` to also simulate `get_lease` and check that the lease is active,
 belongs to the token's consumer, and has calls remaining. The result includes
@@ -262,9 +310,42 @@ the on-chain service; service and call limits are not claims encoded in the
 current session token. Chain lookup failures are reported as failed checks and
 return exit code 1.
 
+`keylease status --lease 42` reads the on-chain lease state and reports the network and contract address:
+
+```text
+Lease 42
+  network    : testnet
+  contract   : CC2YHTV3...UOXDA3KRC
+  service    : weather-api
+  provider   : GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  consumer   : GDUKMGUGDZQK6YHYA5Z6AY2G4XDSZPSZ3SW5UN3ARVMO6QSRDWP5YLEX
+  calls      : 4/10
+  escrow     : 10000 (paid into keylease-core)
+  expires at : 2023-11-15T10:00:00.000Z
+  active     : yes
+  settled    : no
+```
+
+Add `--json` for machine-readable output, including the full contract id:
+
+```json
+{
+  "leaseId": "42",
+  "network": "testnet",
+  "contract_id": "CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC",
+  "service": "weather-api",
+  ...
+}
+```
+
 `--secret` is the consumer account's **Stellar secret seed**. It signs the
 `create_lease` transaction and the session token, and it never leaves the
 process — it is not printed, logged, or written to disk.
+
+Session bearer tokens (`kls1.*` format) are redacted in all error messages and
+logs. If a token parse error or verification failure occurs, the CLI will
+display `kls1.<redacted>` instead of the full token value, ensuring credentials
+are never leaked to terminal output, CI logs, or pasted issues.
 
 `acquire --dry-run` calls `quote` on `keylease-core` first and prints the
 service, call count, duration, quoted price (token smallest units) and the

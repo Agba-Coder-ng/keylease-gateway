@@ -36,12 +36,16 @@ import {
   type KeyleaseConfigFile,
   type ResolvedConfig,
 } from './config.js';
-import { CliError } from './errors.js';
+import { CliError, redactToken } from './errors.js';
+import { renderError } from './error-renderer.js';
 
-export { CliError } from './errors.js';
+export { CliError, redactToken } from './errors.js';
 
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
+
+/** Maximum lease duration in seconds (365 days). */
+export const MAX_DURATION_SECONDS = 365 * 24 * 60 * 60;
 
 export interface CliIo {
   out(line?: string): void;
@@ -182,6 +186,15 @@ function parsePositiveInt(raw: string, name: keyof ParsedOptions): number {
   return parsed;
 }
 
+function requireDuration(values: ParsedOptions): number {
+  const duration = requirePositiveInt(values, 'duration');
+  if (duration > MAX_DURATION_SECONDS) {
+    throw new CliError(
+      `--duration must not exceed ${MAX_DURATION_SECONDS} seconds (365 days), got ${duration}`,
+      'invalid_option',
+    );
+  }
+  return duration;
 function validateRpcUrl(url: string): void {
   // Validate RPC URL at parse time to catch typos early
   let parsed: URL;
@@ -299,7 +312,7 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
         ...networkArgs(values),
         service: serviceFrom(values, options),
         calls: requirePositiveInt(values, 'calls'),
-        duration: requirePositiveInt(values, 'duration'),
+        duration: requireDuration(values),
         secret,
         dryRun,
         json: values.json === true,
@@ -414,7 +427,7 @@ Commands:
 Options:
   --service <id>       Service identifier the lease is scoped to (default: .keyleaserc.json)
   --calls <count>      Number of API calls the lease authorises
-  --duration <secs>    Lease lifetime in seconds
+  --duration <secs>    Lease lifetime in seconds (max: ${MAX_DURATION_SECONDS} / 365 days)
   --secret <key>       Stellar secret seed (S...) of the consumer account
   --lease <id>         On-chain lease id (repeatable or comma-separated for settle/revoke)
   --fee <stroops>      Transaction inclusion fee in stroops (positive integer)
@@ -488,12 +501,22 @@ function withResolvedNetwork(invocation: Invocation, resolved: ResolvedConfig): 
   } as Invocation;
 }
 
+/**
+ * Detects whether --json flag is present in argv.
+ * Used early to determine error rendering mode.
+ */
+function hasJsonFlag(argv: string[]): boolean {
+  return argv.includes('--json');
+}
+
 /** Parses and dispatches a CLI invocation, returning a process exit code. */
 export async function run(
   argv: string[],
   io: CliIo = consoleIo,
   deps: RunDeps = {},
 ): Promise<number> {
+  const json = hasJsonFlag(argv);
+
   let invocation: Invocation;
   try {
     if (isMetaInvocation(argv)) {
@@ -510,8 +533,7 @@ export async function run(
     }
   } catch (error) {
     if (error instanceof CliError) {
-      io.err(`error: ${error.message}`);
-      io.err(`run "${CLI_NAME} help" for usage`);
+      renderError(error, io, json);
       return error.exitCode;
     }
     throw error;
@@ -542,11 +564,10 @@ export async function run(
     }
   } catch (error) {
     if (error instanceof CliError) {
-      io.err(`error: ${error.message}`);
+      renderError(error, io, json);
       return error.exitCode;
     }
-    const message = error instanceof Error ? error.message : String(error);
-    io.err(`error: ${message}`);
+    renderError(error, io, json);
     return 1;
   }
 }

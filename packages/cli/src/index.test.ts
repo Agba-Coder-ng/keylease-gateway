@@ -352,6 +352,58 @@ describe('parseArgv', () => {
     );
   });
 
+  it('validates the maximum duration (365 days)', () => {
+    const maxSeconds = 365 * 24 * 60 * 60; // 31536000
+
+    // Exactly at the limit: should pass
+    const atLimit = parseArgv([
+      'acquire',
+      '--service',
+      'x',
+      '--calls',
+      '1',
+      `--duration=${maxSeconds}`,
+      '--secret',
+      SECRET,
+    ]);
+    expect(atLimit.command).toBe('acquire');
+    expect((atLimit as { args: AcquireArgs }).args.duration).toBe(maxSeconds);
+
+    // One second over: should fail
+    const error = expectCliError(
+      () =>
+        parseArgv([
+          'acquire',
+          '--service',
+          'x',
+          '--calls',
+          '1',
+          `--duration=${maxSeconds + 1}`,
+          '--secret',
+          SECRET,
+        ]),
+      'invalid_option',
+    );
+    expect(error.message).toContain('365 days');
+    expect(error.message).toContain(String(maxSeconds));
+
+    // Zero should still fail (caught by requirePositiveInt)
+    expectCliError(
+      () =>
+        parseArgv([
+          'acquire',
+          '--service',
+          'x',
+          '--calls',
+          '1',
+          '--duration=0',
+          '--secret',
+          SECRET,
+        ]),
+      'invalid_option',
+    );
+  });
+
   it('rejects unknown commands, flags and stray positionals', () => {
     expectCliError(() => parseArgv(['destroy', '--service', 'x']), 'unknown_command');
     expectCliError(
@@ -524,6 +576,84 @@ describe('run', () => {
     const { io, err } = captureIo();
     expect(await run(['explode'], io)).toBe(2);
     expect(err.join('\n')).toContain('unknown command');
+  });
+
+  it('outputs JSON error when --json flag is set', async () => {
+    const { io, err, out } = captureIo();
+    expect(await run(['acquire', '--service', 'x', '--json'], io)).toBe(2);
+    expect(out).toEqual([]);
+    expect(err).toHaveLength(1);
+    const response = JSON.parse(err[0]);
+    expect(response).toEqual({
+      error: {
+        code: 'missing_option',
+        message: expect.stringContaining('--duration'),
+        hint: expect.stringContaining('keylease help'),
+      },
+    });
+  });
+
+  it('outputs JSON error for unknown command with --json', async () => {
+    const { io, err, out } = captureIo();
+    expect(await run(['explode', '--json'], io)).toBe(2);
+    expect(out).toEqual([]);
+    expect(err).toHaveLength(1);
+    const response = JSON.parse(err[0]);
+    expect(response.error.code).toBe('unknown_command');
+    expect(response.error.message).toContain('unknown command');
+  });
+
+  it('outputs JSON error for parse errors with --json', async () => {
+    const { io, err, out } = captureIo();
+    expect(
+      await run(
+        ['acquire', '--service', 'x', '--calls', 'not_a_number', '--duration', '60', '--secret', SECRET, '--json'],
+        io,
+      ),
+    ).toBe(2);
+    expect(out).toEqual([]);
+    expect(err).toHaveLength(1);
+    const response = JSON.parse(err[0]);
+    expect(response.error.code).toBe('invalid_option');
+    expect(response.error.message).toContain('positive integer');
+  });
+
+  it('outputs human-readable error without --json', async () => {
+    const { io, err, out } = captureIo();
+    expect(await run(['acquire', '--service', 'x'], io)).toBe(2);
+    expect(out).toEqual([]);
+    expect(err.length).toBeGreaterThan(0);
+    expect(err[0]).toContain('error:');
+    expect(err[0]).not.toContain('{');
+  });
+
+  it('preserves exit code 2 with JSON errors', async () => {
+    const { io } = captureIo();
+    const code = await run(['unknown', '--json'], io);
+    expect(code).toBe(2);
+  });
+
+  it('preserves exit code 1 for command failures', async () => {
+    const { io, err } = captureIo();
+    const code = await run(
+      ['acquire', '--service', 'x', '--calls', '1', '--duration', '1', '--secret', SECRET, '--json'],
+      io,
+      {
+        acquire: {
+          createClient: () => ({
+            quote: async () => 10,
+            createLease: async () => {
+              throw new Error('rpc exploded');
+            },
+          }),
+        },
+      },
+    );
+    expect(code).toBe(1);
+    expect(err).toHaveLength(1);
+    const response = JSON.parse(err[0]);
+    expect(response.error.code).toBe('internal_error');
+    expect(response.error.message).toBe('rpc exploded');
   });
 
   it('dispatches acquire to the command with injected dependencies', async () => {

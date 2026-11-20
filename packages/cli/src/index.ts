@@ -4,10 +4,13 @@ import { pathToFileURL } from 'node:url';
 import {
   acquireCommand,
   envCommand,
+  quoteCommand,
   type AcquireArgs,
   type AcquireDeps,
   type EnvArgs,
   type EnvDeps,
+  type QuoteArgs,
+  type QuoteDeps,
 } from './commands/lease.js';
 import { statusCommand, type StatusArgs, type StatusDeps } from './commands/status.js';
 import {
@@ -44,12 +47,20 @@ export class CliError extends Error {
   }
 }
 
-export type CommandName = 'acquire' | 'env' | 'status' | 'settle' | 'revoke' | 'sessions';
+export type CommandName =
+  | 'acquire'
+  | 'quote'
+  | 'env'
+  | 'status'
+  | 'settle'
+  | 'revoke'
+  | 'sessions';
 
 export type Invocation =
   | { command: 'help' }
   | { command: 'version' }
   | { command: 'acquire'; args: AcquireArgs }
+  | { command: 'quote'; args: QuoteArgs }
   | { command: 'env'; args: EnvArgs }
   | { command: 'status'; args: StatusArgs }
   | { command: 'settle'; args: SettleArgs }
@@ -58,6 +69,7 @@ export type Invocation =
 
 export interface RunDeps {
   acquire?: AcquireDeps;
+  quote?: QuoteDeps;
   env?: EnvDeps;
   status?: StatusDeps;
   settle?: SettleDeps;
@@ -155,8 +167,29 @@ function ensureNoPositionals(positionals: string[]): void {
  * Turns a raw argv slice into a typed invocation. Pure and side-effect free so
  * CLI parameter parsing can be unit tested directly.
  */
+export const QUIET_FLAG = '--quiet';
+
+/**
+ * Extracts global flags that may appear anywhere in argv. `--quiet` is
+ * stripped before command parsing so `keylease --quiet acquire ...` and
+ * `keylease acquire --quiet ...` behave the same.
+ */
+export function extractGlobalFlags(argv: string[]): { argv: string[]; quiet: boolean } {
+  const rest: string[] = [];
+  let quiet = false;
+  for (const arg of argv) {
+    if (arg === QUIET_FLAG) {
+      quiet = true;
+      continue;
+    }
+    rest.push(arg);
+  }
+  return { argv: rest, quiet };
+}
+
 export function parseArgv(argv: string[]): Invocation {
-  const [rawCommand, ...rest] = argv;
+  const { argv: args } = extractGlobalFlags(argv);
+  const [rawCommand, ...rest] = args;
 
   if (rawCommand === undefined || rawCommand === 'help' || rawCommand === '--help' || rawCommand === '-h') {
     return { command: 'help' };
@@ -182,6 +215,18 @@ export function parseArgv(argv: string[]): Invocation {
         json: values.json === true,
       };
       return { command: 'acquire', args };
+    }
+    case 'quote': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'quote',
+        args: {
+          ...networkArgs(values),
+          service: requireString(values, 'service'),
+          calls: requirePositiveInt(values, 'calls'),
+          json: values.json === true,
+        },
+      };
     }
     case 'env': {
       ensureNoPositionals(positionals);
@@ -242,7 +287,7 @@ export function parseArgv(argv: string[]): Invocation {
     }
     default:
       throw new CliError(
-        `unknown command "${rawCommand}" (expected acquire, env, status, settle, revoke or sessions)`,
+        `unknown command "${rawCommand}" (expected acquire, quote, env, status, settle, revoke or sessions)`,
         'unknown_command',
       );
   }
@@ -253,6 +298,7 @@ export function renderHelp(): string {
 
 Usage:
   ${CLI_NAME} acquire --service <id> --calls <count> --duration <secs> --secret <key>
+  ${CLI_NAME} quote   --service <id> --calls <count> [--json]
   ${CLI_NAME} env     --service <id> [--file <path>]
   ${CLI_NAME} status  --lease <id> | --token <session-token> [--check-chain]
   ${CLI_NAME} settle  --lease <id> --secret <key>
@@ -262,6 +308,7 @@ Usage:
 
 Commands:
   acquire   Prepay a lease in keylease-core escrow and mint a session bearer token
+  quote     Price a batch of calls in token smallest units and XLM, without a lease
   env       Write the temporary session keys of an acquired lease into a local .env
   status    Inspect an on-chain lease, or verify a session token offline
   settle    Settle an expired/exhausted lease: pay the provider, refund the consumer
@@ -282,6 +329,7 @@ Options:
   --contract <id>      keylease-core contract id override
   --prune              Remove expired sessions (for "sessions")
   --json               Machine-readable JSON output
+  --quiet              Suppress human-readable success output (errors still go to stderr)
   -h, --help           Show this help
 `;
 }
@@ -298,12 +346,15 @@ export const consoleIo: CliIo = {
 /** Parses and dispatches a CLI invocation, returning a process exit code. */
 export async function run(
   argv: string[],
-  io: CliIo = consoleIo,
+  baseIo: CliIo = consoleIo,
   deps: RunDeps = {},
 ): Promise<number> {
+  const { argv: commandArgv, quiet } = extractGlobalFlags(argv);
+  // `--quiet` only silences human-readable output; stderr and exit codes are untouched.
+  const io: CliIo = quiet ? { out: () => undefined, err: (line) => baseIo.err(line) } : baseIo;
   let invocation: Invocation;
   try {
-    invocation = parseArgv(argv);
+    invocation = parseArgv(commandArgv);
   } catch (error) {
     if (error instanceof CliError) {
       io.err(`error: ${error.message}`);
@@ -323,6 +374,8 @@ export async function run(
         return 0;
       case 'acquire':
         return await acquireCommand(invocation.args, io, deps.acquire);
+      case 'quote':
+        return await quoteCommand(invocation.args, io, deps.quote);
       case 'env':
         return await envCommand(invocation.args, io, deps.env);
       case 'status':

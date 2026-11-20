@@ -222,6 +222,7 @@ friendbot, writes `deployments.json` (public) and
 | Command | Purpose |
 | --- | --- |
 | `keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>` | Invokes `create_lease` (paying the SAC token into escrow) and prints a signed session bearer token |
+| `keylease quote --service <id> --calls <n> [--json]` | Simulates the read-only `quote` view and prints the price in token smallest units and XLM |
 | `keylease env --service <id> [--file .env]` | Writes the temporary keys of an acquired lease into a local `.env` |
 | `keylease status --lease <id>` | Reads live lease state by simulating `get_lease` |
 | `keylease status --token <token>` | Verifies a session token offline |
@@ -233,7 +234,15 @@ friendbot, writes `deployments.json` (public) and
 | `keylease help` · `keylease --version` | Help / version |
 
 Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
-`--contract <id>`, `--json` (machine-readable output).
+`--contract <id>`, `--json` (machine-readable output), `--quiet`
+(suppress human-readable success output; errors still go to stderr and exit
+codes are unchanged). `--quiet` may appear before or after the command name.
+
+`quote` simulates `quote(service, calls)` without acquiring a lease, so you can
+price a batch before signing a `create_lease` transaction. It prints the price
+in token smallest units and in XLM; add `--json` for
+`{ service, calls, price, asset }`. An unregistered service fails with
+`Error(Contract, #3)` and exit code 1.
 
 `status --token` checks the token signature and expiry offline. Add
 `--check-chain` to also simulate `get_lease` and check that the lease is active,
@@ -366,6 +375,15 @@ The on-chain quota sink tracks at most 10,000 distinct leases in its pending bat
 | `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) or `/readyz` has no reachable state. Includes `Retry-After`, rounded up from the configured cache TTL and capped at 30 seconds |
 | `426 upgrade_required` | `Connection: upgrade` requests (e.g. WebSocket) are not supported; rejected before verification, so no call is consumed. The response carries `Upgrade: HTTP/1.1` |
 | `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed) |
+
+### Body encoding
+
+Node's `fetch` transparently decompresses `gzip`/`br` upstream responses, so the
+proxy forwards the decoded body and **normalises the headers** rather than
+forwarding compressed bytes: `content-encoding` is stripped, and
+`content-length` is regenerated from the bytes actually sent (and omitted for
+the empty bodies of `HEAD`, `204` and `304` responses). Clients and caches never
+receive encoding metadata that disagrees with the body.
 
 Every response carries `x-request-id`: a valid inbound value (1-128 chars of `A-Za-z0-9._:~+=/-`) is reused, anything else is replaced by a generated UUID. It is also forwarded upstream and appears in denial logs.
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.

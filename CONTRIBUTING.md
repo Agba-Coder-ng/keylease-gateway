@@ -335,3 +335,38 @@ the expected failure mode.
   bodies, status codes).
 - Keep tests deterministic: inject a fake `clock`, a fake `SorobanRpc` and a
   fake committer instead of sleeping or hitting the network.
+
+## CI Matrix and Node.js support
+
+CI tests the full TypeScript test suite across all supported LTS and current Node.js release lines:
+- **Node 20** (Active LTS)
+- **Node 22** (Active LTS)
+- **Node 24** (Current)
+
+All pull requests must pass across the full matrix. Caching for `pnpm` dependencies is segregated per Node version.
+
+## Code review routing (CODEOWNERS)
+
+To protect critical security boundaries, GitHub automatically requests reviews from maintainers (`.github/CODEOWNERS`) when pull requests touch:
+- `/contracts/`: Soroban smart contract logic (escrow, settlement, authorization)
+- `/.github/workflows/`: CI/CD automation and security check pipelines
+- `/SECURITY.md`: Vulnerability disclosure and reporting policies
+- `/packages/proxy/src/verifier.ts` and `/packages/proxy/src/quota.ts`: Token verification and quota tracking
+
+## Stale issue and PR lifecycle
+
+To keep the backlog actionable for contributors:
+- Issues and PRs with no activity for **60 days** are automatically marked as `stale`.
+- If no activity occurs within a **14-day grace period**, stale items are closed.
+- Posting a comment or pushing a commit removes the `stale` label and resets the timer.
+- Issues labeled `security`, `help wanted`, or `pinned` are exempt from stale management.
+
+## Documentation link verification
+
+Documentation links are checked automatically on pull requests touching markdown files via [Lychee](https://github.com/lycheeverse/lychee):
+- Flaky or anti-bot protected domains (such as `stellar.expert` and badge services) are excluded in `.lycheeignore`.
+- You can run the link checker locally before submitting docs:
+  ```bash
+  # Using lychee CLI or docker
+  lychee '**/*.md'
+  ```

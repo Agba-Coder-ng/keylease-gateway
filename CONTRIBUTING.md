@@ -29,6 +29,9 @@ pnpm contract:build # stellar contract build -> wasm32v1-none
 > The contract needs `stellar-cli` v25.2.0+ (`soroban-sdk` 29 requires it for
 > the wasm build) and the `wasm32v1-none` Rust target. CI installs both.
 
+> Stuck on a CLI code, contract trap (`Error(Contract, #n)`) or a proxy 401/403?
+> Start with the [troubleshooting guide](./docs/troubleshooting.md).
+
 ## Project layout
 
 ```

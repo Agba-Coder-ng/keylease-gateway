@@ -539,6 +539,10 @@ Operators: [docs/runbook.md](./docs/runbook.md) covers the startup checklist,
 HTTP 5xx diagnostics, quota drift and crash recovery, gateway key rotation and
 restarting without losing calls.
 
+Contributors and integrators: [docs/troubleshooting.md](./docs/troubleshooting.md)
+maps CLI codes, `Error(Contract, #n)` variants and proxy 401/403 denials to the
+exact command or configuration change that fixes them.
+
 Current deployment status:
 
 | Component | Network / host | Address or URL |

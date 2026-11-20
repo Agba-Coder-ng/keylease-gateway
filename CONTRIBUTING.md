@@ -14,12 +14,12 @@ workspace plus the Soroban contract the whole system runs on:
 ```bash
 pnpm install        # Node >= 20.11, pnpm 12 (see "packageManager")
 pnpm build          # tsc emit for both packages
-pnpm test           # vitest (108 tests)
+pnpm test           # vitest: package suites + the PR-title rules in scripts/
 pnpm lint           # eslint
 pnpm typecheck      # build + tsc --noEmit
 
 # contract (needs Rust + stellar-cli)
-pnpm contract:test  # cargo test (14 tests)
+pnpm contract:test  # cargo test (22 tests)
 pnpm contract:build # stellar contract build -> wasm32v1-none
 ```
 
@@ -67,9 +67,88 @@ packages/proxy/src
 - **Imports**: ESM with explicit `.js` extensions, `import type` for
   type-only imports (enforced by eslint).
 
+## Commit messages and PR titles
+
+Pull requests are squash-merged, so the **PR title** becomes the commit message
+on `main`. CI validates it against
+[Conventional Commits](https://www.conventionalcommits.org/):
+
+```text
+<type>(<scope>)!: <subject>
+
+feat(proxy): add request validation
+```
+
+| Part | Rule |
+| --- | --- |
+| `type` | Required, lower-case, one of the types below |
+| `scope` | Optional, lower-case. `(proxy)`, `(contract)`, `(cli)` and `(ci)` are the areas used today; introduce a new lower-case scope when the change is in a new area — no registration needed |
+| `!` | Optional, marks a breaking change |
+| `subject` | Required, imperative, no trailing period, whole header ≤ 100 characters |
+
+| Type | Use for |
+| --- | --- |
+| `feat` | A user-visible feature or capability |
+| `fix` | A bug fix, including a security fix |
+| `docs` | Documentation only (README, CONTRIBUTING, SECURITY, `docs/`) |
+| `ci` | Workflows, tooling and release automation |
+| `chore` | Maintenance that changes no behaviour (dependencies, metadata) |
+| `test` | Adding or repairing tests only |
+| `refactor` | A change that neither fixes a bug nor adds a feature |
+| `perf` | A performance improvement |
+| `build` | The build, packaging or lockfile setup |
+| `revert` | Reverting a previous commit |
+
+Valid titles:
+
+```text
+feat(proxy): add request validation
+fix(proxy): strip client-supplied x-keylease headers
+docs: add proxy operations runbook
+ci: validate the pull request title
+test(contract): cover every unauthorised entrypoint
+chore: bump fastify to 5.6.0
+feat(proxy)!: require the gateway key for on-chain quota
+```
+
+Titles CI rejects, and what it suggests instead:
+
+```text
+Add proxy runbook            ->  docs: add proxy runbook
+feature(proxy): add x        ->  feat(proxy): add x
+feat(Proxy): add x           ->  feat(proxy): add x
+docs: add the runbook.       ->  docs: add the runbook
+```
+
+**Breaking changes.** Add `!` after the type/scope (`feat(proxy)!: …`) and
+explain the migration in the PR description (and in a `BREAKING CHANGE:` footer
+if you are writing the commit yourself). Contract ABI changes also require a
+major bump of `contracts/keylease-core/Cargo.toml`, per the README's versioning
+policy.
+
+**How the check behaves.** The `PR title · conventional commits` job runs on
+pull requests. It skips titles that begin with `Merge ` (GitHub-generated merge
+commit titles) and PRs opened by `dependabot[bot]`; every contributor PR,
+including from forks, is validated. It never rewrites a title. On failure it
+prints a copy-pasteable corrected title in the job log and the run summary.
+After editing the title, re-run the failed check from the Actions tab (or push a
+commit) — a title edit alone does not re-trigger CI.
+
+**Running it locally.** Preview a corrected title, then validate exactly as CI
+does:
+
+```bash
+node scripts/pr-title-suggestion.mjs "Add proxy runbook"
+printf '%s\n' "feat(proxy): add request validation" | pnpm commitlint
+```
+
+The rules live in `commitlint.config.mjs` and `scripts/conventional-commits.mjs`
+(tested by `scripts/conventional-commits.test.mjs`).
+
 ## Commit and PR hygiene
 
 - One logical change per PR; keep diffs reviewable.
+- Write the PR title in Conventional Commits form (above).
 - Fill in the pull request template; link the issue you are claiming
   (`Fixes #123`).
 - CI must be green: `pnpm lint` → `pnpm build` → `tsc --noEmit` → `pnpm test`.

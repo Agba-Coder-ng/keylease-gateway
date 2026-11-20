@@ -152,12 +152,20 @@ export class LeaseNotFoundError extends SorobanError {
 export class ContractCallError extends SorobanError {
   readonly code: number | null;
   readonly method: string;
+  /** Raw error detail from the contract for machine-readable output (--json). */
+  readonly detail: string;
 
   constructor(method: string, code: number | null, detail: string) {
-    super(`keylease-core.${method} failed${code === null ? '' : ` with Error(${code})`}: ${detail}`);
+    const errorInfo = mapContractError(code);
+    const codeStr = code === null ? 'unknown' : String(code);
+    const message =
+      `keylease-core.${method} failed with Error(${codeStr}): ${errorInfo.message}\n` +
+      `Next step: ${errorInfo.nextStep}`;
+    super(message);
     this.name = 'ContractCallError';
     this.method = method;
     this.code = code;
+    this.detail = detail;
   }
 }
 
@@ -311,6 +319,97 @@ export function parseLeaseId(leaseId: string): bigint {
 function contractErrorCode(detail: string): number | null {
   const match = /Error\(Contract, #(\d+)\)/.exec(detail);
   return match?.[1] === undefined ? null : Number(match[1]);
+}
+
+/**
+ * Maps contract error codes to human-readable messages with actionable next steps.
+ * See: https://github.com/KeyLease-Security/keylease-gateway#contract-reference
+ */
+export interface ErrorMessage {
+  /** Human-readable error summary. */
+  message: string;
+  /** Suggested next step or resolution. */
+  nextStep: string;
+}
+
+export function mapContractError(code: number | null): ErrorMessage {
+  switch (code) {
+    case 1:
+      return {
+        message: 'Contract initialization has already been performed',
+        nextStep: 'This error typically indicates a contract deployment issue. Contact the operator.',
+      };
+    case 2:
+      return {
+        message: 'Contract has not been initialized',
+        nextStep: 'The contract may be misconfigured. Verify KEYLEASE_CONTRACT_ID and contact the operator.',
+      };
+    case 3:
+      return {
+        message: 'Service was never registered',
+        nextStep: 'Check your --service name. The provider may need to register this service first.',
+      };
+    case 4:
+      return {
+        message: 'Service is paused by its provider',
+        nextStep: 'The provider has temporarily disabled this service. Contact them to re-enable it.',
+      };
+    case 5:
+      return {
+        message: 'Lease does not exist on chain',
+        nextStep: 'Check your --lease id. You may need to acquire a new lease with "keylease acquire".',
+      };
+    case 6:
+      return {
+        message: 'Lease is inactive (revoked or already settled)',
+        nextStep: 'This lease has already been closed. Acquire a new lease to continue.',
+      };
+    case 7:
+      return {
+        message: 'Lease has expired',
+        nextStep: 'Wait for settlement or contact the provider. Run "keylease settle" to finalize the lease.',
+      };
+    case 8:
+      return {
+        message: 'Lease cannot be settled yet',
+        nextStep: 'Settlement is only possible once the lease expires or runs out of calls. Wait for expiry or exhaust the quota.',
+      };
+    case 9:
+      return {
+        message: 'Escrow has already been paid out',
+        nextStep: 'This lease was already settled. The payout cannot be made twice.',
+      };
+    case 10:
+      return {
+        message: 'Call count is invalid (must be positive)',
+        nextStep: 'Ensure --calls is a positive integer.',
+      };
+    case 11:
+      return {
+        message: 'Duration is invalid (must be positive)',
+        nextStep: 'Ensure --duration is a positive integer in seconds.',
+      };
+    case 12:
+      return {
+        message: 'Price per call is invalid (must be positive)',
+        nextStep: 'Contact the operator. The service has an invalid price configuration.',
+      };
+    case 13:
+      return {
+        message: 'Payment amount is invalid',
+        nextStep: 'Ensure you have sufficient funds. Verify your account balance and try again.',
+      };
+    case 14:
+      return {
+        message: 'Operation not authorized',
+        nextStep: 'You do not have permission for this operation. Check that you are using the correct account.',
+      };
+    default:
+      return {
+        message: 'An unknown contract error occurred',
+        nextStep: 'Check the detailed error information below. If the problem persists, contact support.',
+      };
+  }
 }
 
 export class SorobanClient {
@@ -605,6 +704,37 @@ function transactionResultName(result: unknown): string {
   return 'unknown error';
 }
 
+/**
+ * Validates an RPC URL ensuring it is a valid http: or https: URL.
+ * http: is only allowed for local/localhost URLs, matching the SDK's allowHttp rule.
+ *
+ * @throws SorobanError if the URL is invalid or does not meet the scheme requirements
+ */
+export function validateRpcUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new SorobanError(`invalid RPC URL "${url}": must be a valid URL`);
+  }
+
+  const scheme = parsed.protocol;
+  if (scheme !== 'http:' && scheme !== 'https:') {
+    throw new SorobanError(`invalid RPC URL "${url}": scheme must be http: or https:, got ${scheme}`);
+  }
+
+  // Allow http: only for localhost/127.0.0.1
+  if (scheme === 'http:') {
+    const hostname = parsed.hostname;
+    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1') {
+      throw new SorobanError(
+        `invalid RPC URL "${url}": http: is only allowed for localhost, not ${hostname}`,
+      );
+    }
+  }
+}
+
 function createRpcServer(url: string): SorobanRpc {
+  validateRpcUrl(url);
   return new rpc.Server(url, { allowHttp: url.startsWith('http://') }) as unknown as SorobanRpc;
 }

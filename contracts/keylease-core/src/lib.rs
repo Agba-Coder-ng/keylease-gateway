@@ -21,6 +21,17 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
 };
 
+/// Contract ABI version burned into the wasm. Taken from `Cargo.toml` at
+/// compile time so the two can never drift.
+///
+/// Compatibility policy (semver on the contract ABI):
+/// * patch — internal fixes, no change to entry points, types or errors;
+/// * minor — additive only (new entry points, views, error variants or
+///   events); existing callers keep working;
+/// * major — breaking (removed/renamed entry points, changed argument or
+///   storage layouts). Clients should refuse a major they do not know.
+pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Ledgers are ~5s; keep long-lived entries alive for a month at a time.
 const DAY_IN_LEDGERS: u32 = 17_280;
 /// Extend an entry when it has less than a week of TTL left.
@@ -46,6 +57,8 @@ pub enum Error {
     InvalidPrice = 12,
     InvalidAmount = 13,
     Unauthorized = 14,
+    /// `create_lease` was called with the contract itself as consumer.
+    InvalidConsumer = 15,
 }
 
 #[contracttype]
@@ -90,6 +103,8 @@ pub struct Lease {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Config,
+    /// Admin nominated by the current admin, awaiting `accept_admin`.
+    PendingAdmin,
     Service(soroban_sdk::String),
     Lease(u64),
 }
@@ -101,36 +116,61 @@ fn config_key() -> DataKey {
     DataKey::Config
 }
 
+/// Bump the TTL of an entry that was just read.
+///
+/// Reads are the hot path (`get_lease` is simulated by the proxy on every
+/// request), so an entry that is only ever read must still stay alive.
+/// `extend_ttl` is a no-op while the entry is above `MIN_TTL`, so the common
+/// case costs one storage access and no write.
+fn bump_instance_ttl(env: &Env) {
+    env.storage().instance().extend_ttl(MIN_TTL, EXTEND_TO);
+}
+
+fn bump_persistent_ttl(env: &Env, key: &DataKey) {
+    env.storage().persistent().extend_ttl(key, MIN_TTL, EXTEND_TO);
+}
+
 fn load_config(env: &Env) -> Result<Config, Error> {
-    env.storage()
+    let config = env
+        .storage()
         .instance()
         .get(&config_key())
-        .ok_or(Error::NotInitialized)
+        .ok_or(Error::NotInitialized)?;
+    bump_instance_ttl(env);
+    Ok(config)
 }
 
 fn store_config(env: &Env, config: &Config) {
     env.storage().instance().set(&config_key(), config);
-    env.storage().instance().extend_ttl(MIN_TTL, EXTEND_TO);
+    bump_instance_ttl(env);
 }
 
 fn load_service(env: &Env, service: &soroban_sdk::String) -> Result<Service, Error> {
-    env.storage()
+    let key = DataKey::Service(service.clone());
+    let stored = env
+        .storage()
         .persistent()
-        .get(&DataKey::Service(service.clone()))
-        .ok_or(Error::UnknownService)
+        .get(&key)
+        .ok_or(Error::UnknownService)?;
+    bump_persistent_ttl(env, &key);
+    Ok(stored)
 }
 
 fn load_lease(env: &Env, lease_id: u64) -> Result<Lease, Error> {
-    env.storage()
+    let key = DataKey::Lease(lease_id);
+    let lease = env
+        .storage()
         .persistent()
-        .get(&DataKey::Lease(lease_id))
-        .ok_or(Error::LeaseNotFound)
+        .get(&key)
+        .ok_or(Error::LeaseNotFound)?;
+    bump_persistent_ttl(env, &key);
+    Ok(lease)
 }
 
 fn store_lease(env: &Env, lease: &Lease) {
     let key = DataKey::Lease(lease.id);
     env.storage().persistent().set(&key, lease);
-    env.storage().persistent().extend_ttl(&key, MIN_TTL, EXTEND_TO);
+    bump_persistent_ttl(env, &key);
 }
 
 #[contractimpl]
@@ -169,6 +209,44 @@ impl KeyleaseCore {
         Ok(())
     }
 
+    /// Admin-only: nominate the next admin. The handover only takes effect
+    /// once the nominee calls `accept_admin`, so a typo in the new address
+    /// cannot permanently lock out admin rotation.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "admin_proposed"), config.admin, new_admin),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Completes a handover started by `propose_admin`. Requires the nominee's
+    /// auth and clears the pending entry, so accepting twice fails with
+    /// `Unauthorized` (there is no proposal left to accept).
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let mut config = load_config(&env)?;
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::Unauthorized)?;
+        pending.require_auth();
+        config.admin = pending.clone();
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        store_config(&env, &config);
+        env.events().publish(
+            (Symbol::new(&env, "admin_changed"), pending),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
     /// Provider-only: register or update a priced service.
     pub fn register_service(
         env: Env,
@@ -189,7 +267,7 @@ impl KeyleaseCore {
         };
         let key = DataKey::Service(service.clone());
         env.storage().persistent().set(&key, &stored);
-        env.storage().persistent().extend_ttl(&key, MIN_TTL, EXTEND_TO);
+        bump_persistent_ttl(&env, &key);
         env.events().publish(
             (Symbol::new(&env, "service_registered"), provider),
             (service, price_per_call),
@@ -213,7 +291,7 @@ impl KeyleaseCore {
         stored.active = active;
         let key = DataKey::Service(service);
         env.storage().persistent().set(&key, &stored);
-        env.storage().persistent().extend_ttl(&key, MIN_TTL, EXTEND_TO);
+        bump_persistent_ttl(&env, &key);
         Ok(stored)
     }
 
@@ -231,6 +309,12 @@ impl KeyleaseCore {
 
     /// Prepays a lease: transfers `calls * price_per_call` from `consumer`
     /// into escrow and returns the new lease id.
+    ///
+    /// The consumer may not be this contract: escrow would move from the
+    /// contract to itself and the refund could never reach a real account
+    /// (`InvalidConsumer`). The admin and gateway are deliberately allowed —
+    /// they are ordinary accounts that can receive refunds, and an operator
+    /// leasing their own service for smoke tests is a legitimate use.
     pub fn create_lease(
         env: Env,
         consumer: Address,
@@ -238,6 +322,9 @@ impl KeyleaseCore {
         calls: u32,
         duration: u64,
     ) -> Result<u64, Error> {
+        if consumer == env.current_contract_address() {
+            return Err(Error::InvalidConsumer);
+        }
         consumer.require_auth();
         if calls == 0 {
             return Err(Error::InvalidCalls);
@@ -290,6 +377,10 @@ impl KeyleaseCore {
 
     /// Gateway-only: commit `count` served calls against a lease. Committing
     /// more calls than are left clamps at `calls_limit` instead of overflowing.
+    ///
+    /// The `calls_committed` event keeps its
+    /// `(calls_committed, consumer, lease_id)` topic tuple and publishes
+    /// `(calls_used, remaining)` so indexers do not need a second read.
     pub fn use_call(env: Env, lease_id: u64, count: u32) -> Result<Lease, Error> {
         let config = load_config(&env)?;
         config.gateway.require_auth();
@@ -307,9 +398,10 @@ impl KeyleaseCore {
 
         lease.calls_used = lease.calls_used.saturating_add(count).min(lease.calls_limit);
         store_lease(&env, &lease);
+        let remaining = lease.calls_limit.saturating_sub(lease.calls_used);
         env.events().publish(
             (Symbol::new(&env, "calls_committed"), lease.consumer.clone(), lease_id),
-            lease.calls_used,
+            (lease.calls_used, remaining),
         );
         Ok(lease)
     }
@@ -394,6 +486,12 @@ impl KeyleaseCore {
     /// Contract configuration plus the number of leases ever created.
     pub fn get_config(env: Env) -> Result<Config, Error> {
         load_config(&env)
+    }
+
+    /// Contract ABI version (the crate version, e.g. `"0.2.0"`). Works before
+    /// `init`, so deploy verification can check it in one simulated call.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
     }
 
     /// Calls left on a lease (`0` for unknown or settled leases).

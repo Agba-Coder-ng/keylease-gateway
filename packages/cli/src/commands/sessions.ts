@@ -22,8 +22,9 @@ interface SessionRow {
   status: 'active' | 'expired';
 }
 
-function sessionRows(sessions: Record<string, LeaseSession>, now: number): SessionRow[] {
+function sessionRows(sessions: Record<string, LeaseSession[]>, now: number): SessionRow[] {
   return Object.values(sessions)
+    .flat()
     .map((session): SessionRow => {
       const status: SessionRow['status'] = session.expiresAt > now ? 'active' : 'expired';
       return {
@@ -33,7 +34,10 @@ function sessionRows(sessions: Record<string, LeaseSession>, now: number): Sessi
         status,
       };
     })
-    .sort((left, right) => left.service.localeCompare(right.service));
+    .sort(
+      (left, right) =>
+        left.service.localeCompare(right.service) || left.lease_id.localeCompare(right.lease_id),
+    );
 }
 
 function formatExpiry(expiresAt: number): string {
@@ -71,10 +75,13 @@ export async function sessionsCommand(
   const now = Math.floor((deps.now ?? Date.now)() / 1000);
 
   if (args.prune) {
-    const remaining = Object.fromEntries(
-      Object.entries(sessions).filter(([, session]) => session.expiresAt > now),
-    );
-    const removed = Object.keys(sessions).length - Object.keys(remaining).length;
+    const remaining: Record<string, LeaseSession[]> = {};
+    let removed = 0;
+    for (const [service, leases] of Object.entries(sessions)) {
+      const live = leases.filter((session) => session.expiresAt > now);
+      removed += leases.length - live.length;
+      if (live.length > 0) remaining[service] = live;
+    }
     if (removed > 0) await store.saveAll(remaining);
 
     if (args.json) {

@@ -18,7 +18,8 @@
 //! Amounts are in the token's smallest unit (stroops for the native SAC).
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, BytesN,
+    ContractExecutable, Env, Symbol, Vec,
 };
 
 /// Contract ABI version burned into the wasm. Taken from `Cargo.toml` at
@@ -38,6 +39,11 @@ const DAY_IN_LEDGERS: u32 = 17_280;
 const MIN_TTL: u32 = DAY_IN_LEDGERS * 7;
 /// Extend it to a month.
 const EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
+
+/// Largest page `get_consumer_leases` returns. A larger `limit` is clamped to
+/// this value, so one call reads at most this many index entries (plus the
+/// count) and stays well inside the per-transaction read budget.
+pub const MAX_CONSUMER_LEASES_PAGE: u32 = 50;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -107,6 +113,23 @@ pub enum DataKey {
     PendingAdmin,
     Service(soroban_sdk::String),
     Lease(u64),
+    /// Number of leases ever created by a consumer (`u32`). Together with
+    /// `ConsumerLease` this forms the consumer's append-only lease index.
+    ConsumerLeases(Address),
+    /// Lease id at zero-based `position` in a consumer's index (`u64`).
+    /// One entry per lease keeps `create_lease` O(1) and page reads
+    /// O(limit) no matter how many leases a consumer accumulates.
+    ConsumerLease(Address, u32),
+}
+
+/// Published by `upgrade`: topics `(contract_updated, admin)`, data
+/// `new_wasm_hash`. Same wire shape as the other events in this contract.
+#[contractevent(topics = ["contract_updated"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpdated {
+    #[topic]
+    pub admin: Address,
+    pub new_wasm_hash: BytesN<32>,
 }
 
 #[contract]
@@ -171,6 +194,35 @@ fn store_lease(env: &Env, lease: &Lease) {
     let key = DataKey::Lease(lease.id);
     env.storage().persistent().set(&key, lease);
     bump_persistent_ttl(env, &key);
+}
+
+/// Number of entries in `consumer`'s lease index (`0` if they never leased).
+fn consumer_lease_count(env: &Env, consumer: &Address) -> u32 {
+    let key = DataKey::ConsumerLeases(consumer.clone());
+    match env.storage().persistent().get::<_, u32>(&key) {
+        Some(count) => {
+            bump_persistent_ttl(env, &key);
+            count
+        }
+        None => 0,
+    }
+}
+
+/// Appends `lease_id` to `consumer`'s index: one new position entry plus the
+/// updated count. Runs inside `create_lease`, so it commits or rolls back
+/// together with the lease itself.
+fn append_consumer_lease(env: &Env, consumer: &Address, lease_id: u64) -> Result<(), Error> {
+    let position = consumer_lease_count(env, consumer);
+    let next = position.checked_add(1).ok_or(Error::InvalidAmount)?;
+
+    let entry = DataKey::ConsumerLease(consumer.clone(), position);
+    env.storage().persistent().set(&entry, &lease_id);
+    bump_persistent_ttl(env, &entry);
+
+    let count = DataKey::ConsumerLeases(consumer.clone());
+    env.storage().persistent().set(&count, &next);
+    bump_persistent_ttl(env, &count);
+    Ok(())
 }
 
 #[contractimpl]
@@ -247,7 +299,41 @@ impl KeyleaseCore {
         Ok(())
     }
 
-    /// Provider-only: register or update a priced service.
+    /// Admin-only: replace this contract's wasm with `new_wasm_hash`.
+    ///
+    /// The contract address, its instance storage (config, pending admin) and
+    /// every persistent entry (services, leases, consumer lease indexes, and
+    /// the escrowed token balance) stay where they are: only the executable
+    /// changes. The new wasm must already be uploaded to the ledger, otherwise
+    /// the host traps and nothing changes. The swap takes effect once this
+    /// invocation completes successfully, so the `contract_updated` event
+    /// (`(contract_updated, admin)` topics, `new_wasm_hash` data) is only ever
+    /// observed for an upgrade that actually happened.
+    ///
+    /// Only a plain wasm hash is accepted: executable references are not, so
+    /// an upgrade can never hand control of the code to another account.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        env.deployer()
+            .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
+        ContractUpdated {
+            admin: config.admin,
+            new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Provider-only: register a new priced service or re-price your own.
+    ///
+    /// A service id belongs to the provider that first registered it. Calling
+    /// this for an id registered by a *different* provider fails with
+    /// `Unauthorized` and leaves the stored service untouched, so nobody can
+    /// take over another provider's name, price or future lease payouts. The
+    /// owner may call it again to update the price (which also marks the
+    /// service active, as before). Existing leases are never touched: each one
+    /// snapshots its provider and escrowed price at creation.
     pub fn register_service(
         env: Env,
         provider: Address,
@@ -259,13 +345,18 @@ impl KeyleaseCore {
         if price_per_call <= 0 {
             return Err(Error::InvalidPrice);
         }
+        let key = DataKey::Service(service.clone());
+        if let Some(existing) = env.storage().persistent().get::<_, Service>(&key) {
+            if existing.provider != provider {
+                return Err(Error::Unauthorized);
+            }
+        }
         let stored = Service {
             provider: provider.clone(),
             service: service.clone(),
             price_per_call,
             active: true,
         };
-        let key = DataKey::Service(service.clone());
         env.storage().persistent().set(&key, &stored);
         bump_persistent_ttl(&env, &key);
         env.events().publish(
@@ -367,6 +458,7 @@ impl KeyleaseCore {
             price_paid: amount,
         };
         store_lease(&env, &lease);
+        append_consumer_lease(&env, &consumer, id)?;
 
         env.events().publish(
             (Symbol::new(&env, "lease_created"), consumer, id),
@@ -481,6 +573,35 @@ impl KeyleaseCore {
     /// Registered service, including its price per call.
     pub fn get_service(env: Env, service: soroban_sdk::String) -> Result<Service, Error> {
         load_service(&env, &service)
+    }
+
+    /// One page of the lease ids `consumer` created, oldest first.
+    ///
+    /// * Ordering: ascending creation order, which is also ascending lease id.
+    ///   The index is append-only, so a page never shifts once written.
+    /// * `start` is a zero-based offset into that list; `limit` is the page
+    ///   size. A `limit` above `MAX_CONSUMER_LEASES_PAGE` is clamped to it, and
+    ///   `limit == 0` or a `start` at or past the end returns an empty page.
+    ///   To walk everything, keep calling with `start += page.len()` until a
+    ///   page comes back shorter than the requested (clamped) limit.
+    /// * Settled and revoked leases stay listed; read `get_lease` for status.
+    pub fn get_consumer_leases(env: Env, consumer: Address, start: u32, limit: u32) -> Vec<u64> {
+        let mut page = Vec::new(&env);
+        let total = consumer_lease_count(&env, &consumer);
+        if start >= total {
+            return page;
+        }
+        let end = start
+            .saturating_add(limit.min(MAX_CONSUMER_LEASES_PAGE))
+            .min(total);
+        for position in start..end {
+            let key = DataKey::ConsumerLease(consumer.clone(), position);
+            if let Some(id) = env.storage().persistent().get::<_, u64>(&key) {
+                bump_persistent_ttl(&env, &key);
+                page.push_back(id);
+            }
+        }
+        page
     }
 
     /// Contract configuration plus the number of leases ever created.

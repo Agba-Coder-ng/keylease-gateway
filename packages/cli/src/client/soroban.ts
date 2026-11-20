@@ -152,12 +152,20 @@ export class LeaseNotFoundError extends SorobanError {
 export class ContractCallError extends SorobanError {
   readonly code: number | null;
   readonly method: string;
+  /** Raw error detail from the contract for machine-readable output (--json). */
+  readonly detail: string;
 
   constructor(method: string, code: number | null, detail: string) {
-    super(`keylease-core.${method} failed${code === null ? '' : ` with Error(${code})`}: ${detail}`);
+    const errorInfo = mapContractError(code);
+    const codeStr = code === null ? 'unknown' : String(code);
+    const message =
+      `keylease-core.${method} failed with Error(${codeStr}): ${errorInfo.message}\n` +
+      `Next step: ${errorInfo.nextStep}`;
+    super(message);
     this.name = 'ContractCallError';
     this.method = method;
     this.code = code;
+    this.detail = detail;
   }
 }
 
@@ -165,6 +173,10 @@ export interface SorobanClientOptions {
   server: SorobanRpc;
   contractId: string;
   networkPassphrase: string;
+  /** Transaction inclusion fee in stroops. Defaults to the SDK base fee. */
+  fee?: number;
+  /** Envelope timeout in seconds. Defaults to 60 seconds. */
+  timeout?: number;
   txPollAttempts?: number;
   txPollIntervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -313,160 +325,121 @@ function contractErrorCode(detail: string): number | null {
 }
 
 /**
- * Determines if an error is a transient RPC failure that should be retried.
- * Retries on:
- * - 429 (Too Many Requests)
- * - 5xx errors (server errors)
- * - Timeout errors
- * Never retries on contract errors or other client errors.
+ * Maps contract error codes to human-readable messages with actionable next steps.
+ * See: https://github.com/KeyLease-Security/keylease-gateway#contract-reference
  */
-function isTransientError(error: unknown): boolean {
-  // Network timeout errors
-  if (error instanceof Error) {
-    const message = error.message.toLowerCase();
-    if (message.includes('timeout') || message.includes('econnrefused') || message.includes('enotfound')) {
-      return true;
-    }
-  }
-
-  // HTTP error responses
-  if (typeof error === 'object' && error !== null) {
-    const err = error as Record<string, unknown>;
-    const status = err.status as unknown;
-    if (typeof status === 'number') {
-      // 429 Too Many Requests
-      if (status === 429) {
-        return true;
-      }
-      // 5xx Server Errors
-      if (status >= 500 && status < 600) {
-        return true;
-      }
-    }
-  }
-
-  return false;
+export interface ErrorMessage {
+  /** Human-readable error summary. */
+  message: string;
+  /** Suggested next step or resolution. */
+  nextStep: string;
 }
 
-/**
- * Extracts the Retry-After value from a response in seconds.
- * Handles both seconds (numeric) and HTTP-date formats.
- */
-function getRetryAfterSeconds(error: unknown): number | null {
-  if (typeof error === 'object' && error !== null) {
-    const err = error as Record<string, unknown>;
-    const retryAfter = err.retryAfter as unknown;
-
-    if (typeof retryAfter === 'number') {
-      // Already in seconds
-      return retryAfter;
-    }
-    if (typeof retryAfter === 'string') {
-      // Try parsing as a number (seconds)
-      const seconds = Number(retryAfter);
-      if (Number.isFinite(seconds) && seconds > 0) {
-        return seconds;
-      }
-      // Try parsing as HTTP-date (we'll do simple check; full parsing is complex)
-      try {
-        const date = new Date(retryAfter);
-        if (!isNaN(date.getTime())) {
-          const delayMs = date.getTime() - Date.now();
-          if (delayMs > 0) {
-            return Math.ceil(delayMs / 1000);
-          }
-        }
-      } catch {
-        // Ignore parse errors
-      }
-    }
+export function mapContractError(code: number | null): ErrorMessage {
+  switch (code) {
+    case 1:
+      return {
+        message: 'Contract initialization has already been performed',
+        nextStep: 'This error typically indicates a contract deployment issue. Contact the operator.',
+      };
+    case 2:
+      return {
+        message: 'Contract has not been initialized',
+        nextStep: 'The contract may be misconfigured. Verify KEYLEASE_CONTRACT_ID and contact the operator.',
+      };
+    case 3:
+      return {
+        message: 'Service was never registered',
+        nextStep: 'Check your --service name. The provider may need to register this service first.',
+      };
+    case 4:
+      return {
+        message: 'Service is paused by its provider',
+        nextStep: 'The provider has temporarily disabled this service. Contact them to re-enable it.',
+      };
+    case 5:
+      return {
+        message: 'Lease does not exist on chain',
+        nextStep: 'Check your --lease id. You may need to acquire a new lease with "keylease acquire".',
+      };
+    case 6:
+      return {
+        message: 'Lease is inactive (revoked or already settled)',
+        nextStep: 'This lease has already been closed. Acquire a new lease to continue.',
+      };
+    case 7:
+      return {
+        message: 'Lease has expired',
+        nextStep: 'Wait for settlement or contact the provider. Run "keylease settle" to finalize the lease.',
+      };
+    case 8:
+      return {
+        message: 'Lease cannot be settled yet',
+        nextStep: 'Settlement is only possible once the lease expires or runs out of calls. Wait for expiry or exhaust the quota.',
+      };
+    case 9:
+      return {
+        message: 'Escrow has already been paid out',
+        nextStep: 'This lease was already settled. The payout cannot be made twice.',
+      };
+    case 10:
+      return {
+        message: 'Call count is invalid (must be positive)',
+        nextStep: 'Ensure --calls is a positive integer.',
+      };
+    case 11:
+      return {
+        message: 'Duration is invalid (must be positive)',
+        nextStep: 'Ensure --duration is a positive integer in seconds.',
+      };
+    case 12:
+      return {
+        message: 'Price per call is invalid (must be positive)',
+        nextStep: 'Contact the operator. The service has an invalid price configuration.',
+      };
+    case 13:
+      return {
+        message: 'Payment amount is invalid',
+        nextStep: 'Ensure you have sufficient funds. Verify your account balance and try again.',
+      };
+    case 14:
+      return {
+        message: 'Operation not authorized',
+        nextStep: 'You do not have permission for this operation. Check that you are using the correct account.',
+      };
+    default:
+      return {
+        message: 'An unknown contract error occurred',
+        nextStep: 'Check the detailed error information below. If the problem persists, contact support.',
+      };
   }
-
-  return null;
-}
-
-/**
- * Configuration for retry behavior with exponential backoff.
- */
-interface RetryConfig {
-  maxAttempts: number;
-  initialDelayMs: number;
-  maxDelayMs: number;
-  backoffMultiplier: number;
-}
-
-const DEFAULT_RETRY_CONFIG: RetryConfig = {
-  maxAttempts: 5,
-  initialDelayMs: 100,
-  maxDelayMs: 10_000,
-  backoffMultiplier: 2,
-};
-
-/**
- * Executes an async operation with exponential backoff retry on transient errors.
- * - Retries only on 429, 5xx, and timeout errors
- * - Never retries on contract errors or other application errors
- * - Respects Retry-After header when present
- * - Caps total attempts by maxAttempts
- *
- * @param operation The async operation to retry
- * @param sleep Function to sleep between retries (injected for testing)
- * @param config Retry configuration
- * @returns The result of the operation
- * @throws The last error if all retries are exhausted or a non-transient error occurs
- */
-async function withRetry<T>(
-  operation: () => Promise<T>,
-  sleep: (ms: number) => Promise<void>,
-  config: Partial<RetryConfig> = {},
-): Promise<T> {
-  const finalConfig = { ...DEFAULT_RETRY_CONFIG, ...config };
-  let lastError: unknown;
-
-  for (let attempt = 0; attempt < finalConfig.maxAttempts; attempt += 1) {
-    try {
-      return await operation();
-    } catch (error) {
-      // Never retry on non-transient errors (including ContractCallError)
-      if (!isTransientError(error)) {
-        throw error;
-      }
-
-      // Don't sleep after the last failed attempt
-      if (attempt === finalConfig.maxAttempts - 1) {
-        throw error;
-      }
-
-      lastError = error;
-
-      // Calculate delay: check for Retry-After first, then use exponential backoff
-      let delayMs = finalConfig.initialDelayMs * Math.pow(finalConfig.backoffMultiplier, attempt);
-      delayMs = Math.min(delayMs, finalConfig.maxDelayMs);
-
-      const retryAfterSeconds = getRetryAfterSeconds(error);
-      if (retryAfterSeconds !== null) {
-        delayMs = Math.min(retryAfterSeconds * 1000, finalConfig.maxDelayMs);
-      }
-
-      await sleep(delayMs);
-    }
-  }
-
-  throw lastError ?? new SorobanError('retry exhausted');
 }
 
 export class SorobanClient {
   private readonly server: SorobanRpc;
   private readonly contractId: string;
   private readonly networkPassphrase: string;
+  private readonly fee: string;
+  private readonly timeout: number;
   private readonly txPollAttempts: number;
   private readonly txPollIntervalMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(options: SorobanClientOptions) {
+    if (options.fee !== undefined && (!Number.isSafeInteger(options.fee) || options.fee <= 0)) {
+      throw new SorobanError(`transaction fee must be a positive safe integer in stroops, got ${options.fee}`);
+    }
+    if (
+      options.timeout !== undefined &&
+      (!Number.isSafeInteger(options.timeout) || options.timeout <= 0)
+    ) {
+      throw new SorobanError(`transaction timeout must be a positive safe integer in seconds, got ${options.timeout}`);
+    }
     this.server = options.server;
     this.contractId = options.contractId;
     this.networkPassphrase = options.networkPassphrase;
+    this.fee = options.fee === undefined ? BASE_FEE : String(options.fee);
+    this.timeout = options.timeout ?? DEFAULT_TX_TIMEOUT_SECONDS;
     this.txPollAttempts = options.txPollAttempts ?? DEFAULT_TX_POLL_ATTEMPTS;
     this.txPollIntervalMs = options.txPollIntervalMs ?? DEFAULT_TX_POLL_INTERVAL_MS;
     this.sleep = options.sleep ?? defaultSleep;
@@ -480,6 +453,7 @@ export class SorobanClient {
   static fromEnv(
     env: ClientEnv = process.env,
     serverFactory: (url: string) => SorobanRpc = createRpcServer,
+    transactionOptions: Pick<SorobanClientOptions, 'fee' | 'timeout'> = {},
   ): SorobanClient {
     const networkName = env.KEYLEASE_NETWORK ?? 'testnet';
     const network = NETWORKS[networkName];
@@ -503,6 +477,7 @@ export class SorobanClient {
       server: serverFactory(rpcUrl),
       contractId,
       networkPassphrase: network.networkPassphrase,
+      ...transactionOptions,
     });
   }
 
@@ -688,11 +663,11 @@ export class SorobanClient {
     const operation = new Contract(this.contractId).call(method, ...args);
     const account = new Account(source, sequence);
     return new TransactionBuilder(account, {
-      fee: BASE_FEE,
+      fee: this.fee,
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(operation)
-      .setTimeout(DEFAULT_TX_TIMEOUT_SECONDS)
+      .setTimeout(this.timeout)
       .build();
   }
 
@@ -738,6 +713,37 @@ function transactionResultName(result: unknown): string {
   return 'unknown error';
 }
 
+/**
+ * Validates an RPC URL ensuring it is a valid http: or https: URL.
+ * http: is only allowed for local/localhost URLs, matching the SDK's allowHttp rule.
+ *
+ * @throws SorobanError if the URL is invalid or does not meet the scheme requirements
+ */
+export function validateRpcUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new SorobanError(`invalid RPC URL "${url}": must be a valid URL`);
+  }
+
+  const scheme = parsed.protocol;
+  if (scheme !== 'http:' && scheme !== 'https:') {
+    throw new SorobanError(`invalid RPC URL "${url}": scheme must be http: or https:, got ${scheme}`);
+  }
+
+  // Allow http: only for localhost/127.0.0.1
+  if (scheme === 'http:') {
+    const hostname = parsed.hostname;
+    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1') {
+      throw new SorobanError(
+        `invalid RPC URL "${url}": http: is only allowed for localhost, not ${hostname}`,
+      );
+    }
+  }
+}
+
 function createRpcServer(url: string): SorobanRpc {
+  validateRpcUrl(url);
   return new rpc.Server(url, { allowHttp: url.startsWith('http://') }) as unknown as SorobanRpc;
 }

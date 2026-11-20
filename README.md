@@ -8,6 +8,9 @@
 [![Soroban](https://img.shields.io/badge/Soroban-soroban--sdk%2029-8A2BE2.svg)](https://soroban.stellar.org)
 [![Stellar Testnet](https://img.shields.io/badge/Stellar-Testnet-08B5E5.svg)](https://stellar.expert/explorer/testnet/contract/CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC)
 
+<!-- Recording placeholder: replace with the hosted ~2-minute testnet demo. -->
+[▶ Watch the end-to-end demo](./docs/media/demo.mp4)
+
 KeyLease sells **prepaid, per-call API access on Stellar**. A provider registers a
 priced service on the Soroban contract, a consumer prepays a lease with real
 XLM, and an edge proxy admits requests only while that lease still has calls
@@ -117,12 +120,16 @@ sequenceDiagram
   the proxy follows the contract's ABI instead of its storage layout, and
   contract errors (`Error(Contract, #5)`) map to precise HTTP decisions.
 - **Long-lived entries are bumped.** Leases and services are persistent
-  entries with TTL extension, so a lease does not disappear from state while it
-  is still payable.
+  entries whose TTL is extended on every write **and** every read, so a lease
+  does not disappear from state while it is still payable, even if it is only
+  ever read (the proxy's `get_lease` path).
 
 ---
 
 ## Quickstart
+
+<!-- Generated from scripts/demo/quickstart.sh; placeholder until the GIF is recorded. -->
+![Animated KeyLease quickstart](./docs/media/quickstart.gif)
 
 ```bash
 pnpm install
@@ -155,6 +162,41 @@ curl -H "Authorization: Bearer $KEYLEASE_SESSION_TOKEN" http://localhost:8080/v1
 node packages/cli/dist/index.js settle --lease 2 --secret "$STELLAR_SECRET"
 ```
 
+### Record the demo
+
+The local demo script acquires a five-call **testnet** lease, writes its session
+keys to a private temporary `.env`, starts a local mock upstream and proxy, then
+shows one allowed request and one rejected forged token. It prompts for the
+funded testnet secret without echoing it, suppresses the CLI's token output, and
+never needs or displays a mainnet key. The prepaid testnet lease remains on
+chain after the local processes stop.
+
+For the animated quickstart, install `asciinema` and
+[`agg`](https://github.com/asciinema/agg), then record without enabling stdin
+capture:
+
+```bash
+mkdir -p docs/media
+asciinema rec docs/media/quickstart.cast
+# In the recorded shell:
+bash scripts/demo/quickstart.sh
+# Exit the recorded shell, then render the GIF:
+agg docs/media/quickstart.cast docs/media/quickstart.gif
+```
+
+For the video, record `bash scripts/demo/quickstart.sh` in OBS while narrating
+the flow, save it as `docs/media/demo.mp4`, and replace the placeholder link
+above with the hosted video URL before publishing. Suggested caption / pinned
+comment commands:
+
+```text
+keylease acquire --network testnet --contract <testnet-contract-id> --service weather-api --calls 5 --duration 3600 --secret [hidden]
+keylease env --service weather-api --file .env
+KEYLEASE_UPSTREAM_URL=http://localhost:<local-upstream-port> node packages/proxy/dist/index.js
+curl -i -H "Authorization: Bearer [session token]" http://localhost:<proxy-port>/v1/weather
+curl -i -H "Authorization: Bearer kls1.forged.invalid" http://localhost:<proxy-port>/v1/weather
+```
+
 Offline sanity check of a token (no RPC required):
 
 ```bash
@@ -179,19 +221,87 @@ friendbot, writes `deployments.json` (public) and
 
 | Command | Purpose |
 | --- | --- |
+| `keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>` | Invokes `create_lease` (paying the SAC token into escrow) and prints a signed session bearer token; `--duration` max is 365 days |
+| `keylease acquire --service <id> --calls <n> --duration <secs> --dry-run` | Quotes the price of those calls without signing, creating a lease or storing a session; `--duration` max is 365 days |
 | `keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>` | Invokes `create_lease` (paying the SAC token into escrow) and prints a signed session bearer token |
+| `keylease env --service <id> [--file .env] [--lease <id>]` | Writes the temporary keys of an acquired lease into a local `.env`. Selects newest unexpired lease by default, or explicit lease via `--lease <id>` |
+| `keylease acquire --service <id> --calls <n> --duration <secs> --dry-run` | Quotes the price of those calls without signing, creating a lease or storing a session |
 | `keylease env --service <id> [--file .env]` | Writes the temporary keys of an acquired lease into a local `.env` |
 | `keylease status --lease <id>` | Reads live lease state by simulating `get_lease` |
 | `keylease status --token <token>` | Verifies a session token offline |
 | `keylease status --token <token> --check-chain [--json]` | Also checks the referenced lease's on-chain active state, consumer, and remaining quota |
-| `keylease sessions [--json]` | Lists locally stored leases with expiry and status |
+| `keylease sessions [--json]` | Lists locally stored leases with cost, expiry, and status |
 | `keylease sessions --prune [--json]` | Removes locally stored leases that have expired |
+| `keylease settle --lease <id>[,<id>...] [--lease <id> ...] --secret <key>` | Settles multiple expired/exhausted leases |
+| `keylease revoke --lease <id>[,<id>...] [--lease <id> ...] --secret <key>` | Revokes multiple leases and refunds unused calls |
+| `keylease help` · `keylease --version` | Help / version |
+
+Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
+`--contract <id>`, `--json` (machine-readable output). Transaction commands
+`acquire`, `settle`, and `revoke` also accept `--fee <stroops>` (positive
+integer; defaults to the Stellar SDK base fee) and `--timeout <seconds>`
+(positive integer; defaults to 60 seconds).
+
+`settle` and `revoke` accept repeated `--lease` flags or comma-separated IDs.
+IDs are de-duplicated and each lease gets an outcome in the summary table; with
+`--json`, the command prints an array of per-lease results. An already-settled
+lease is reported as `already_settled` and does not stop the batch. Both
+commands continue through all IDs and return exit code 1 if any lease has a
+real failure, or 0 if all leases succeeded or were already settled.
+| `keylease completions <shell>` | Prints a bash, zsh or fish completion script (`bash`, `zsh`, `fish`) |
 | `keylease settle --lease <id> --secret <key>` | Settles an expired/exhausted lease: provider payout + consumer refund |
 | `keylease revoke --lease <id> --secret <key>` | Ends a lease early and refunds its unused calls |
 | `keylease help` · `keylease --version` | Help / version |
 
 Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
-`--contract <id>`, `--json` (machine-readable output).
+`--contract <id>`, `--json` (machine-readable output), `--dry-run`
+(`acquire` only).
+
+#### Error responses with `--json`
+
+When `--json` is set, errors are emitted to stderr as machine-readable JSON
+instead of plain text. The format is stable across all commands:
+
+```json
+{
+  "error": {
+    "code": "missing_option",
+    "message": "--duration is required",
+    "hint": "run \"keylease help\" for usage"
+  }
+}
+```
+
+The `error` object always contains:
+- `code` (string): A stable machine-readable error identifier
+- `message` (string): Human-readable error description
+- `hint` (string, optional): Actionable suggestion (hints are omitted for token and runtime errors)
+
+**Error codes** are drawn from three categories:
+
+**CLI validation errors** (exit code 2):
+- `parse_error` — Invalid argument syntax or unknown flag
+- `missing_option` — Required flag not provided
+- `invalid_option` — Flag value failed validation (not a number, not a Stellar key, etc.)
+- `unexpected_argument` — Positional argument where none expected
+- `unknown_command` — Unrecognized command name
+- `usage_error` — Generic validation issue
+
+**Token verification errors** (exit code 1):
+- `malformed_token` — Token format invalid (wrong prefix, not base64url, missing fields)
+- `unsupported_version` — Token version mismatch
+- `invalid_consumer` — Consumer public key invalid
+- `bad_signature` — Ed25519 signature does not verify
+- `consumer_mismatch` — Token consumer doesn't match expected
+- `lease_mismatch` — Token lease_id doesn't match requested
+- `token_expired` — Token past expiry time
+- `token_not_yet_valid` — Token's issued-at time hasn't arrived (clock skew)
+
+**Runtime errors** (exit code 1):
+- `internal_error` — Unhandled exceptions, RPC failures, etc.
+
+Success output remains unchanged: `--json` renders structured data to stdout
+without wrapping.
 
 `status --token` checks the token signature and expiry offline. Add
 `--check-chain` to also simulate `get_lease` and check that the lease is active,
@@ -200,23 +310,219 @@ the on-chain service; service and call limits are not claims encoded in the
 current session token. Chain lookup failures are reported as failed checks and
 return exit code 1.
 
+`keylease status --lease 42` reads the on-chain lease state and reports the network and contract address:
+
+```text
+Lease 42
+  network    : testnet
+  contract   : CC2YHTV3...UOXDA3KRC
+  service    : weather-api
+  provider   : GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  consumer   : GDUKMGUGDZQK6YHYA5Z6AY2G4XDSZPSZ3SW5UN3ARVMO6QSRDWP5YLEX
+  calls      : 4/10
+  escrow     : 10000 (paid into keylease-core)
+  expires at : 2023-11-15T10:00:00.000Z
+  active     : yes
+  settled    : no
+```
+
+Add `--json` for machine-readable output, including the full contract id:
+
+```json
+{
+  "leaseId": "42",
+  "network": "testnet",
+  "contract_id": "CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC",
+  "service": "weather-api",
+  ...
+}
+```
+
 `--secret` is the consumer account's **Stellar secret seed**. It signs the
 `create_lease` transaction and the session token, and it never leaves the
 process — it is not printed, logged, or written to disk.
 
+Session bearer tokens (`kls1.*` format) are redacted in all error messages and
+logs. If a token parse error or verification failure occurs, the CLI will
+display `kls1.<redacted>` instead of the full token value, ensuring credentials
+are never leaked to terminal output, CI logs, or pasted issues.
+
+`acquire --dry-run` calls `quote` on `keylease-core` first and prints the
+service, call count, duration, quoted price (token smallest units) and the
+expiry the lease would get — then stops. Nothing is signed, no lease is created
+and nothing is written to `.keylease/sessions.json`, so a typo in `--calls`
+costs no testnet XLM. `--secret` is optional with `--dry-run`; pass it to see
+the consumer address the lease would use. Add `--json` for machine-readable
+output (`dry_run: true`, `price`, `expires_at`).
+
 `acquire` remembers the lease in `.keylease/sessions.json` (git-ignored) so
-`env` can find it later. `env` merges these keys, replacing existing ones and
+`env` can find it later. The store maintains multiple leases per service to
+support parallel acquisitions and renewals. `env` selects the newest unexpired
+lease automatically, or use `--lease <id>` to pick a specific one. `env` then
+merges these keys, replacing existing ones and preserving everything else in the file:
+`env` can find it later. The store is a local cache with best-effort locking:
+writes are serialized within a process, guarded across processes by an
+exclusive `.keylease/sessions.json.lock` (2 s wait; a lock older than 10 s is
+treated as abandoned and removed once), and land via an atomic temp-file
+rename, so parallel `acquire` runs for different services keep every session.
+If the lock stays held, the command fails with a `locked` error naming the
+lock file. `env` merges these keys, replacing existing ones and
 preserving everything else in the file:
 
-```
-KEYLEASE_SERVICE KEYLEASE_LEASE_ID KEYLEASE_CONSUMER KEYLEASE_SESSION_TOKEN
-KEYLEASE_CALLS_LIMIT KEYLEASE_ISSUED_AT KEYLEASE_EXPIRES_AT
+```dotenv
+KEYLEASE_SERVICE=weather-api
+KEYLEASE_LEASE_ID=42
+KEYLEASE_CONSUMER=GDUKMGUGDZQK6YHYA5Z6AY2G4XDSZPSZ3SW5UN3ARVMO6QSRDWP5YLEX
+KEYLEASE_SESSION_TOKEN=kls1.eyJ...signature
+KEYLEASE_CALLS_LIMIT=25
+KEYLEASE_ISSUED_AT=1700000000
+KEYLEASE_EXPIRES_AT=1700003600
 ```
 
-`keylease sessions` lists the stored service, lease ID, expiry, and whether the
-lease is active or expired. Add `--json` for machine-readable output, or
-`--prune` to remove expired entries. If the session store is missing, acquire a
-lease first; if it is corrupt, back it up or repair it before retrying.
+The file is meant to be sourced, so values are shell-quoted: plain values made
+of `A-Z a-z 0-9 _ . : @ / -` are written bare, and anything else is
+double-quoted with `\`, `"` and `$` escaped. A service id containing a space or
+`#` therefore reads back intact:
+
+```dotenv
+KEYLEASE_SERVICE="weather api #1"
+KEYLEASE_SESSION_TOKEN="kls1.a\$b.c\"d"
+```
+
+```bash
+set -a; . ./.env; set +a
+# KEYLEASE_SERVICE is now exactly `weather api #1`
+```
+
+Each stored session also records `pricePaid` and `pricePerCall`, in the token's
+smallest units. Acquisition quotes before creating the lease and checks the
+resulting on-chain escrow; if the price changed between those steps, the session
+records the on-chain amount and acquisition warns about the mismatch. Existing
+session files without these optional fields remain valid.
+
+`keylease sessions` lists the stored service, lease ID, cost, expiry, and
+whether the lease is active or expired. Add `--json` for machine-readable
+output, or `--prune` to remove expired entries. `status --lease` shows the
+on-chain escrow total and cost per call. If the session store is missing,
+acquire a lease first; if it is corrupt, back it up or repair it before retrying.
+
+#### Environment file merge rule
+
+When `keylease env` writes to a `.env` file, it merges the new session keys with
+existing content according to these rules:
+
+- Matching keys are replaced in place, preserving their relative line order and
+  any `export` prefix from the original assignment
+- Duplicate assignments of the same key (whether prefixed with `export` or not)
+  are deduplicated — only the first occurrence is kept, updated with the new
+  value; subsequent duplicates are dropped
+- Non-matching lines and comments are preserved as-is
+- New keys that don't already exist are appended at the end
+- The file always ends with a single newline
+
+Example: starting with this `.env`:
+
+```bash
+export KEYLEASE_SESSION_TOKEN=old_value
+OTHER_VAR=keep_me
+KEYLEASE_SESSION_TOKEN=duplicate  # This line will be dropped
+# My comment
+```
+
+Running `keylease env --service my-api` with a new token produces:
+
+```bash
+export KEYLEASE_SESSION_TOKEN=new_value
+OTHER_VAR=keep_me
+# My comment
+KEYLEASE_SERVICE=my-api
+KEYLEASE_LEASE_ID=...
+```
+
+This ensures that stale or duplicate exported tokens cannot accidentally shadow
+the active lease credentials in shells that process both lines.
+
+#### Session store format
+
+The `.keylease/sessions.json` file stores acquired leases keyed by service id.
+Each service maps to an array of `LeaseSession` objects:
+
+```json
+{
+  "weather-api": [
+    { "leaseId": "123", "consumer": "GCC...", "token": "kls1...", ... },
+    { "leaseId": "456", "consumer": "GCC...", "token": "kls1...", ... }
+  ]
+}
+```
+
+**Multiple leases per service:** `acquire` appends new leases to the service's
+array. This supports parallel acquisitions (e.g., CI jobs) and renewals without
+losing earlier leases' remaining quota. Saving the same `leaseId` twice replaces
+that entry idempotently (e.g., on retry with updated tx hash).
+
+**Automatic migration:** If an older v1 store exists with the format
+`{ "service": LeaseSession }` (single session per service), it is automatically
+converted to v2 on first read. The migration is transparent and saves in v2 format.
+
+**Git-ignored:** `.keylease/sessions.json` contains sensitive session tokens and
+is git-ignored. Never commit it or share the tokens with untrusted parties.
+### Configuration file
+
+`keylease` reads an optional `.keyleaserc.json` from the working directory once
+per invocation; a missing file is ignored. CI jobs and teams can check one in
+instead of repeating the same network triple:
+
+```json
+{
+  "network": "testnet",
+  "rpc": "https://soroban-testnet.stellar.org",
+  "contract": "CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC",
+  "defaultService": "weather-api"
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `network` | `testnet` \| `mainnet` \| `local` |
+| `rpc` | Soroban RPC endpoint override |
+| `contract` | `keylease-core` contract id |
+| `defaultService` | service id used when `--service` is omitted (`acquire`, `env`) |
+
+Unknown keys, invalid JSON and values that are not non-empty strings are
+rejected with a usage error naming the file, so a typo in a checked-in config
+fails loudly instead of being ignored. `keylease help` and `keylease --version`
+never read the file and keep working when it is broken.
+
+Precedence for every key, highest first:
+
+| Layer | Source |
+| --- | --- |
+| 1 | command-line flag (`--network`, `--rpc`, `--contract`, `--service`) |
+| 2 | environment (`KEYLEASE_NETWORK`, `KEYLEASE_RPC_URL`, `KEYLEASE_CONTRACT_ID` or `KEYLEASE_CONTRACT`, `KEYLEASE_SERVICE`) |
+| 3 | `.keyleaserc.json` |
+| 4 | built-in default (`network=testnet`; no rpc, contract or service) |
+
+### Shell completions
+
+`keylease completions <shell>` prints a static completion script for `bash`,
+`zsh` or `fish` covering every command, flag and `--network` value. It only
+writes to stdout:
+
+```bash
+# bash — current session
+source <(keylease completions bash)
+# bash — persist
+keylease completions bash | sudo tee /etc/bash_completion.d/keylease >/dev/null
+
+# zsh
+keylease completions zsh > "${fpath[1]}/_keylease"
+
+# fish
+keylease completions fish > ~/.config/fish/completions/keylease.fish
+```
+
+An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 
 ---
 
@@ -229,19 +535,41 @@ lease first; if it is corrupt, back it up or repair it before retrying.
 | --- | --- | --- |
 | `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account |
 | `set_gateway(gateway)` | admin | Rotate the account allowed to commit quota |
+| `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
+| `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
 | `register_service(provider, service, price_per_call)` | provider | Register or re-price a service (`price_per_call > 0`) |
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
-| `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id |
-| `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`) |
+| `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
+| `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
 | `get_lease(id)` · `get_service(id)` · `get_config()` · `remaining_calls(id)` | – | Views used by the CLI and proxy |
+| `version()` | – | Contract ABI version as a `String`, equal to the crate version in `Cargo.toml`; callable before `init` |
 
-Storage: `Config` in instance storage; `Service(String)` and `Lease(u64)` as
+`version()` follows semver on the contract ABI: **patch** for internal fixes
+with no interface change, **minor** for additive changes (new entry points,
+views, error variants or events), **major** for breaking changes (removed or
+renamed entry points, changed arguments or storage layout). Bump
+`contracts/keylease-core/Cargo.toml` with every contract change; clients should
+refuse a major version they do not recognise.
+
+Storage: `Config` and the pending admin (`PendingAdmin`, set by
+`propose_admin`) in instance storage; `Service(String)` and `Lease(u64)` as
 persistent entries with TTL bumps (`MIN_TTL` 7 days, `EXTEND_TO` 30 days).
-Events: `init`, `gateway`, `service_registered`, `lease_created`,
-`calls_committed`, `lease_revoked`, `lease_settled`.
+The bump happens on writes (`register_service`, `create_lease`, `use_call`, …)
+and on reads: `load_config`, `load_service` and `load_lease` extend the entry
+when its TTL falls below `MIN_TTL`, so a lease that is only ever simulated or
+read stays alive. `extend_ttl` is a no-op above the threshold, so the hot read
+path costs one storage access and no write.
+Events: `init`, `gateway`, `admin_proposed`, `admin_changed`,
+`service_registered`, `lease_created`, `calls_committed`, `lease_revoked`,
+`lease_settled`.
+
+`calls_committed` keeps its `(calls_committed, consumer, lease_id)` topic
+tuple, so existing topic filters still match, but its payload is now the pair
+`(calls_used, remaining)`. Both fields are `u32`; indexers that decoded a bare
+`calls_used` value must read the pair (or the first element).
 
 Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 `Error(Contract, #n)`:
@@ -256,6 +584,7 @@ Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 | 8 | `LeaseNotSettleable` | `settle` before expiry/exhaustion |
 | 9 | `AlreadySettled` | Escrow already paid out |
 | 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation |
+| 15 | `InvalidConsumer` | `create_lease` consumer is the contract's own address |
 
 Escrow invariant: the contract only ever pays out `price_paid` once per lease,
 split as `used/total` to the provider and `(total-used)/total` to the consumer.
@@ -282,6 +611,8 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `KEYLEASE_SHUTDOWN_TIMEOUT_MS` | no | `10000` | Graceful shutdown drain timeout in milliseconds |
 | `PORT` / `HOST` | no | `8080` / `0.0.0.0` | Listen address |
 
+The on-chain quota sink tracks at most 10,000 distinct leases in its pending batch by default. It flushes pending calls early when that bound is reached.
+
 ### Responses
 
 | Status | Meaning |
@@ -290,13 +621,14 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `401 missing_token` / `invalid_token` / `token_expired` | Bearer token absent, malformed, forged or expired |
 | `403 lease_not_found` / `lease_inactive` / `lease_expired` / `consumer_mismatch` | On-chain lease does not permit this call |
 | `403 quota_exhausted` | The lease's call limit has been spent (on chain, locally, or both) |
-| `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) or `/readyz` has no reachable state |
+| `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) or `/readyz` has no reachable state. Includes `Retry-After`, rounded up from the configured cache TTL and capped at 30 seconds |
 | `426 upgrade_required` | `Connection: upgrade` requests (e.g. WebSocket) are not supported; rejected before verification, so no call is consumed. The response carries `Upgrade: HTTP/1.1` |
 | `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed) |
 
 Every response carries `x-request-id`: a valid inbound value (1-128 chars of `A-Za-z0-9._:~+=/-`) is reused, anything else is replaced by a generated UUID. It is also forwarded upstream and appears in denial logs.
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
 Forwarded upstream requests also receive these headers set exclusively by the proxy; any client-supplied `x-keylease-*` headers are stripped to prevent spoofing.
+Once lease verification succeeds, the call remains consumed even if the client disconnects or the upstream request fails; aborted calls are not refunded.
 `/healthz` and `/readyz` endpoints provide health and readiness probes without requiring bearer tokens and are never forwarded upstream.
 
 ---
@@ -304,7 +636,14 @@ Forwarded upstream requests also receive these headers set exclusively by the pr
 ## Deployments
 
 Nothing in this project holds mainnet value until an audit is announced (see
-[SECURITY.md](./SECURITY.md)). Current deployment status:
+[SECURITY.md](./SECURITY.md)); the concrete gates and sign-off are in
+[docs/mainnet-readiness.md](./docs/mainnet-readiness.md).
+
+Operators: [docs/runbook.md](./docs/runbook.md) covers the startup checklist,
+HTTP 5xx diagnostics, quota drift and crash recovery, gateway key rotation and
+restarting without losing calls.
+
+Current deployment status:
 
 | Component | Network / host | Address or URL |
 | --- | --- | --- |
@@ -354,6 +693,9 @@ keylease-gateway/
 │   │       └── client/soroban.ts
 │   └── proxy/                         # @keylease/proxy
 │       └── src/{index,server,verifier,quota,cache}.ts
+├── docs/
+│   ├── runbook.md                     # operator runbook: startup, 5xx, quota, rotation
+│   └── mainnet-readiness.md           # mainnet gates, solvency checks, drill, sign-off
 ├── deployments.json                   # testnet contract ids + tx hashes
 ├── .github/workflows/ci.yml           # TS: lint/build/tsc/test · Rust: cargo test + wasm
 ├── .github/workflows/security.yml     # PR malware scan (ClamAV) + dependency review
@@ -369,10 +711,10 @@ keylease-gateway/
 ## Development
 
 ```bash
-pnpm contract:test # cargo test: 14 contract tests
+pnpm contract:test # cargo test: 36 contract tests
 pnpm contract:build# stellar contract build (wasm32v1-none)
 pnpm build         # tsc emit for both packages (topological order)
-pnpm test          # vitest: 110 tests (58 CLI + 52 proxy)
+pnpm test          # vitest: 213 package tests (109 CLI + 104 proxy) + PR-title rules
 pnpm lint          # eslint (flat config, typescript-eslint)
 pnpm typecheck     # build, then tsc --noEmit in every package
 ```
@@ -403,6 +745,13 @@ conventions and the issue templates (trivial 100 / medium 150 / high 200
 points). Found a security issue (token forgery, quota bypass, escrow payout,
 RPC spoofing)? Follow [SECURITY.md](./SECURITY.md) instead of opening a public
 issue.
+
+CLI human-readable output is checked against fixtures in
+`packages/cli/test/golden/`. After intentionally changing command formatting,
+run `UPDATE_GOLDEN=1 pnpm --filter @keylease/cli test` to regenerate the
+fixtures, review the fixture diff, then run `pnpm --filter @keylease/cli test`
+without the variable. JSON output is validated separately with schema
+assertions rather than golden files.
 
 ## Community
 

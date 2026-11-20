@@ -43,6 +43,24 @@ This software is **pre-1.0 and has not been independently audited**. Use it for
 development and testnet evaluation, not for mainnet value at risk, until an
 audit is announced in the repository release notes.
 
+## Mainnet readiness
+
+[`docs/mainnet-readiness.md`](./docs/mainnet-readiness.md) operationalises this
+restriction. It lists the technical, operational and security gates that must
+be completed, the escrow-solvency check, the mandatory testnet settlement
+drill, and the role-based sign-off required before the software may handle
+mainnet value.
+
+That checklist does not relax this policy: an independent audit remains
+mandatory, critical and high findings must be resolved or explicitly accepted,
+and any unresolved gate keeps the decision at NO-GO. Until the audit is
+announced and the checklist is signed off, the answer to "can this hold mainnet
+value?" is no.
+
+Operational procedures for running the proxy (startup checks, 5xx
+diagnostics, quota reconciliation and key rotation) are in
+[`docs/runbook.md`](./docs/runbook.md).
+
 ## Supported versions
 
 | Version | Supported |

@@ -4,6 +4,7 @@ import { CliError, parseArgv, renderHelp, run, type CliIo } from './index.js';
 import type { AcquireArgs, LeaseSession } from './commands/lease.js';
 
 const NOW_MS = 1_700_000_000_000;
+const NOW = NOW_MS / 1000;
 const SECRET = Keypair.random().secret();
 
 function captureIo(): { io: CliIo; out: string[]; err: string[] } {
@@ -92,16 +93,183 @@ describe('parseArgv', () => {
       '--duration=60',
       `--secret=${SECRET}`,
       '--network=local',
+      '--fee=2500',
+      '--timeout=90',
       '--json',
     ]);
     expect(invocation.command).toBe('acquire');
     const args = (invocation as { args: AcquireArgs }).args;
     expect(args.service).toBe('weather-api');
     expect(args.network).toBe('local');
+    expect(args.fee).toBe(2_500);
+    expect(args.timeout).toBe(90);
     expect(args.json).toBe(true);
   });
 
-  it('requires --service, --calls, --duration for acquire (--secret is optional)', () => {
+  it('validates --rpc URLs with valid http and https schemes', () => {
+    const validUrls = [
+      'https://soroban-testnet.stellar.org',
+      'https://mainnet.sorobanrpc.com',
+      'http://localhost:8000/soroban/rpc',
+      'http://127.0.0.1:8000/soroban/rpc',
+      'http://[::1]:8000/soroban/rpc',
+    ];
+
+    for (const url of validUrls) {
+      const invocation = parseArgv([
+        'acquire',
+        '--service',
+        'weather-api',
+        '--calls',
+        '1',
+        '--duration',
+        '60',
+        '--secret',
+        SECRET,
+        '--rpc',
+        url,
+      ]);
+      expect(invocation.command).toBe('acquire');
+      const args = (invocation as { args: AcquireArgs }).args;
+      expect(args.rpc).toBe(url);
+    }
+  });
+
+  it('rejects --rpc URLs with invalid schemes', () => {
+    const invalidUrls = [
+      'ftp://example.com',
+      'file:///path/to/file',
+      'htps://typo.example.com',
+      'htp://typo.example.com',
+    ];
+
+    for (const url of invalidUrls) {
+      const error = expectCliError(
+        () =>
+          parseArgv([
+            'acquire',
+            '--service',
+            'weather-api',
+            '--calls',
+            '1',
+            '--duration',
+            '60',
+            '--secret',
+            SECRET,
+            '--rpc',
+            url,
+          ]),
+        'invalid_option',
+      );
+      expect(error.message).toContain(url);
+      expect(error.message).toContain('scheme');
+    }
+  });
+
+  it('rejects --rpc URLs that are not valid URLs', () => {
+    const invalidUrls = [
+      'not-a-url',
+      'htps://example.com',
+      'localhost:8000',
+      '192.168.1.1:8000',
+    ];
+
+    for (const url of invalidUrls) {
+      const error = expectCliError(
+        () =>
+          parseArgv([
+            'acquire',
+            '--service',
+            'weather-api',
+            '--calls',
+            '1',
+            '--duration',
+            '60',
+            '--secret',
+            SECRET,
+            '--rpc',
+            url,
+          ]),
+        'invalid_option',
+      );
+      expect(error.message).toContain(url);
+    }
+  });
+
+  it('rejects http: URLs that are not localhost', () => {
+    const nonLocalHostUrls = [
+      'http://example.com',
+      'http://192.168.1.1',
+      'http://staging.example.com:8000',
+    ];
+
+    for (const url of nonLocalHostUrls) {
+      const error = expectCliError(
+        () =>
+          parseArgv([
+            'acquire',
+            '--service',
+            'weather-api',
+            '--calls',
+            '1',
+            '--duration',
+            '60',
+            '--secret',
+            SECRET,
+            '--rpc',
+            url,
+          ]),
+        'invalid_option',
+      );
+      expect(error.message).toContain(url);
+      expect(error.message).toContain('localhost');
+    }
+  it('parses --dry-run acquire without a secret', () => {
+    const invocation = parseArgv([
+      'acquire',
+      '--service',
+      'weather-api',
+      '--calls',
+      '5',
+      '--duration',
+      '300',
+      '--dry-run',
+    ]);
+    expect(invocation.command).toBe('acquire');
+    expect((invocation as { args: AcquireArgs }).args).toMatchObject({
+      service: 'weather-api',
+      calls: 5,
+      duration: 300,
+      secret: undefined,
+      dryRun: true,
+      json: false,
+    });
+
+    const withSecret = parseArgv([
+      'acquire',
+      '--service',
+      'weather-api',
+      '--calls',
+      '5',
+      '--duration',
+      '300',
+      '--dry-run',
+      '--secret',
+      SECRET,
+    ]);
+    expect((withSecret as { args: AcquireArgs }).args.dryRun).toBe(true);
+    expect((withSecret as { args: AcquireArgs }).args.secret).toBe(SECRET);
+  });
+
+  it('requires --secret unless --dry-run is set', () => {
+    const error = expectCliError(
+      () => parseArgv(['acquire', '--service', 'x', '--calls', '1', '--duration', '1']),
+      'missing_option',
+    );
+    expect(error.message).toContain('--dry-run');
+  });
+
+  it('requires --service, --calls, --duration and --secret for acquire', () => {
     expectCliError(() => parseArgv(['acquire']), 'missing_option');
     expectCliError(
       () => parseArgv(['acquire', '--calls', '5', '--duration', '60', '--secret', SECRET]),
@@ -185,6 +353,58 @@ describe('parseArgv', () => {
     );
   });
 
+  it('validates the maximum duration (365 days)', () => {
+    const maxSeconds = 365 * 24 * 60 * 60; // 31536000
+
+    // Exactly at the limit: should pass
+    const atLimit = parseArgv([
+      'acquire',
+      '--service',
+      'x',
+      '--calls',
+      '1',
+      `--duration=${maxSeconds}`,
+      '--secret',
+      SECRET,
+    ]);
+    expect(atLimit.command).toBe('acquire');
+    expect((atLimit as { args: AcquireArgs }).args.duration).toBe(maxSeconds);
+
+    // One second over: should fail
+    const error = expectCliError(
+      () =>
+        parseArgv([
+          'acquire',
+          '--service',
+          'x',
+          '--calls',
+          '1',
+          `--duration=${maxSeconds + 1}`,
+          '--secret',
+          SECRET,
+        ]),
+      'invalid_option',
+    );
+    expect(error.message).toContain('365 days');
+    expect(error.message).toContain(String(maxSeconds));
+
+    // Zero should still fail (caught by requirePositiveInt)
+    expectCliError(
+      () =>
+        parseArgv([
+          'acquire',
+          '--service',
+          'x',
+          '--calls',
+          '1',
+          '--duration=0',
+          '--secret',
+          SECRET,
+        ]),
+      'invalid_option',
+    );
+  });
+
   it('rejects unknown commands, flags and stray positionals', () => {
     expectCliError(() => parseArgv(['destroy', '--service', 'x']), 'unknown_command');
     expectCliError(
@@ -244,6 +464,64 @@ describe('parseArgv', () => {
     });
   });
 
+  it('parses repeated and comma-separated lifecycle lease ids without duplicates', () => {
+    expect(
+      parseArgv([
+        'settle',
+        '--lease',
+        '1,2',
+        '--lease',
+        '2',
+        '--lease=3',
+        '--secret',
+        SECRET,
+        '--fee',
+        '5000',
+        '--timeout',
+        '120',
+      ]),
+    ).toEqual({
+      command: 'settle',
+      args: {
+        lease: ['1', '2', '3'],
+        secret: SECRET,
+        json: false,
+        fee: 5_000,
+        timeout: 120,
+      },
+    });
+    expect(
+      parseArgv(['revoke', '--lease', '4', '--lease', '5,6', '--secret', SECRET, '--json']),
+    ).toEqual({
+      command: 'revoke',
+      args: {
+        lease: ['4', '5', '6'],
+        secret: SECRET,
+        json: true,
+      },
+    });
+    expectCliError(
+      () => parseArgv(['acquire', '--service', 'x', '--calls', '1', '--duration', '1', '--secret', SECRET, '--fee', '0']),
+      'invalid_option',
+    );
+    expectCliError(
+      () => parseArgv(['revoke', '--lease', '1', '--secret', SECRET, '--timeout', '1.5']),
+      'invalid_option',
+    );
+    expectCliError(
+      () => parseArgv(['settle', '--lease', '1', '--secret', SECRET, '--fee', '9007199254740992']),
+      'invalid_option',
+    );
+    expectCliError(
+      () => parseArgv(['settle', '--lease', '1,,2', '--secret', SECRET]),
+      'invalid_option',
+    );
+    expectCliError(
+      () => parseArgv(['status', '--lease', '1', '--lease', '2']),
+      'invalid_option',
+    );
+  });
+
   it('parses --check-chain only with status tokens', () => {
     expect(parseArgv(['status', '--token', 'kls1.a.b'])).toEqual({
       command: 'status',
@@ -265,10 +543,13 @@ describe('renderHelp', () => {
       'env',
       'status',
       'sessions',
+      'completions',
       '--prune',
       '--check-chain',
+      '--dry-run',
       '--secret',
       '--service',
+      '.keyleaserc.json',
     ]) {
       expect(help).toContain(needle);
     }
@@ -298,6 +579,84 @@ describe('run', () => {
     expect(err.join('\n')).toContain('unknown command');
   });
 
+  it('outputs JSON error when --json flag is set', async () => {
+    const { io, err, out } = captureIo();
+    expect(await run(['acquire', '--service', 'x', '--json'], io)).toBe(2);
+    expect(out).toEqual([]);
+    expect(err).toHaveLength(1);
+    const response = JSON.parse(err[0]);
+    expect(response).toEqual({
+      error: {
+        code: 'missing_option',
+        message: expect.stringContaining('--duration'),
+        hint: expect.stringContaining('keylease help'),
+      },
+    });
+  });
+
+  it('outputs JSON error for unknown command with --json', async () => {
+    const { io, err, out } = captureIo();
+    expect(await run(['explode', '--json'], io)).toBe(2);
+    expect(out).toEqual([]);
+    expect(err).toHaveLength(1);
+    const response = JSON.parse(err[0]);
+    expect(response.error.code).toBe('unknown_command');
+    expect(response.error.message).toContain('unknown command');
+  });
+
+  it('outputs JSON error for parse errors with --json', async () => {
+    const { io, err, out } = captureIo();
+    expect(
+      await run(
+        ['acquire', '--service', 'x', '--calls', 'not_a_number', '--duration', '60', '--secret', SECRET, '--json'],
+        io,
+      ),
+    ).toBe(2);
+    expect(out).toEqual([]);
+    expect(err).toHaveLength(1);
+    const response = JSON.parse(err[0]);
+    expect(response.error.code).toBe('invalid_option');
+    expect(response.error.message).toContain('positive integer');
+  });
+
+  it('outputs human-readable error without --json', async () => {
+    const { io, err, out } = captureIo();
+    expect(await run(['acquire', '--service', 'x'], io)).toBe(2);
+    expect(out).toEqual([]);
+    expect(err.length).toBeGreaterThan(0);
+    expect(err[0]).toContain('error:');
+    expect(err[0]).not.toContain('{');
+  });
+
+  it('preserves exit code 2 with JSON errors', async () => {
+    const { io } = captureIo();
+    const code = await run(['unknown', '--json'], io);
+    expect(code).toBe(2);
+  });
+
+  it('preserves exit code 1 for command failures', async () => {
+    const { io, err } = captureIo();
+    const code = await run(
+      ['acquire', '--service', 'x', '--calls', '1', '--duration', '1', '--secret', SECRET, '--json'],
+      io,
+      {
+        acquire: {
+          createClient: () => ({
+            quote: async () => 10,
+            createLease: async () => {
+              throw new Error('rpc exploded');
+            },
+          }),
+        },
+      },
+    );
+    expect(code).toBe(1);
+    expect(err).toHaveLength(1);
+    const response = JSON.parse(err[0]);
+    expect(response.error.code).toBe('internal_error');
+    expect(response.error.message).toBe('rpc exploded');
+  });
+
   it('dispatches acquire to the command with injected dependencies', async () => {
     const store = memoryStore();
     const { io, out, err } = captureIo();
@@ -321,10 +680,24 @@ describe('run', () => {
           now: () => NOW_MS,
           store,
           createClient: () => ({
+            quote: async () => 5_000,
+            quote: async () => 10,
             createLease: async (params) => {
               seen.push(params);
               return { leaseId: 'lease-abc', txHash: 'deadbeef' };
             },
+            getLeaseState: async () => ({
+              leaseId: 'lease-abc',
+              service: 'weather-api',
+              provider: 'GPROVIDER',
+              consumer: Keypair.fromSecret(SECRET).publicKey(),
+              callsLimit: 5,
+              callsUsed: 0,
+              expiresAt: NOW + 300,
+              active: true,
+              settled: false,
+              pricePaid: 5_000,
+            }),
           }),
         },
       },
@@ -348,8 +721,13 @@ describe('run', () => {
       {
         acquire: {
           createClient: () => ({
+            quote: async () => 1_000,
+            quote: async () => 10,
             createLease: async () => {
               throw new Error('rpc exploded');
+            },
+            getLeaseState: async () => {
+              throw new Error('should not be called');
             },
           }),
         },

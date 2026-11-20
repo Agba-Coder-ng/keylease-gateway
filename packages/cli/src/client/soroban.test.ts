@@ -1,11 +1,16 @@
-import { Keypair, nativeToScVal } from '@stellar/stellar-sdk';
-import { describe, expect, it } from 'vitest';
+import { BASE_FEE, Keypair, nativeToScVal } from '@stellar/stellar-sdk';
+import { describe, expect, it, vi } from 'vitest';
 import {
+  ContractCallError,
   LeaseNotFoundError,
   SorobanClient,
+  mapContractError,
   parseLeaseId,
   parseLeaseState,
   encodeLeaseState,
+  type Transaction,
+  validateRpcUrl,
+  SorobanError,
   type LeaseState,
   type SorobanRpc,
 } from './soroban.js';
@@ -51,6 +56,47 @@ describe('parseLeaseId', () => {
     expect(() => parseLeaseId('0x7')).toThrow(/canonical decimal form/);
     expect(() => parseLeaseId('1.5')).toThrow(/canonical decimal form/);
     expect(() => parseLeaseId('1e5')).toThrow(/canonical decimal form/);
+  });
+});
+
+describe('validateRpcUrl', () => {
+  it('accepts valid https URLs', () => {
+    expect(() => validateRpcUrl('https://soroban-testnet.stellar.org')).not.toThrow();
+    expect(() => validateRpcUrl('https://mainnet.sorobanrpc.com')).not.toThrow();
+    expect(() =>
+      validateRpcUrl('https://soroban-testnet.stellar.org:443/soroban/rpc'),
+    ).not.toThrow();
+  });
+
+  it('accepts http URLs for localhost', () => {
+    expect(() => validateRpcUrl('http://localhost:8000')).not.toThrow();
+    expect(() => validateRpcUrl('http://localhost:8000/soroban/rpc')).not.toThrow();
+    expect(() => validateRpcUrl('http://127.0.0.1:8000')).not.toThrow();
+    expect(() => validateRpcUrl('http://[::1]:8000')).not.toThrow();
+  });
+
+  it('rejects invalid URLs', () => {
+    expect(() => validateRpcUrl('not-a-url')).toThrow('must be a valid URL');
+    expect(() => validateRpcUrl('localhost:8000')).toThrow('must be a valid URL');
+    expect(() => validateRpcUrl('192.168.1.1:8000')).toThrow('must be a valid URL');
+  });
+
+  it('rejects wrong schemes', () => {
+    expect(() => validateRpcUrl('ftp://example.com')).toThrow('scheme must be http: or https:');
+    expect(() => validateRpcUrl('file:///path/to/file')).toThrow('scheme must be http: or https:');
+    expect(() => validateRpcUrl('gopher://example.com')).toThrow('scheme must be http: or https:');
+  });
+
+  it('rejects http URLs that are not localhost', () => {
+    expect(() => validateRpcUrl('http://example.com')).toThrow('localhost');
+    expect(() => validateRpcUrl('http://192.168.1.1')).toThrow('localhost');
+    expect(() => validateRpcUrl('http://staging.example.com:8000')).toThrow('localhost');
+    expect(() => validateRpcUrl('http://example.com:8000/soroban/rpc')).toThrow('localhost');
+  });
+
+  it('catches typos like htps:// or htp://', () => {
+    expect(() => validateRpcUrl('htps://example.com')).toThrow('scheme');
+    expect(() => validateRpcUrl('htp://example.com')).toThrow('scheme');
   });
 });
 
@@ -356,5 +402,169 @@ describe('getLeaseState', () => {
 
       await expect(client.getLeaseState('7')).rejects.toThrow('503 Service Unavailable');
     });
+  });
+});
+
+describe('transaction envelope options', () => {
+  it('uses the supplied fee and timeout and preserves defaults when omitted', async () => {
+    const transactions: Transaction[] = [];
+    const server = {
+      simulateTransaction: async (transaction: Transaction) => {
+        transactions.push(transaction);
+        return {
+          _parsed: true,
+          id: '1',
+          latestLedger: 1,
+          events: [],
+          result: { retval: nativeToScVal(1_000, { type: 'i128' }) },
+        };
+      },
+    } as unknown as SorobanRpc;
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2024-01-01T00:00:00.000Z'));
+    try {
+      const custom = new SorobanClient({
+        server,
+        contractId: 'CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC',
+        networkPassphrase: 'Test SDF Network ; September 2015',
+        fee: 2_500,
+        timeout: 90,
+      });
+      await custom.quote('weather-api', 1);
+      expect(transactions[0]?.fee).toBe('2500');
+      expect(transactions[0]?.timeBounds?.maxTime).toBe('1704067290');
+
+      const defaults = new SorobanClient({
+        server,
+        contractId: 'CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC',
+        networkPassphrase: 'Test SDF Network ; September 2015',
+      });
+      await defaults.quote('weather-api', 1);
+      expect(transactions[1]?.fee).toBe(String(BASE_FEE));
+      expect(transactions[1]?.timeBounds?.maxTime).toBe('1704067260');
+    } finally {
+      vi.useRealTimers();
+    }
+describe('mapContractError', () => {
+  it('maps error code 1 (AlreadyInitialized)', () => {
+    const msg = mapContractError(1);
+    expect(msg.message).toContain('already been performed');
+    expect(msg.nextStep).toContain('deployment');
+  });
+
+  it('maps error code 2 (NotInitialized)', () => {
+    const msg = mapContractError(2);
+    expect(msg.message).toContain('not been initialized');
+    expect(msg.nextStep).toContain('KEYLEASE_CONTRACT_ID');
+  });
+
+  it('maps error code 3 (UnknownService)', () => {
+    const msg = mapContractError(3);
+    expect(msg.message).toContain('never registered');
+    expect(msg.nextStep).toContain('--service');
+  });
+
+  it('maps error code 4 (ServiceInactive)', () => {
+    const msg = mapContractError(4);
+    expect(msg.message).toContain('paused');
+    expect(msg.nextStep).toContain('provider');
+  });
+
+  it('maps error code 5 (LeaseNotFound)', () => {
+    const msg = mapContractError(5);
+    expect(msg.message).toContain('does not exist');
+    expect(msg.nextStep).toContain('--lease');
+  });
+
+  it('maps error code 6 (LeaseInactive)', () => {
+    const msg = mapContractError(6);
+    expect(msg.message).toContain('inactive');
+    expect(msg.nextStep).toContain('new lease');
+  });
+
+  it('maps error code 7 (LeaseExpired)', () => {
+    const msg = mapContractError(7);
+    expect(msg.message).toContain('expired');
+    expect(msg.nextStep).toContain('settle');
+  });
+
+  it('maps error code 8 (LeaseNotSettleable)', () => {
+    const msg = mapContractError(8);
+    expect(msg.message).toContain('cannot be settled yet');
+    expect(msg.nextStep).toContain('expiry');
+  });
+
+  it('maps error code 9 (AlreadySettled)', () => {
+    const msg = mapContractError(9);
+    expect(msg.message).toContain('already been paid out');
+    expect(msg.nextStep).toContain('twice');
+  });
+
+  it('maps error code 10 (InvalidCalls)', () => {
+    const msg = mapContractError(10);
+    expect(msg.message).toContain('invalid');
+    expect(msg.nextStep).toContain('--calls');
+  });
+
+  it('maps error code 11 (InvalidDuration)', () => {
+    const msg = mapContractError(11);
+    expect(msg.message).toContain('invalid');
+    expect(msg.nextStep).toContain('--duration');
+  });
+
+  it('maps error code 12 (InvalidPrice)', () => {
+    const msg = mapContractError(12);
+    expect(msg.message).toContain('invalid');
+    expect(msg.nextStep).toContain('operator');
+  });
+
+  it('maps error code 13 (InvalidAmount)', () => {
+    const msg = mapContractError(13);
+    expect(msg.message).toContain('invalid');
+    expect(msg.nextStep).toContain('funds');
+  });
+
+  it('maps error code 14 (Unauthorized)', () => {
+    const msg = mapContractError(14);
+    expect(msg.message).toContain('not authorized');
+    expect(msg.nextStep).toContain('permission');
+  });
+
+  it('maps unknown error codes gracefully', () => {
+    const msg = mapContractError(999);
+    expect(msg.message).toContain('unknown');
+    expect(msg.nextStep).toContain('support');
+  });
+
+  it('maps null code (not found in error detail)', () => {
+    const msg = mapContractError(null);
+    expect(msg.message).toContain('unknown');
+    expect(msg.nextStep).toContain('support');
+  });
+});
+
+describe('ContractCallError', () => {
+  it('includes error code and mapped message for known codes', () => {
+    const error = new ContractCallError('settle', 8, 'Error(Contract, #8)');
+    expect(error.message).toContain('Error(8)');
+    expect(error.message).toContain('cannot be settled yet');
+    expect(error.message).toContain('Next step:');
+    expect(error.detail).toBe('Error(Contract, #8)');
+  });
+
+  it('includes unknown code and generic message for null code', () => {
+    const error = new ContractCallError('settle', null, 'Error(Contract, UNKNOWN)');
+    expect(error.message).toContain('Error(unknown)');
+    expect(error.message).toContain('unknown contract error');
+    expect(error.detail).toBe('Error(Contract, UNKNOWN)');
+  });
+
+  it('preserves raw detail for --json output', () => {
+    const rawDetail = 'HostError: Error(Contract, #5)';
+    const error = new ContractCallError('get_lease', 5, rawDetail);
+    expect(error.detail).toBe(rawDetail);
+    expect(error.code).toBe(5);
+    expect(error.method).toBe('get_lease');
   });
 });

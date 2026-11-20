@@ -252,6 +252,8 @@ real failure, or 0 if all leases succeeded or were already settled.
 | `keylease completions <shell>` | Prints a bash, zsh or fish completion script (`bash`, `zsh`, `fish`) |
 | `keylease settle --lease <id> --secret <key>` | Settles an expired/exhausted lease: provider payout + consumer refund |
 | `keylease revoke --lease <id> --secret <key>` | Ends a lease early and refunds its unused calls |
+| `keylease use-call --lease <id> --count <n> --secret <gateway-key>` | Commits served calls on chain as the registered gateway. **Spends quota without serving a call** — use only to reconcile after a proxy outage |
+| `keylease whoami [--secret <key>] [--json]` | Prints the resolved network, RPC URL, contract id, consumer public key and locally stored leases |
 | `keylease help` · `keylease --version` | Help / version |
 
 Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
@@ -554,6 +556,17 @@ keylease completions fish > ~/.config/fish/completions/keylease.fish
 
 An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 
+`env` contains a bearer token for a paid lease, so it always leaves the target
+file at `0600` (owner read/write). This applies when the file is created and
+when an existing `.env` with wider permissions is updated; on platforms without
+POSIX modes (e.g. Windows) the chmod is skipped and the command still succeeds.
+
+`keylease whoami` answers "which network and contract is this terminal pointed
+at?" in one command. It resolves configuration exactly like the chain commands
+(`--network`/`--rpc`/`--contract` over `KEYLEASE_*`), reports `(unset)` when no
+contract id is configured, and derives the consumer public key from `--secret`
+without ever printing the seed. Stored sessions are listed with their expiry.
+
 ---
 
 ## Contract reference
@@ -722,6 +735,7 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `KEYLEASE_QUOTA_BATCH` | no | `50` | Buffered calls before committing on chain |
 | `KEYLEASE_QUOTA_FLUSH_MS` | no | `10000` | Periodic quota commit interval |
 | `KEYLEASE_CACHE_TTL_MS` | no | `30000` | Lease-state cache TTL |
+| `KEYLEASE_UPSTREAM_TIMEOUT_MS` | no | `15000` | Per-request upstream timeout in milliseconds. `0` disables the timeout; expired requests map to `504 gateway_timeout` |
 | `KEYLEASE_MAX_BODY_BYTES` | no | `33554432` (32 MiB) | Maximum allowed request body size in bytes |
 | `KEYLEASE_TRUST_PROXY` | no | `false` | Trusted edge proxies for `x-forwarded-*`: `true`, a hop count, or a comma-separated IP/CIDR list. When off, inbound `x-forwarded-*` headers are dropped and rebuilt from the socket |
 | `KEYLEASE_MAX_INFLIGHT` | no | `1024` | Maximum concurrent proxied requests. Excess requests get `503` with `Retry-After: 1` before any quota is charged; `0` disables the cap |
@@ -742,7 +756,7 @@ The on-chain quota sink tracks at most 10,000 distinct leases in its pending bat
 | `403 quota_exhausted` | The lease's call limit has been spent (on chain, locally, or both) |
 | `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) or `/readyz` has no reachable state. Includes `Retry-After`, rounded up from the configured cache TTL and capped at 30 seconds |
 | `426 upgrade_required` | `Connection: upgrade` requests (e.g. WebSocket) are not supported; rejected before verification, so no call is consumed. The response carries `Upgrade: HTTP/1.1` |
-| `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed) |
+| `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed); `504` is produced when `KEYLEASE_UPSTREAM_TIMEOUT_MS` elapses |
 
 Every response carries `x-request-id`: a valid inbound value (1-128 chars of `A-Za-z0-9._:~+=/-`) is reused, anything else is replaced by a generated UUID. It is also forwarded upstream and appears in denial logs.
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.

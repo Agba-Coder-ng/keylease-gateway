@@ -15,10 +15,13 @@ import { statusCommand, type StatusArgs, type StatusDeps } from './commands/stat
 import {
   revokeCommand,
   settleCommand,
+  useCallCommand,
   type RevokeArgs,
   type RevokeDeps,
   type SettleArgs,
   type SettleDeps,
+  type UseCallArgs,
+  type UseCallDeps,
 } from './commands/lifecycle.js';
 import {
   sessionsCommand,
@@ -79,6 +82,7 @@ export interface RunDeps {
   status?: StatusDeps;
   settle?: SettleDeps;
   revoke?: RevokeDeps;
+  'use-call'?: UseCallDeps;
   sessions?: SessionsDeps;
   /** Directory holding `.keyleaserc.json` (default: `process.cwd()`). */
   cwd?: string;
@@ -91,6 +95,7 @@ export interface RunDeps {
 const OPTION_SPEC = {
   service: { type: 'string' },
   calls: { type: 'string' },
+  count: { type: 'string' },
   duration: { type: 'string' },
   secret: { type: 'string' },
   lease: { type: 'string', multiple: true },
@@ -370,6 +375,19 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
         },
       };
     }
+    case 'use-call': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'use-call',
+        args: {
+          ...networkArgs(values),
+          lease: requireString(values, 'lease'),
+          count: requirePositiveInt(values, 'count'),
+          secret: requireString(values, 'secret'),
+          json: values.json === true,
+        },
+      };
+    }
     case 'sessions': {
       ensureNoPositionals(positionals);
       return {
@@ -558,6 +576,8 @@ export async function run(
         return await settleCommand(invocation.args, io, deps.settle);
       case 'revoke':
         return await revokeCommand(invocation.args, io, deps.revoke);
+      case 'use-call':
+        return await useCallCommand(invocation.args, io, deps['use-call']);
       case 'sessions':
         return await sessionsCommand(invocation.args, io, deps.sessions);
       case 'completions':

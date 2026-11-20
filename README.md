@@ -206,7 +206,7 @@ node packages/cli/dist/index.js status --token "$KEYLEASE_SESSION_TOKEN"
 Redeploying the contract from source (needs Rust + `stellar-cli` ≥ 25.2):
 
 ```bash
-pnpm contract:test          # 14 Rust tests against a real SAC instance
+pnpm contract:test          # cargo test against a real SAC instance
 pnpm contract:build         # wasm32v1-none artifact
 pnpm deploy:testnet         # upload → create → init → register → demo lease
 ```
@@ -529,7 +529,7 @@ An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 ## Contract reference
 
 `contracts/keylease-core` is a Soroban contract (`soroban-sdk` 29, built for
-`wasm32v1-none`, 13.8 KB wasm).
+`wasm32v1-none`).
 
 | Entry point | Auth | Description |
 | --- | --- | --- |
@@ -541,6 +541,7 @@ An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
 | `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
+| `extend_lease(lease_id, extra_calls, extra_duration)` | consumer | Extends an active, unexpired, unsettled lease. At least one argument must be nonzero; a zero value leaves that dimension unchanged. Pulls `extra_calls × price_per_call` into the same escrow, grows `calls_limit`, `expires_at` and `price_paid`, and emits `lease_extended`. No CLI command is wired up yet |
 | `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
@@ -563,8 +564,11 @@ when its TTL falls below `MIN_TTL`, so a lease that is only ever simulated or
 read stays alive. `extend_ttl` is a no-op above the threshold, so the hot read
 path costs one storage access and no write.
 Events: `init`, `gateway`, `admin_proposed`, `admin_changed`,
-`service_registered`, `lease_created`, `calls_committed`, `lease_revoked`,
-`lease_settled`.
+`service_registered`, `lease_created`, `lease_extended`, `calls_committed`,
+`lease_revoked`, `lease_settled`. `lease_extended` keeps the
+`(lease_extended, consumer, lease_id)` topics and publishes
+`(extra_calls, extra_duration, amount)` so indexers can price the top-up without
+a second read.
 
 `calls_committed` keeps its `(calls_committed, consumer, lease_id)` topic
 tuple, so existing topic filters still match, but its payload is now the pair
@@ -582,9 +586,14 @@ Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 | 6 | `LeaseInactive` | Lease revoked or settled |
 | 7 | `LeaseExpired` | Lease past `expires_at` |
 | 8 | `LeaseNotSettleable` | `settle` before expiry/exhaustion |
-| 9 | `AlreadySettled` | Escrow already paid out |
-| 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation |
+| 9 | `AlreadySettled` | Escrow already paid out; also rejects `extend_lease` |
+| 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation; `extend_lease` uses 10 when both extension arguments are zero or `calls_limit` would overflow, 11 when expiry would overflow and 13 when the top-up price would overflow |
 | 15 | `InvalidConsumer` | `create_lease` consumer is the contract's own address |
+
+`extend_lease` reuses the existing typed errors rather than adding a variant:
+code 5 for an unknown lease, 6 for an inactive lease, 7 for an expired lease and
+9 for a settled one. Full raising entry points are in
+[docs/troubleshooting.md](./docs/troubleshooting.md#contract-errors-errorcontract-n).
 
 Escrow invariant: the contract only ever pays out `price_paid` once per lease,
 split as `used/total` to the provider and `(total-used)/total` to the consumer.
@@ -642,6 +651,10 @@ Nothing in this project holds mainnet value until an audit is announced (see
 Operators: [docs/runbook.md](./docs/runbook.md) covers the startup checklist,
 HTTP 5xx diagnostics, quota drift and crash recovery, gateway key rotation and
 restarting without losing calls.
+
+Contributors and integrators: [docs/troubleshooting.md](./docs/troubleshooting.md)
+maps CLI codes, `Error(Contract, #n)` variants and proxy 401/403 denials to the
+exact command or configuration change that fixes them.
 
 Current deployment status:
 
@@ -711,10 +724,10 @@ keylease-gateway/
 ## Development
 
 ```bash
-pnpm contract:test # cargo test: 36 contract tests
+pnpm contract:test # cargo test against a real SAC instance
 pnpm contract:build# stellar contract build (wasm32v1-none)
 pnpm build         # tsc emit for both packages (topological order)
-pnpm test          # vitest: 213 package tests (109 CLI + 104 proxy) + PR-title rules
+pnpm test          # vitest: package tests + PR-title rules
 pnpm lint          # eslint (flat config, typescript-eslint)
 pnpm typecheck     # build, then tsc --noEmit in every package
 ```
@@ -730,6 +743,7 @@ real SAC instance registered in the Soroban test environment.
 init(admin: Address, token: Address, gateway: Address)
 register_service(provider: Address, service: String, price_per_call: i128) -> Service
 create_lease(consumer: Address, service: String, calls: u32, duration: u64) -> u64
+extend_lease(lease_id: u64, extra_calls: u32, extra_duration: u64) -> Lease
 use_call(lease_id: u64, count: u32) -> Lease
 revoke(lease_id: u64) -> Lease
 settle(lease_id: u64) -> Lease
@@ -742,9 +756,10 @@ expires_at (unix seconds), active, settled, price_paid (i128)`.
 
 PRs welcome — read [CONTRIBUTING.md](./CONTRIBUTING.md) for setup, coding
 conventions and the issue templates (trivial 100 / medium 150 / high 200
-points). Found a security issue (token forgery, quota bypass, escrow payout,
-RPC spoofing)? Follow [SECURITY.md](./SECURITY.md) instead of opening a public
-issue.
+points). Shipped and unreleased changes are tracked in
+[CHANGELOG.md](./CHANGELOG.md). Found a security issue (token forgery, quota
+bypass, escrow payout, RPC spoofing)? Follow [SECURITY.md](./SECURITY.md)
+instead of opening a public issue.
 
 CLI human-readable output is checked against fixtures in
 `packages/cli/test/golden/`. After intentionally changing command formatting,

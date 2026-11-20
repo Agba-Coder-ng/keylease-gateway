@@ -26,6 +26,13 @@ export interface RevokeArgs extends TransactionArgs {
   json: boolean;
 }
 
+export interface UseCallArgs extends NetworkArgs {
+  lease: string;
+  count: number;
+  secret: string;
+  json: boolean;
+}
+
 export interface SettleDeps {
   createClient?: (args: SettleArgs) => Pick<SorobanClient, 'settle'>;
   readSecretFromStdin?: () => Promise<string>;

@@ -765,9 +765,13 @@ export async function envCommand(
   }
 
   const entries = envEntriesFor(session);
+  // Tighten permissions on the read path too, in case the file already exists
+  // wider than 0600 before new secrets are merged into it.
+  await restrictEnvFile(args.file, chmodFile);
   const existing = await read(args.file).catch(() => '');
   const merged = mergeEnv(existing, entries);
   await write(args.file, merged);
+  await restrictEnvFile(args.file, chmodFile);
 
   const keys = Object.keys(entries);
   if (args.json) {

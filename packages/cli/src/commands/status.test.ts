@@ -51,6 +51,33 @@ function args(value: string, json = false): StatusArgs {
 }
 
 describe('statusCommand --check-chain', () => {
+  it('shows on-chain spend and per-call cost for --lease in text and JSON', async () => {
+    const state = makeLease();
+    const provider = { getLeaseState: vi.fn(async () => state) };
+    const text = captureIo();
+
+    expect(
+      await statusCommand(
+        { lease: '42', json: false },
+        text.io,
+        { createClient: () => provider },
+      ),
+    ).toBe(0);
+    expect(text.out.join('\n')).toContain('escrow     : 10000');
+    expect(text.out.join('\n')).toContain('price/call : 1000');
+
+    const json = captureIo();
+    await statusCommand(
+      { lease: '42', json: true },
+      json.io,
+      { createClient: () => provider },
+    );
+    expect(JSON.parse(json.out.join('\n'))).toMatchObject({
+      pricePaid: 10_000,
+      pricePerCall: 1_000,
+    });
+  });
+
   it('passes token and on-chain checks for a valid lease', async () => {
     const bearer = token();
     const { io, out } = captureIo();

@@ -173,6 +173,10 @@ export interface SorobanClientOptions {
   server: SorobanRpc;
   contractId: string;
   networkPassphrase: string;
+  /** Transaction inclusion fee in stroops. Defaults to the SDK base fee. */
+  fee?: number;
+  /** Envelope timeout in seconds. Defaults to 60 seconds. */
+  timeout?: number;
   txPollAttempts?: number;
   txPollIntervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -412,14 +416,27 @@ export class SorobanClient {
   private readonly server: SorobanRpc;
   private readonly contractId: string;
   private readonly networkPassphrase: string;
+  private readonly fee: string;
+  private readonly timeout: number;
   private readonly txPollAttempts: number;
   private readonly txPollIntervalMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(options: SorobanClientOptions) {
+    if (options.fee !== undefined && (!Number.isSafeInteger(options.fee) || options.fee <= 0)) {
+      throw new SorobanError(`transaction fee must be a positive safe integer in stroops, got ${options.fee}`);
+    }
+    if (
+      options.timeout !== undefined &&
+      (!Number.isSafeInteger(options.timeout) || options.timeout <= 0)
+    ) {
+      throw new SorobanError(`transaction timeout must be a positive safe integer in seconds, got ${options.timeout}`);
+    }
     this.server = options.server;
     this.contractId = options.contractId;
     this.networkPassphrase = options.networkPassphrase;
+    this.fee = options.fee === undefined ? BASE_FEE : String(options.fee);
+    this.timeout = options.timeout ?? DEFAULT_TX_TIMEOUT_SECONDS;
     this.txPollAttempts = options.txPollAttempts ?? DEFAULT_TX_POLL_ATTEMPTS;
     this.txPollIntervalMs = options.txPollIntervalMs ?? DEFAULT_TX_POLL_INTERVAL_MS;
     this.sleep = options.sleep ?? defaultSleep;
@@ -433,6 +450,7 @@ export class SorobanClient {
   static fromEnv(
     env: ClientEnv = process.env,
     serverFactory: (url: string) => SorobanRpc = createRpcServer,
+    transactionOptions: Pick<SorobanClientOptions, 'fee' | 'timeout'> = {},
   ): SorobanClient {
     const networkName = env.KEYLEASE_NETWORK ?? 'testnet';
     const network = NETWORKS[networkName];
@@ -456,6 +474,7 @@ export class SorobanClient {
       server: serverFactory(rpcUrl),
       contractId,
       networkPassphrase: network.networkPassphrase,
+      ...transactionOptions,
     });
   }
 
@@ -635,11 +654,11 @@ export class SorobanClient {
     const operation = new Contract(this.contractId).call(method, ...args);
     const account = new Account(source, sequence);
     return new TransactionBuilder(account, {
-      fee: BASE_FEE,
+      fee: this.fee,
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(operation)
-      .setTimeout(DEFAULT_TX_TIMEOUT_SECONDS)
+      .setTimeout(this.timeout)
       .build();
   }
 

@@ -1,5 +1,7 @@
 ## Summary
 
+<!-- The PR title must follow Conventional Commits, e.g. "feat(proxy): add request validation". CI validates it; see CONTRIBUTING.md. -->
+
 <!-- What does this PR change, and why? -->
 
 ## Linked issue

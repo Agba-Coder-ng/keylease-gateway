@@ -164,6 +164,33 @@ function requireDuration(values: ParsedOptions): number {
     );
   }
   return duration;
+function validateRpcUrl(url: string): void {
+  // Validate RPC URL at parse time to catch typos early
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new CliError(`invalid --rpc URL "${url}": must be a valid URL`, 'invalid_option');
+  }
+
+  const scheme = parsed.protocol;
+  if (scheme !== 'http:' && scheme !== 'https:') {
+    throw new CliError(
+      `invalid --rpc URL "${url}": scheme must be http: or https:, got ${scheme}`,
+      'invalid_option',
+    );
+  }
+
+  // Allow http: only for localhost/127.0.0.1
+  if (scheme === 'http:') {
+    const hostname = parsed.hostname;
+    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1') {
+      throw new CliError(
+        `invalid --rpc URL "${url}": http: is only allowed for localhost, not ${hostname}`,
+        'invalid_option',
+      );
+    }
+  }
 }
 
 function networkArgs(values: ParsedOptions): {
@@ -171,9 +198,14 @@ function networkArgs(values: ParsedOptions): {
   rpc?: string | undefined;
   contract?: string | undefined;
 } {
+  const rpc = optionalString(values, 'rpc');
+  if (rpc !== undefined) {
+    validateRpcUrl(rpc);
+  }
+  
   return {
     network: optionalString(values, 'network'),
-    rpc: optionalString(values, 'rpc'),
+    rpc,
     contract: optionalString(values, 'contract'),
   };
 }
@@ -362,6 +394,10 @@ Options:
   --json               Machine-readable JSON output
   -h, --help           Show this help
 
+Error reference:
+  Contract errors are documented at:
+  https://github.com/KeyLease-Security/keylease-gateway#contract-reference
+  See the "Contract failures" section for error codes and meanings.
 Configuration:
   .keyleaserc.json in the working directory may set network, rpc, contract and
   defaultService. Precedence: flag > KEYLEASE_* environment > file > default.

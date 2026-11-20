@@ -642,9 +642,10 @@ expires_at (unix seconds), active, settled, price_paid (i128)`.
 
 PRs welcome — read [CONTRIBUTING.md](./CONTRIBUTING.md) for setup, coding
 conventions and the issue templates (trivial 100 / medium 150 / high 200
-points). Found a security issue (token forgery, quota bypass, escrow payout,
-RPC spoofing)? Follow [SECURITY.md](./SECURITY.md) instead of opening a public
-issue.
+points). Shipped and unreleased changes are tracked in
+[CHANGELOG.md](./CHANGELOG.md). Found a security issue (token forgery, quota
+bypass, escrow payout, RPC spoofing)? Follow [SECURITY.md](./SECURITY.md)
+instead of opening a public issue.
 
 ## Community
 

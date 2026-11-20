@@ -30,7 +30,8 @@ pnpm contract:build # stellar contract build -> wasm32v1-none
 > the wasm build) and the `wasm32v1-none` Rust target. CI installs both.
 
 > Stuck on a CLI code, contract trap (`Error(Contract, #n)`) or a proxy 401/403?
-> Start with the [troubleshooting guide](./docs/troubleshooting.md).
+> Start with the [troubleshooting guide](./docs/troubleshooting.md). User-facing
+> and contract changes need an entry in [CHANGELOG.md](./CHANGELOG.md).
 
 ## Your first contribution: good first issues
 

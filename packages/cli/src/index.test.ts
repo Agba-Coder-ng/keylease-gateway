@@ -283,10 +283,11 @@ describe('parseArgv', () => {
       () => parseArgv(['acquire', '--service', 'x', '--calls', '5', '--secret', SECRET]),
       'missing_option',
     );
-    expectCliError(
-      () => parseArgv(['acquire', '--service', 'x', '--calls', '5', '--duration', '60']),
-      'missing_option',
-    );
+    // --secret is now optional, so omitting it is valid
+    const valid = parseArgv(['acquire', '--service', 'x', '--calls', '5', '--duration', '60']);
+    expect(valid.command).toBe('acquire');
+    const args = (valid as { args: AcquireArgs }).args;
+    expect(args.secret).toBeUndefined();
   });
 
   it('validates numeric flags', () => {

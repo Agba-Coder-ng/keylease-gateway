@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Keypair } from '@stellar/stellar-sdk';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   acquireCommand,
   envCommand,
@@ -110,6 +110,65 @@ describe('parseConsumerSecret', () => {
     expect(() => parseConsumerSecret('password')).toThrow(/Stellar secret seed/);
   });
 });
+
+describe('resolveConsumerSecret', () => {
+  const secret = consumer.secret();
+
+  afterEach(() => {
+    delete process.env['KEYLEASE_SECRET'];
+    vi.clearAllMocks();
+  });
+
+  it('returns the flag value if provided (not "-")', async () => {
+    const result = await resolveConsumerSecret(secret);
+    expect(result).toBe(secret);
+  });
+
+  it('returns the env var if flag is not provided', async () => {
+    process.env['KEYLEASE_SECRET'] = secret;
+    const result = await resolveConsumerSecret(undefined);
+    expect(result).toBe(secret);
+  });
+
+  it('prefers flag over env var when both provided', async () => {
+    process.env['KEYLEASE_SECRET'] = 'env-secret';
+    const result = await resolveConsumerSecret(secret);
+    expect(result).toBe(secret);
+  });
+
+  it('reads from stdin if flag is "-" (ignoring env var)', async () => {
+    process.env['KEYLEASE_SECRET'] = 'env-secret';
+    const mockReadStdin = vi.fn().mockResolvedValue(secret);
+    const result = await resolveConsumerSecret('-', { readSecretFromStdin: mockReadStdin });
+    expect(result).toBe(secret);
+    expect(mockReadStdin).toHaveBeenCalledOnce();
+  });
+
+  it('reads from stdin if neither flag nor env var provided', async () => {
+    delete process.env['KEYLEASE_SECRET'];
+    const mockReadStdin = vi.fn().mockResolvedValue(secret);
+    const result = await resolveConsumerSecret(undefined, { readSecretFromStdin: mockReadStdin });
+    expect(result).toBe(secret);
+    expect(mockReadStdin).toHaveBeenCalledOnce();
+  });
+
+  it('prefers env var over stdin when flag not provided', async () => {
+    process.env['KEYLEASE_SECRET'] = secret;
+    const mockReadStdin = vi.fn();
+    const result = await resolveConsumerSecret(undefined, { readSecretFromStdin: mockReadStdin });
+    expect(result).toBe(secret);
+    expect(mockReadStdin).not.toHaveBeenCalled();
+  });
+
+  it('prefers flag over stdin even when env var is set', async () => {
+    process.env['KEYLEASE_SECRET'] = 'env-secret';
+    const mockReadStdin = vi.fn();
+    const result = await resolveConsumerSecret(secret, { readSecretFromStdin: mockReadStdin });
+    expect(result).toBe(secret);
+    expect(mockReadStdin).not.toHaveBeenCalled();
+  });
+});
+
 
 describe('acquireCommand', () => {
   it('invokes create_lease and mints a verifiable session token', async () => {

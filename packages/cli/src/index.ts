@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import {
   acquireCommand,
   envCommand,
+  resolveConsumerSecret,
   type AcquireArgs,
   type AcquireDeps,
   type EnvArgs,

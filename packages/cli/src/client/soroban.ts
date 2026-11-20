@@ -304,13 +304,16 @@ export function encodeLeaseState(state: LeaseState): xdr.ScVal {
   ]);
 }
 
-/** Validates the decimal `u64` lease id used on chain and in bearer tokens. */
+/** Validates the canonical decimal `u64` lease id used on chain and in bearer tokens.
+ *  Requires the canonical form: 0, or [1-9] followed by optional digits.
+ *  Rejects leading zeros (e.g., 00, 007) to avoid lease id collisions in comparisons and logs.
+ */
 export function parseLeaseId(leaseId: string): bigint {
-  if (!/^[0-9]+$/.test(leaseId)) {
-    throw new SorobanError(`lease id "${leaseId}" must be a decimal u64`);
+  if (!/^(0|[1-9][0-9]*)$/.test(leaseId)) {
+    throw new SorobanError(`lease id "${leaseId}" must be in canonical decimal form (0 or [1-9][0-9]*)`);
   }
   const value = BigInt(leaseId);
-  if (value <= 0n || value > 0xffff_ffff_ffff_ffffn) {
+  if (value > 0xffff_ffff_ffff_ffffn) {
     throw new SorobanError(`lease id "${leaseId}" is out of the u64 range`);
   }
   return value;
@@ -604,7 +607,10 @@ export class SorobanClient {
   /** Runs a read-only contract method through `simulateTransaction`. */
   private async simulate(method: string, args: xdr.ScVal[]): Promise<xdr.ScVal> {
     const transaction = this.build(method, args, SIMULATION_SOURCE, '0');
-    const simulation = await this.server.simulateTransaction(transaction);
+    const simulation = await withRetry(
+      () => this.server.simulateTransaction(transaction),
+      this.sleep,
+    );
     if (rpc.Api.isSimulationError(simulation)) {
       const code = contractErrorCode(simulation.error);
       throw new ContractCallError(method, code, simulation.error);
@@ -628,7 +634,10 @@ export class SorobanClient {
     const prepared = await this.server.prepareTransaction(transaction);
     prepared.sign(params.signer);
 
-    const sent = await this.server.sendTransaction(prepared);
+    const sent = await withRetry(
+      () => this.server.sendTransaction(prepared),
+      this.sleep,
+    );
     if (sent.status === 'ERROR') {
       const detail = transactionResultName(sent.errorResult?.result);
       throw new SorobanError(`${params.method} was rejected by the RPC (${sent.hash}): ${detail}`);

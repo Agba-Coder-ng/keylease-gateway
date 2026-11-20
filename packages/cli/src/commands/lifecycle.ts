@@ -28,10 +28,12 @@ export interface RevokeArgs extends TransactionArgs {
 
 export interface SettleDeps {
   createClient?: (args: SettleArgs) => Pick<SorobanClient, 'settle'>;
+  readSecretFromStdin?: () => Promise<string>;
 }
 
 export interface RevokeDeps {
   createClient?: (args: RevokeArgs) => Pick<SorobanClient, 'revoke'>;
+  readSecretFromStdin?: () => Promise<string>;
 }
 
 function defaultClient(args: TransactionArgs): SorobanClient {

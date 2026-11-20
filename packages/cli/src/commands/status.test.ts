@@ -271,3 +271,102 @@ describe('statusCommand --lease', () => {
     expect(output).not.toContain('contract');
   });
 });
+
+describe('statusCommand --lease', () => {
+  it('prints remaining calls for an active lease', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease({ callsUsed: 4, callsLimit: 10 })),
+    };
+
+    expect(
+      await statusCommand({ lease: '42', checkChain: true, json: false }, io, {
+        leaseStateProvider: provider,
+        now: () => NOW * 1000,
+      }),
+    ).toBe(0);
+
+    expect(out.join('\n')).toContain('remaining  : 6');
+  });
+
+  it('includes remainingCalls in JSON output', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease({ callsUsed: 2, callsLimit: 10 })),
+    };
+
+    expect(
+      await statusCommand({ lease: '42', checkChain: true, json: true }, io, {
+        leaseStateProvider: provider,
+        now: () => NOW * 1000,
+      }),
+    ).toBe(0);
+
+    const result = JSON.parse(out.join('\n')) as LeaseState & { remainingCalls: number };
+    expect(result.remainingCalls).toBe(8);
+  });
+
+  it('returns zero remaining for a settled lease', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease({ callsUsed: 1, callsLimit: 500, settled: true })),
+    };
+
+    expect(
+      await statusCommand({ lease: '42', checkChain: true, json: false }, io, {
+        leaseStateProvider: provider,
+        now: () => NOW * 1000,
+      }),
+    ).toBe(0);
+
+    expect(out.join('\n')).toContain('remaining  : 0');
+  });
+
+  it('returns zero remaining for an inactive lease', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease({ callsUsed: 1, callsLimit: 500, active: false })),
+    };
+
+    expect(
+      await statusCommand({ lease: '42', checkChain: true, json: false }, io, {
+        leaseStateProvider: provider,
+        now: () => NOW * 1000,
+      }),
+    ).toBe(0);
+
+    expect(out.join('\n')).toContain('remaining  : 0');
+  });
+
+  it('returns zero remaining for an expired lease', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease({ callsUsed: 1, callsLimit: 500, expiresAt: NOW - 10 })),
+    };
+
+    expect(
+      await statusCommand({ lease: '42', checkChain: true, json: false }, io, {
+        leaseStateProvider: provider,
+        now: () => NOW * 1000,
+      }),
+    ).toBe(0);
+
+    expect(out.join('\n')).toContain('remaining  : 0');
+  });
+
+  it('returns zero remaining when all calls are used', async () => {
+    const { io, out } = captureIo();
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async () => makeLease({ callsUsed: 10, callsLimit: 10 })),
+    };
+
+    expect(
+      await statusCommand({ lease: '42', checkChain: true, json: false }, io, {
+        leaseStateProvider: provider,
+        now: () => NOW * 1000,
+      }),
+    ).toBe(0);
+
+    expect(out.join('\n')).toContain('remaining  : 0');
+  });
+});

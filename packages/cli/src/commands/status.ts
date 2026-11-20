@@ -202,7 +202,6 @@ function renderState(state: LeaseState, io: CliIo, json: boolean): void {
     io.out(JSON.stringify({ ...state, pricePerCall }, null, 2));
     return;
   }
-  const expired = state.expiresAt <= Math.floor(Date.now() / 1000);
   io.out(`Lease ${state.leaseId}`);
   if (networkName !== undefined) io.out(`  network    : ${networkName}`);
   if (contractId !== undefined) io.out(`  contract   : ${contractId}`);
@@ -210,6 +209,7 @@ function renderState(state: LeaseState, io: CliIo, json: boolean): void {
   io.out(`  provider   : ${state.provider}`);
   io.out(`  consumer   : ${state.consumer}`);
   io.out(`  calls      : ${state.callsUsed}/${state.callsLimit}`);
+  io.out(`  remaining  : ${remainingCalls}`);
   io.out(`  escrow     : ${state.pricePaid} (paid into keylease-core)`);
   io.out(`  price/call : ${pricePerCall}`);
   io.out(`  expires at : ${new Date(state.expiresAt * 1000).toISOString()}${expired ? ' (expired)' : ''}`);

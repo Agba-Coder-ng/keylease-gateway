@@ -285,6 +285,165 @@ fn create_lease_allows_admin_and_gateway_as_consumers() {
 }
 
 #[test]
+fn extend_lease_grows_calls_expiry_and_escrow() {
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    h.client.use_call(&id, &3);
+
+    let original_expiry = h.client.get_lease(&id).expires_at;
+    let consumer_before = balance(&h, &h.consumer);
+    let escrow_before = balance(&h, &h.client.address);
+
+    let lease = h.client.extend_lease(&id, &5, &120);
+    assert_eq!(lease.id, id);
+    assert_eq!(lease.calls_limit, 15);
+    assert_eq!(lease.calls_used, 3);
+    assert_eq!(lease.expires_at, original_expiry + 120);
+    assert_eq!(lease.price_paid, 15_000);
+    assert!(lease.active && !lease.settled);
+    assert_eq!(balance(&h, &h.consumer), consumer_before - 5_000);
+    assert_eq!(balance(&h, &h.client.address), escrow_before + 5_000);
+    assert_eq!(h.client.remaining_calls(&id), 12);
+    assert_eq!(h.client.get_config().lease_count, 1);
+
+    // The extra calls are usable: the old limit no longer clamps `use_call`.
+    let lease = h.client.use_call(&id, &12);
+    assert_eq!(lease.calls_limit, 15);
+    assert_eq!(lease.calls_used, 15);
+    assert_eq!(h.client.remaining_calls(&id), 0);
+}
+
+#[test]
+fn extend_lease_allows_one_nonzero_dimension_and_rejects_both_zero() {
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    let original = h.client.get_lease(&id);
+
+    let err = h.client.try_extend_lease(&id, &0, &0).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidCalls);
+    assert_eq!(h.client.get_lease(&id), original);
+
+    // Duration only: no extra tokens move and the quota stays the same.
+    let consumer_before = balance(&h, &h.consumer);
+    let escrow_before = balance(&h, &h.client.address);
+    let lease = h.client.extend_lease(&id, &0, &30);
+    assert_eq!(lease.calls_limit, 10);
+    assert_eq!(lease.expires_at, original.expires_at + 30);
+    assert_eq!(lease.price_paid, 10_000);
+    assert_eq!(balance(&h, &h.consumer), consumer_before);
+    assert_eq!(balance(&h, &h.client.address), escrow_before);
+
+    // Calls only: expiry stays put while escrow and the limit grow.
+    let lease = h.client.extend_lease(&id, &2, &0);
+    assert_eq!(lease.calls_limit, 12);
+    assert_eq!(lease.expires_at, original.expires_at + 30);
+    assert_eq!(lease.price_paid, 12_000);
+    assert_eq!(balance(&h, &h.consumer), consumer_before - 2_000);
+    assert_eq!(balance(&h, &h.client.address), escrow_before + 2_000);
+}
+
+#[test]
+fn extend_lease_rejects_unknown_expired_inactive_and_settled_leases() {
+    let h = setup();
+    register(&h);
+    let err = h.client.try_extend_lease(&42, &1, &60).unwrap_err();
+    assert_eq!(err.unwrap(), Error::LeaseNotFound);
+
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    h.env.ledger().with_mut(|li| li.timestamp = 60);
+    let err = h.client.try_extend_lease(&id, &1, &60).unwrap_err();
+    assert_eq!(err.unwrap(), Error::LeaseExpired);
+
+    // A settled lease is rejected even when its clock has not advanced.
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    h.client.revoke(&id);
+    let err = h.client.try_extend_lease(&id, &1, &60).unwrap_err();
+    assert_eq!(err.unwrap(), Error::AlreadySettled);
+
+    // `active = false, settled = false` has no public writer today, but the
+    // typed branch must still reject it if storage is ever migrated there.
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    let mut lease = h.client.get_lease(&id);
+    lease.active = false;
+    lease.settled = false;
+    h.env.as_contract(&h.contract_id, || {
+        h.env
+            .storage()
+            .persistent()
+            .set(&crate::DataKey::Lease(id), &lease);
+    });
+    let err = h.client.try_extend_lease(&id, &1, &60).unwrap_err();
+    assert_eq!(err.unwrap(), Error::LeaseInactive);
+}
+
+#[test]
+fn extend_lease_uses_checked_arithmetic() {
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    let original = h.client.get_lease(&id);
+    let consumer_before = balance(&h, &h.consumer);
+    let escrow_before = balance(&h, &h.client.address);
+
+    let err = h.client.try_extend_lease(&id, &u32::MAX, &0).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidCalls);
+    let err = h.client.try_extend_lease(&id, &0, &u64::MAX).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidDuration);
+
+    // Re-price the service so the create_lease price formula itself overflows.
+    h.client
+        .register_service(&h.provider, &service_id(&h.env), &i128::MAX);
+    let err = h.client.try_extend_lease(&id, &2, &0).unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidAmount);
+
+    assert_eq!(h.client.get_lease(&id), original);
+    assert_eq!(balance(&h, &h.consumer), consumer_before);
+    assert_eq!(balance(&h, &h.client.address), escrow_before);
+}
+
+#[test]
+fn settlement_after_extension_pays_from_the_grown_escrow() {
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    h.client.use_call(&id, &4);
+    let lease = h.client.extend_lease(&id, &5, &120);
+    assert_eq!(lease.price_paid, 15_000);
+    assert_eq!(lease.calls_limit, 15);
+    let new_expiry = lease.expires_at;
+
+    h.env.ledger().with_mut(|li| li.timestamp = new_expiry);
+    let consumer_before = balance(&h, &h.consumer);
+    let lease = h.client.settle(&id);
+
+    // 15_000 × 4 / 15 = 4_000 to the provider; the other 11_000 is refunded.
+    assert_eq!(balance(&h, &h.provider), 4_000);
+    assert_eq!(balance(&h, &h.consumer), consumer_before + 11_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+    assert!(lease.settled && !lease.active);
+}
+
+#[test]
 fn use_call_accumulates_and_clamps_at_the_limit() {
     let h = setup();
     register(&h);
@@ -564,6 +723,24 @@ mod unauthorised {
     }
 
     #[test]
+    fn extend_lease_requires_the_consumer() {
+        let h = setup();
+        register(&h);
+        let id = h
+            .client
+            .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+        clear_auths(&h);
+
+        let before_consumer = balance(&h, &h.consumer);
+        let before_escrow = balance(&h, &h.client.address);
+        let err = h.client.try_extend_lease(&id, &5, &60).unwrap_err();
+        assert!(err.is_err(), "only the consumer may extend a lease");
+        assert_eq!(h.client.get_lease(&id).calls_limit, 10);
+        assert_eq!(balance(&h, &h.consumer), before_consumer);
+        assert_eq!(balance(&h, &h.client.address), before_escrow);
+    }
+
+    #[test]
     fn create_lease_requires_the_consumer() {
         let h = setup();
         register(&h);
@@ -840,6 +1017,37 @@ fn calls_committed_event_publishes_used_and_remaining() {
                 h.client.address.clone(),
                 topics(),
                 (10u32, 0u32).into_val(&h.env)
+            )],
+        ),
+    );
+}
+
+#[test]
+fn lease_extended_event_publishes_added_dimensions_and_amount() {
+    use soroban_sdk::{testutils::Events as _, IntoVal, Symbol, Vec as SVec};
+
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    h.client.extend_lease(&id, &4, &90);
+
+    assert_eq!(
+        h.env.events().all(),
+        SVec::from_array(
+            &h.env,
+            [(
+                h.client.address.clone(),
+                SVec::from_array(
+                    &h.env,
+                    [
+                        Symbol::new(&h.env, "lease_extended").into_val(&h.env),
+                        h.consumer.clone().into_val(&h.env),
+                        id.into_val(&h.env),
+                    ],
+                ),
+                (4u32, 90u64, 4_000i128).into_val(&h.env),
             )],
         ),
     );

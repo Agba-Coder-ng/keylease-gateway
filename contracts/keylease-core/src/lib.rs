@@ -413,6 +413,87 @@ impl KeyleaseCore {
         Ok(id)
     }
 
+    /// Consumer-only: extend an active, unexpired, unsettled lease.
+    ///
+    /// At least one of `extra_calls` and `extra_duration` must be positive;
+    /// both zero is rejected with `InvalidCalls`. A zero value for either
+    /// argument means "leave that dimension unchanged", so a caller can buy
+    /// more calls without changing expiry, or more time without buying calls.
+    /// The service's active flag is not re-checked: this renews an existing
+    /// lease, it does not create a new one.
+    ///
+    /// The added calls are priced exactly like `create_lease`:
+    /// `extra_calls × price_per_call`, with checked arithmetic. The amount is
+    /// pulled into the same escrow, `price_paid` grows with it, and
+    /// `calls_limit` / `expires_at` grow by the requested amounts. The lease id
+    /// and `calls_used` do not change. `AlreadySettled`, `LeaseInactive` and
+    /// `LeaseExpired` reject leases that can no longer be extended.
+    pub fn extend_lease(
+        env: Env,
+        lease_id: u64,
+        extra_calls: u32,
+        extra_duration: u64,
+    ) -> Result<Lease, Error> {
+        if extra_calls == 0 && extra_duration == 0 {
+            return Err(Error::InvalidCalls);
+        }
+
+        let mut lease = load_lease(&env, lease_id)?;
+        lease.consumer.require_auth();
+        if lease.settled {
+            return Err(Error::AlreadySettled);
+        }
+        if !lease.active {
+            return Err(Error::LeaseInactive);
+        }
+        if lease.expires_at <= env.ledger().timestamp() {
+            return Err(Error::LeaseExpired);
+        }
+
+        let config = load_config(&env)?;
+        let stored = load_service(&env, &lease.service)?;
+
+        let amount = stored
+            .price_per_call
+            .checked_mul(extra_calls as i128)
+            .ok_or(Error::InvalidAmount)?;
+        let new_calls_limit = lease
+            .calls_limit
+            .checked_add(extra_calls)
+            .ok_or(Error::InvalidCalls)?;
+        let new_expires_at = lease
+            .expires_at
+            .checked_add(extra_duration)
+            .ok_or(Error::InvalidDuration)?;
+        let new_price_paid = lease
+            .price_paid
+            .checked_add(amount)
+            .ok_or(Error::InvalidAmount)?;
+
+        if amount > 0 {
+            token::Client::new(&env, &config.token).transfer(
+                &lease.consumer,
+                &env.current_contract_address(),
+                &amount,
+            );
+        }
+
+        lease.calls_limit = new_calls_limit;
+        lease.expires_at = new_expires_at;
+        lease.price_paid = new_price_paid;
+        store_lease(&env, &lease);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "lease_extended"),
+                lease.consumer.clone(),
+                lease_id,
+            ),
+            (extra_calls, extra_duration, amount),
+        );
+        Ok(lease)
+    }
+
     /// Gateway-only: commit `count` served calls against a lease. Committing
     /// more calls than are left clamps at `calls_limit` instead of overflowing.
     ///
@@ -541,7 +622,7 @@ impl KeyleaseCore {
         load_config(&env)
     }
 
-    /// Contract ABI version (the crate version, e.g. `"0.2.0"`). Works before
+    /// Contract ABI version (the crate version, e.g. `"0.3.0"`). Works before
     /// `init`, so deploy verification can check it in one simulated call.
     pub fn version(env: Env) -> soroban_sdk::String {
         soroban_sdk::String::from_str(&env, CONTRACT_VERSION)

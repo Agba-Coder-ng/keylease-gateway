@@ -222,6 +222,7 @@ friendbot, writes `deployments.json` (public) and
 | Command | Purpose |
 | --- | --- |
 | `keylease acquire --service <id> --calls <n> --duration <secs> --secret <key>` | Invokes `create_lease` (paying the SAC token into escrow) and prints a signed session bearer token |
+| `keylease env --service <id> [--file .env] [--lease <id>]` | Writes the temporary keys of an acquired lease into a local `.env`. Selects newest unexpired lease by default, or explicit lease via `--lease <id>` |
 | `keylease acquire --service <id> --calls <n> --duration <secs> --dry-run` | Quotes the price of those calls without signing, creating a lease or storing a session |
 | `keylease env --service <id> [--file .env]` | Writes the temporary keys of an acquired lease into a local `.env` |
 | `keylease status --lease <id>` | Reads live lease state by simulating `get_lease` |
@@ -258,6 +259,10 @@ the consumer address the lease would use. Add `--json` for machine-readable
 output (`dry_run: true`, `price`, `expires_at`).
 
 `acquire` remembers the lease in `.keylease/sessions.json` (git-ignored) so
+`env` can find it later. The store maintains multiple leases per service to
+support parallel acquisitions and renewals. `env` selects the newest unexpired
+lease automatically, or use `--lease <id>` to pick a specific one. `env` then
+merges these keys, replacing existing ones and preserving everything else in the file:
 `env` can find it later. The store is a local cache with best-effort locking:
 writes are serialized within a process, guarded across processes by an
 exclusive `.keylease/sessions.json.lock` (2 s wait; a lock older than 10 s is
@@ -297,6 +302,67 @@ lease is active or expired. Add `--json` for machine-readable output, or
 `--prune` to remove expired entries. If the session store is missing, acquire a
 lease first; if it is corrupt, back it up or repair it before retrying.
 
+#### Environment file merge rule
+
+When `keylease env` writes to a `.env` file, it merges the new session keys with
+existing content according to these rules:
+
+- Matching keys are replaced in place, preserving their relative line order and
+  any `export` prefix from the original assignment
+- Duplicate assignments of the same key (whether prefixed with `export` or not)
+  are deduplicated — only the first occurrence is kept, updated with the new
+  value; subsequent duplicates are dropped
+- Non-matching lines and comments are preserved as-is
+- New keys that don't already exist are appended at the end
+- The file always ends with a single newline
+
+Example: starting with this `.env`:
+
+```bash
+export KEYLEASE_SESSION_TOKEN=old_value
+OTHER_VAR=keep_me
+KEYLEASE_SESSION_TOKEN=duplicate  # This line will be dropped
+# My comment
+```
+
+Running `keylease env --service my-api` with a new token produces:
+
+```bash
+export KEYLEASE_SESSION_TOKEN=new_value
+OTHER_VAR=keep_me
+# My comment
+KEYLEASE_SERVICE=my-api
+KEYLEASE_LEASE_ID=...
+```
+
+This ensures that stale or duplicate exported tokens cannot accidentally shadow
+the active lease credentials in shells that process both lines.
+
+#### Session store format
+
+The `.keylease/sessions.json` file stores acquired leases keyed by service id.
+Each service maps to an array of `LeaseSession` objects:
+
+```json
+{
+  "weather-api": [
+    { "leaseId": "123", "consumer": "GCC...", "token": "kls1...", ... },
+    { "leaseId": "456", "consumer": "GCC...", "token": "kls1...", ... }
+  ]
+}
+```
+
+**Multiple leases per service:** `acquire` appends new leases to the service's
+array. This supports parallel acquisitions (e.g., CI jobs) and renewals without
+losing earlier leases' remaining quota. Saving the same `leaseId` twice replaces
+that entry idempotently (e.g., on retry with updated tx hash).
+
+**Automatic migration:** If an older v1 store exists with the format
+`{ "service": LeaseSession }` (single session per service), it is automatically
+converted to v2 on first read. The migration is transparent and saves in v2 format.
+
+**Git-ignored:** `.keylease/sessions.json` contains sensitive session tokens and
+is git-ignored. Never commit it or share the tokens with untrusted parties.
 ### Configuration file
 
 `keylease` reads an optional `.keyleaserc.json` from the working directory once
@@ -475,7 +541,14 @@ Once lease verification succeeds, the call remains consumed even if the client d
 ## Deployments
 
 Nothing in this project holds mainnet value until an audit is announced (see
-[SECURITY.md](./SECURITY.md)). Current deployment status:
+[SECURITY.md](./SECURITY.md)); the concrete gates and sign-off are in
+[docs/mainnet-readiness.md](./docs/mainnet-readiness.md).
+
+Operators: [docs/runbook.md](./docs/runbook.md) covers the startup checklist,
+HTTP 5xx diagnostics, quota drift and crash recovery, gateway key rotation and
+restarting without losing calls.
+
+Current deployment status:
 
 | Component | Network / host | Address or URL |
 | --- | --- | --- |
@@ -525,6 +598,9 @@ keylease-gateway/
 │   │       └── client/soroban.ts
 │   └── proxy/                         # @keylease/proxy
 │       └── src/{index,server,verifier,quota,cache}.ts
+├── docs/
+│   ├── runbook.md                     # operator runbook: startup, 5xx, quota, rotation
+│   └── mainnet-readiness.md           # mainnet gates, solvency checks, drill, sign-off
 ├── deployments.json                   # testnet contract ids + tx hashes
 ├── .github/workflows/ci.yml           # TS: lint/build/tsc/test · Rust: cargo test + wasm
 ├── .github/workflows/security.yml     # PR malware scan (ClamAV) + dependency review
@@ -543,7 +619,7 @@ keylease-gateway/
 pnpm contract:test # cargo test: 36 contract tests
 pnpm contract:build# stellar contract build (wasm32v1-none)
 pnpm build         # tsc emit for both packages (topological order)
-pnpm test          # vitest: 213 tests (109 CLI + 104 proxy)
+pnpm test          # vitest: 213 package tests (109 CLI + 104 proxy) + PR-title rules
 pnpm lint          # eslint (flat config, typescript-eslint)
 pnpm typecheck     # build, then tsc --noEmit in every package
 ```

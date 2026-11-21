@@ -259,6 +259,9 @@ impl KeyleaseCore {
         if env.storage().instance().has(&config_key()) {
             return Err(Error::AlreadyInitialized);
         }
+        if admin == gateway {
+            return Err(Error::SameAdminAndGateway);
+        }
         admin.require_auth();
         store_config(
             &env,
@@ -297,10 +300,7 @@ impl KeyleaseCore {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
         bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "admin_proposed"), config.admin, new_admin),
-            env.ledger().timestamp(),
-        );
+        events::emit_admin_proposed(&env, &config.admin, &new_admin);
         Ok(())
     }
 
@@ -318,10 +318,7 @@ impl KeyleaseCore {
         config.admin = pending.clone();
         env.storage().instance().remove(&DataKey::PendingAdmin);
         store_config(&env, &config);
-        env.events().publish(
-            (Symbol::new(&env, "admin_changed"), pending),
-            env.ledger().timestamp(),
-        );
+        events::emit_admin_changed(&env, &pending);
         Ok(())
     }
 
@@ -537,7 +534,7 @@ impl KeyleaseCore {
     ///
     /// The `calls_committed` event keeps its
     /// `(calls_committed, consumer, lease_id)` topic tuple and publishes
-    /// `(calls_used, remaining)` so indexers do not need a second read.
+    /// `(1, calls_used, remaining)` so indexers do not need a second read.
     pub fn use_call(env: Env, lease_id: u64, count: u32) -> Result<Lease, Error> {
         let config = load_config(&env)?;
         config.gateway.require_auth();

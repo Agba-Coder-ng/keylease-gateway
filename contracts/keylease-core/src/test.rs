@@ -772,7 +772,7 @@ fn admin_transfer_emits_proposal_and_change_events() {
                         next.clone().into_val(&h.env),
                     ],
                 ),
-                h.env.ledger().timestamp().into_val(&h.env),
+                (1u32, h.env.ledger().timestamp()).into_val(&h.env),
             )],
         ),
     );
@@ -791,7 +791,7 @@ fn admin_transfer_emits_proposal_and_change_events() {
                         next.clone().into_val(&h.env),
                     ],
                 ),
-                h.env.ledger().timestamp().into_val(&h.env),
+                (1u32, h.env.ledger().timestamp()).into_val(&h.env),
             )],
         ),
     );

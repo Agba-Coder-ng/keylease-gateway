@@ -576,7 +576,7 @@ without ever printing the seed. Stored sessions are listed with their expiry.
 
 | Entry point | Auth | Description |
 | --- | --- | --- |
-| `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account |
+| `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account (`admin != gateway`) |
 | `set_gateway(gateway)` | admin | Rotate the account allowed to commit quota |
 | `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
 | `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
@@ -690,10 +690,21 @@ Events: `init`, `gateway`, `admin_proposed`, `admin_changed`,
 `(extra_calls, extra_duration, amount)` so indexers can price the top-up without
 a second read.
 
-`calls_committed` keeps its `(calls_committed, consumer, lease_id)` topic
-tuple, so existing topic filters still match, but its payload is now the pair
-`(calls_used, remaining)`. Both fields are `u32`; indexers that decoded a bare
-`calls_used` value must read the pair (or the first element).
+### Event catalogue
+
+All contract events are emitted through centralized helpers with `SCHEMA_VERSION = 1` as the first field of the data payload:
+
+| Event | Topics | Data Payload | Description |
+| --- | --- | --- | --- |
+| `init` | `[init, admin]` | `(1u32, timestamp)` | Contract initialized |
+| `gateway` | `[gateway, new_gateway]` | `(1u32, timestamp)` | Gateway account rotated |
+| `admin_proposed` | `[admin_proposed, current_admin, pending_admin]` | `(1u32, timestamp)` | Admin nomination proposed |
+| `admin_changed` | `[admin_changed, old_admin, new_admin]` | `(1u32, timestamp)` | Admin nomination accepted |
+| `service_registered` | `[service_registered, provider]` | `(1u32, service_id, price_per_call)` | Service registered or re-priced |
+| `lease_created` | `[lease_created, consumer, lease_id]` | `(1u32, service_id, calls_limit, price_paid)` | New lease created and escrow funded |
+| `calls_committed` | `[calls_committed, consumer, lease_id]` | `(1u32, calls_used, remaining)` | Calls committed by gateway |
+| `lease_revoked` | `[lease_revoked, consumer, lease_id]` | `(1u32, refund_amount)` | Lease revoked early by consumer |
+| `lease_settled` | `[lease_settled, provider, lease_id]` | `(1u32, provider_payout, consumer_refund)` | Escrow settled after expiry/exhaustion |
 
 Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 `Error(Contract, #n)`:
@@ -712,6 +723,7 @@ Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 | 9 | `AlreadySettled` | Escrow already paid out; also rejects `extend_lease` |
 | 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation; `extend_lease` uses 10 when both extension arguments are zero or `calls_limit` would overflow, 11 when expiry would overflow and 13 when the top-up price would overflow |
 | 15 | `InvalidConsumer` | `create_lease` consumer is the contract's own address |
+| 16 | `SameAdminAndGateway` | `init` rejects identical admin and gateway addresses |
 
 `extend_lease` reuses the existing typed errors rather than adding a variant:
 code 5 for an unknown lease, 6 for an inactive lease, 7 for an expired lease and

@@ -17,6 +17,7 @@ pnpm build          # tsc emit for both packages
 pnpm test           # vitest: package suites + the PR-title rules in scripts/
 pnpm lint           # eslint
 pnpm typecheck      # build + tsc --noEmit
+pnpm test:e2e       # scripted end-to-end flow: proxy + simulated soroban network
 
 # contract (needs Rust + stellar-cli)
 pnpm contract:test  # cargo test (22 tests)
@@ -336,36 +337,37 @@ the expected failure mode.
 - Keep tests deterministic: inject a fake `clock`, a fake `SorobanRpc` and a
   fake committer instead of sleeping or hitting the network.
 
-## Test coverage thresholds
+## CI Matrix and Node.js support
 
-`pnpm test` executes Vitest with v8 coverage enabled and fails builds if per-package floors are not met:
+CI tests the full TypeScript test suite across all supported LTS and current Node.js release lines:
+- **Node 20** (Active LTS)
+- **Node 22** (Active LTS)
+- **Node 24** (Current)
 
-| Package | Lines | Branches | Functions | Statements |
-| --- | --- | --- | --- | --- |
-| `@keylease/cli` | 80% | 75% | 75% | 80% |
-| `@keylease/proxy` | 85% | 80% | 85% | 85% |
+All pull requests must pass across the full matrix. Caching for `pnpm` dependencies is segregated per Node version.
 
-### Raising thresholds
-When adding features or improving test suites, coverage should not regress. If new test coverage raises the package average, raise the corresponding thresholds in `packages/*/vitest.config.ts` to lock in the gains. Threshold reductions require explicit maintainer approval in the PR.
+## Code review routing (CODEOWNERS)
 
-### Excluded files
-- Operational deployment scripts (`packages/cli/scripts/**`) are excluded from coverage calculations because they execute manual testnet rollout steps rather than runtime CLI library logic.
-- Generated code and build output (`dist/**`) and test files themselves (`src/**/*.test.ts`) are excluded.
+To protect critical security boundaries, GitHub automatically requests reviews from maintainers (`.github/CODEOWNERS`) when pull requests touch:
+- `/contracts/`: Soroban smart contract logic (escrow, settlement, authorization)
+- `/.github/workflows/`: CI/CD automation and security check pipelines
+- `/SECURITY.md`: Vulnerability disclosure and reporting policies
+- `/packages/proxy/src/verifier.ts` and `/packages/proxy/src/quota.ts`: Token verification and quota tracking
 
-## Security analysis & CodeQL triage
+## Stale issue and PR lifecycle
 
-CodeQL static analysis runs automatically on all pull requests targeting `main` and on a weekly Sunday schedule, covering both TypeScript packages and the Rust contract crate.
+To keep the backlog actionable for contributors:
+- Issues and PRs with no activity for **60 days** are automatically marked as `stale`.
+- If no activity occurs within a **14-day grace period**, stale items are closed.
+- Posting a comment or pushing a commit removes the `stale` label and resets the timer.
+- Issues labeled `security`, `help wanted`, or `pinned` are exempt from stale management.
 
-### Triaging CodeQL alerts
-1. Inspect the alert details under the repository's **Security > Code scanning** tab.
-2. If the alert identifies a valid flaw (e.g. unhandled error path, prototype injection, or arithmetic issue), write a reproduction test and address the root cause in a PR.
-3. If the alert is a false positive or intentional design pattern, dismiss the alert with a clear rationale referencing the relevant architecture or threat model.
+## Documentation link verification
 
-## Dependency updates (Dependabot)
-
-Dependabot is configured via `.github/dependabot.yml` to check for updates weekly on Mondays across three ecosystems:
-- **npm**: root pnpm workspace (`@keylease/cli` and `@keylease/proxy`)
-- **cargo**: contract crate (`contracts/keylease-core`)
-- **github-actions**: GitHub Actions workflow dependencies
-
-Minor and patch updates are grouped into single pull requests per ecosystem to minimize PR fatigue while ensuring fast dependency upgrades.
+Documentation links are checked automatically on pull requests touching markdown files via [Lychee](https://github.com/lycheeverse/lychee):
+- Flaky or anti-bot protected domains (such as `stellar.expert` and badge services) are excluded in `.lycheeignore`.
+- You can run the link checker locally before submitting docs:
+  ```bash
+  # Using lychee CLI or docker
+  lychee '**/*.md'
+  ```

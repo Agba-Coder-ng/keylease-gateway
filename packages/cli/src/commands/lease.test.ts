@@ -35,8 +35,6 @@ function captureIo(): { io: CliIo; out: string[]; err: string[] } {
   };
 }
 
-function memoryStore(initial: Record<string, LeaseSession[]> = {}) {
-  const sessions: Record<string, LeaseSession[]> = { ...initial };
 /**
  * Minimal POSIX-shell reader for the `KEY=VALUE` lines `mergeEnv` writes:
  * bare words are read literally, double-quoted values honour the `\\`, `\"`
@@ -78,8 +76,8 @@ function parseSourcedEnv(text: string): Record<string, string> {
   return env;
 }
 
-function memoryStore(initial: Record<string, LeaseSession> = {}) {
-  const sessions: Record<string, LeaseSession> = { ...initial };
+function memoryStore(initial: Record<string, LeaseSession[]> = {}) {
+  const sessions: Record<string, LeaseSession[]> = { ...initial };
   return {
     sessions,
     load: async () => sessions,
@@ -87,17 +85,33 @@ function memoryStore(initial: Record<string, LeaseSession> = {}) {
       if (!sessions[session.service]) {
         sessions[session.service] = [];
       }
-      const idx = sessions[session.service].findIndex((s) => s.leaseId === session.leaseId);
+      const list = sessions[session.service]!;
+      const idx = list.findIndex((s) => s.leaseId === session.leaseId);
       if (idx >= 0) {
-        sessions[session.service][idx] = session;
+        list[idx] = session;
       } else {
-        sessions[session.service].push(session);
+        list.push(session);
       }
     },
     saveAll: async (next: Record<string, LeaseSession[]>) => {
       for (const service of Object.keys(sessions)) delete sessions[service];
       Object.assign(sessions, next);
     },
+  };
+}
+
+function session(overrides: Partial<LeaseSession> = {}): LeaseSession {
+  return {
+    service: 'weather-api',
+    leaseId: '42',
+    consumer: consumer.publicKey(),
+    token: 'kls1.abc.def',
+    callsLimit: 3,
+    issuedAt: NOW,
+    expiresAt: NOW + 600,
+    txHash: null,
+    network: 'testnet',
+    ...overrides,
   };
 }
 
@@ -666,7 +680,7 @@ describe('mergeEnv', () => {
     expect(merged).toContain('KEYLEASE_SESSION_TOKEN=kls1.new');
     expect(merged).toContain('OTHER_VAR=value');
     expect(merged).toContain('export OTHER_EXPORTED=data');
-    expect(merged).not.toContain('KEYLEASE_LEASE_ID');
+    expect(merged).toContain('KEYLEASE_LEASE_ID=lease-old');
   });
 
   it('handles trailing comments after values', () => {
@@ -674,6 +688,8 @@ describe('mergeEnv', () => {
     const merged = mergeEnv(existing, { A: 'new' });
     // Note: mergeEnv captures everything after = as the value, including comments
     expect(merged).toBe('A=new # this is a comment\nB=value\n');
+  });
+
   it('quotes values in place when replacing an existing key', () => {
     expect(mergeEnv('KEYLEASE_SERVICE=old\n', { KEYLEASE_SERVICE: 'new id' })).toBe(
       'KEYLEASE_SERVICE="new id"\n',
@@ -859,25 +875,32 @@ describe('envCommand', () => {
     expect(code).toBe(1);
     expect(err.join('\n')).toContain('no valid lease found');
     expect(err.join('\n')).toContain('all 2 leases expired');
+  });
+
   it('quotes a service id that would break a sourced .env', async () => {
     const target = join(dir, '.env');
     const { io } = captureIo();
     const store = memoryStore({
-      'weather api #1': {
-        service: 'weather api #1',
-        leaseId: 'lease-xyz',
-        consumer: consumer.publicKey(),
-        token: 'kls1.abc.def',
-        callsLimit: 3,
-        issuedAt: NOW,
-        expiresAt: NOW + 600,
-        txHash: null,
-        network: 'testnet',
-      },
+      'weather api #1': [
+        {
+          service: 'weather api #1',
+          leaseId: 'lease-xyz',
+          consumer: consumer.publicKey(),
+          token: 'kls1.abc.def',
+          callsLimit: 3,
+          issuedAt: NOW,
+          expiresAt: NOW + 600,
+          txHash: null,
+          network: 'testnet',
+        },
+      ],
     });
 
     expect(
-      await envCommand({ service: 'weather api #1', file: target, json: false }, io, { store }),
+      await envCommand({ service: 'weather api #1', file: target, json: false }, io, {
+        store,
+        now: () => NOW_MS,
+      }),
     ).toBe(0);
 
     const written = await readFile(target, 'utf8');
@@ -912,6 +935,40 @@ describe('envCommand', () => {
     const written = await readFile(target, 'utf8');
     expect(written).toContain('EXISTING=value');
     expect(written).toContain('KEYLEASE_SERVICE=weather-api');
+  });
+
+  it('tightens an existing 0644 .env to 0600 on write', async () => {
+    const target = join(dir, '.env');
+    const { io } = captureIo();
+    const store = memoryStore({ 'weather-api': session() });
+    await writeFile(target, 'EXISTING=value\n', { mode: 0o644 });
+    const { chmod } = await import('node:fs/promises');
+    await chmod(target, 0o644);
+
+    expect(await envCommand({ service: 'weather-api', file: target, json: false }, io, { store })).toBe(0);
+
+    const mode = (await stat(target)).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  it('does not fail the command when chmod is unsupported', async () => {
+    const target = join(dir, '.env');
+    const { io } = captureIo();
+    const store = memoryStore({ 'weather-api': session() });
+
+    const code = await envCommand(
+      { service: 'weather-api', file: target, json: false },
+      io,
+      {
+        store,
+        chmod: async () => {
+          throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+        },
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(await readFile(target, 'utf8')).toContain('KEYLEASE_LEASE_ID=42');
   });
 
   it('fails when no lease exists for the service', async () => {
@@ -1212,7 +1269,7 @@ describe('fileSessionStore', () => {
     await saving;
 
     const reloaded = await fileSessionStore(dir).load();
-    expect(reloaded['weather-api']?.leaseId).toBe('lease-1');
+    expect(reloaded['weather-api']?.[0]?.leaseId).toBe('lease-1');
   });
 
   it('surfaces a clear error when the lock stays held', async () => {
@@ -1237,14 +1294,14 @@ describe('fileSessionStore', () => {
       sessionFor('weather-api', 'lease-1'),
     );
     const reloaded = await fileSessionStore(dir).load();
-    expect(reloaded['weather-api']?.leaseId).toBe('lease-1');
+    expect(reloaded['weather-api']?.[0]?.leaseId).toBe('lease-1');
   });
 
   it('serializes saveAll with concurrent saves', async () => {
     const store = fileSessionStore(dir);
     await store.save(sessionFor('weather-api', 'lease-1'));
     await Promise.all([
-      store.saveAll({ 'weather-api': sessionFor('weather-api', 'lease-1') }),
+      store.saveAll({ 'weather-api': [sessionFor('weather-api', 'lease-1')] }),
       store.save(sessionFor('maps-api', 'lease-2')),
     ]);
     const reloaded = await fileSessionStore(dir).load();

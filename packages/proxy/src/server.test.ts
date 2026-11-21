@@ -62,10 +62,18 @@ function stubFetch(
 }
 
 function okJson(body: unknown, init: ResponseInit = {}): Response {
-  return new Response(JSON.stringify(body), {
+  const json = JSON.stringify(body);
+  const headers = new Headers(init.headers);
+  if (!headers.has('content-type')) {
+    headers.set('content-type', 'application/json');
+  }
+  if (!headers.has('content-length')) {
+    headers.set('content-length', String(Buffer.byteLength(json)));
+  }
+  return new Response(json, {
     status: 200,
-    headers: { 'content-type': 'application/json' },
     ...init,
+    headers,
   });
 }
 
@@ -1470,6 +1478,22 @@ describe('buildUpstreamHeaders property test (request-smuggling vectors)', () =>
         'Bearer t',
       );
     }
+  });
+
+  it('filters through allowedHeaders when configured', () => {
+    const out = buildUpstreamHeaders(
+      {
+        accept: 'text/html',
+        'x-custom': 'allowed',
+        'x-other': 'denied',
+        authorization: 'Bearer kls1.a.b',
+      },
+      { allowedHeaders: ['accept', 'x-custom'] },
+    );
+    expect(out).toEqual({
+      accept: 'text/html',
+      'x-custom': 'allowed',
+    });
   });
 
   it('is deterministic for a given seed', () => {

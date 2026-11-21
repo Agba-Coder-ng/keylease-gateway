@@ -552,6 +552,34 @@ export class SorobanClient {
     return parseLeaseState(returnValue, leaseId);
   }
 
+  /** Consumer-side release / refund of an expired lease. */
+  async release(
+    leaseId: string,
+    consumer: Keypair,
+  ): Promise<{ leaseId: string; refunded: number; txHash: string; lease: LeaseState }> {
+    const id = parseLeaseId(leaseId);
+    try {
+      const { returnValue, txHash } = await this.invoke({
+        signer: consumer,
+        method: 'revoke_expired_lease',
+        args: [nativeToScVal(id, { type: 'u64' })],
+      });
+      if (!returnValue) throw new SorobanError('revoke_expired_lease returned no lease');
+      const lease = parseLeaseState(returnValue, leaseId);
+      const paidOut =
+        lease.callsLimit === 0
+          ? 0
+          : Math.floor((lease.pricePaid * lease.callsUsed) / lease.callsLimit);
+      const refunded = lease.pricePaid - paidOut;
+      return { leaseId, refunded, txHash, lease };
+    } catch (error) {
+      if (error instanceof ContractCallError && error.code === 5) {
+        throw new LeaseNotFoundError(leaseId);
+      }
+      throw error;
+    }
+  }
+
   /** Provider-side service registration / price update. */
   async registerService(
     provider: Keypair,

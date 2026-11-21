@@ -13,6 +13,7 @@ import {
 } from './commands/lease.js';
 import { statusCommand, type StatusArgs, type StatusDeps } from './commands/status.js';
 import {
+  releaseCommand,
   revokeCommand,
   settleCommand,
   useCallCommand,
@@ -65,6 +66,7 @@ export type CommandName =
   | 'status'
   | 'settle'
   | 'revoke'
+  | 'release'
   | 'sessions'
   | 'completions';
 
@@ -76,6 +78,7 @@ export type Invocation =
   | { command: 'status'; args: StatusArgs }
   | { command: 'settle'; args: SettleArgs }
   | { command: 'revoke'; args: RevokeArgs }
+  | { command: 'release'; args: ReleaseArgs }
   | { command: 'sessions'; args: SessionsArgs }
   | { command: 'completions'; args: CompletionsArgs };
 
@@ -407,6 +410,18 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
         },
       };
     }
+    case 'release': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'release',
+        args: {
+          ...networkArgs(values),
+          lease: requireString(values, 'lease'),
+          secret: requireString(values, 'secret'),
+          json: values.json === true,
+        },
+      };
+    }
     case 'sessions': {
       ensureNoPositionals(positionals);
       return {
@@ -434,7 +449,7 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
     }
     default:
       throw new CliError(
-        `unknown command "${rawCommand}" (expected acquire, env, status, settle, revoke, sessions or completions)`,
+        `unknown command "${rawCommand}" (expected acquire, env, status, settle, revoke, release, sessions or completions)`,
         'unknown_command',
       );
   }
@@ -459,6 +474,7 @@ Commands:
   status      Inspect an on-chain lease, or verify a session token offline
   settle      Settle an expired/exhausted lease: pay the provider, refund the consumer
   revoke      End a lease early and refund its unused calls
+  release     Release an expired lease to claim the consumer refund
   sessions    List locally stored leases or prune expired entries
   completions Print a bash, zsh or fish completion script
 

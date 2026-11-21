@@ -19,7 +19,8 @@
 //! Amounts are in the token's smallest unit (stroops for the native SAC).
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, BytesN,
+    ContractExecutable, Env, Symbol, Vec,
 };
 
 /// Contract ABI version burned into the wasm. Taken from `Cargo.toml` at
@@ -40,12 +41,10 @@ const MIN_TTL: u32 = DAY_IN_LEDGERS * 7;
 /// Extend it to a month.
 const EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 
-/// Maximum calls allowed per single lease (1,000,000 calls).
-pub const MAX_CALLS: u32 = 1_000_000;
-/// Maximum lease duration in seconds (365 days = 31,536,000 seconds).
-pub const MAX_DURATION: u64 = 31_536_000;
-/// Maximum page size when listing services.
-pub const MAX_SERVICE_PAGE_SIZE: u32 = 50;
+/// Largest page `get_consumer_leases` returns. A larger `limit` is clamped to
+/// this value, so one call reads at most this many index entries (plus the
+/// count) and stays well inside the per-transaction read budget.
+pub const MAX_CONSUMER_LEASES_PAGE: u32 = 50;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -67,6 +66,8 @@ pub enum Error {
     Unauthorized = 14,
     /// `create_lease` was called with the contract itself as consumer.
     InvalidConsumer = 15,
+    /// `settle_many` was called with more IDs than `MAX_SETTLE_BATCH`.
+    BatchTooLarge = 16,
 }
 
 #[contracttype]
@@ -88,6 +89,8 @@ pub struct Service {
     /// Price of a single API call, in token smallest units.
     pub price_per_call: i128,
     pub active: bool,
+    /// Number of leases ever created for this service.
+    pub lease_count: u64,
 }
 
 #[contracttype]
@@ -115,8 +118,23 @@ pub enum DataKey {
     PendingAdmin,
     Service(soroban_sdk::String),
     Lease(u64),
-    /// List of registered service IDs in insertion order (append-only).
-    ServiceList,
+    /// Number of leases ever created by a consumer (`u32`). Together with
+    /// `ConsumerLease` this forms the consumer's append-only lease index.
+    ConsumerLeases(Address),
+    /// Lease id at zero-based `position` in a consumer's index (`u64`).
+    /// One entry per lease keeps `create_lease` O(1) and page reads
+    /// O(limit) no matter how many leases a consumer accumulates.
+    ConsumerLease(Address, u32),
+}
+
+/// Published by `upgrade`: topics `(contract_updated, admin)`, data
+/// `new_wasm_hash`. Same wire shape as the other events in this contract.
+#[contractevent(topics = ["contract_updated"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpdated {
+    #[topic]
+    pub admin: Address,
+    pub new_wasm_hash: BytesN<32>,
 }
 
 #[contract]
@@ -157,6 +175,25 @@ fn store_config(env: &Env, config: &Config) {
     bump_instance_ttl(env);
 }
 
+/// Validates that a service identifier is non-empty, at most `MAX_SERVICE_LEN` bytes,
+/// and contains only ASCII alphanumeric characters, hyphens, underscores, or dots.
+pub fn validate_service_id(service: &soroban_sdk::String) -> Result<(), Error> {
+    let len = service.len();
+    if !(MIN_SERVICE_LEN..=MAX_SERVICE_LEN).contains(&len) {
+        return Err(Error::InvalidService);
+    }
+    let mut buf = [0u8; MAX_SERVICE_LEN as usize];
+    let slice = &mut buf[..len as usize];
+    service.copy_into_slice(slice);
+    for &b in slice.iter() {
+        let is_allowed = matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.');
+        if !is_allowed {
+            return Err(Error::InvalidService);
+        }
+    }
+    Ok(())
+}
+
 fn load_service(env: &Env, service: &soroban_sdk::String) -> Result<Service, Error> {
     let key = DataKey::Service(service.clone());
     let stored = env
@@ -185,36 +222,33 @@ fn store_lease(env: &Env, lease: &Lease) {
     bump_persistent_ttl(env, &key);
 }
 
-fn load_service_list(env: &Env) -> soroban_sdk::Vec<soroban_sdk::String> {
-    let key = DataKey::ServiceList;
-    if let Some(list) = env.storage().persistent().get(&key) {
-        bump_persistent_ttl(env, &key);
-        list
-    } else {
-        soroban_sdk::Vec::new(env)
+/// Number of entries in `consumer`'s lease index (`0` if they never leased).
+fn consumer_lease_count(env: &Env, consumer: &Address) -> u32 {
+    let key = DataKey::ConsumerLeases(consumer.clone());
+    match env.storage().persistent().get::<_, u32>(&key) {
+        Some(count) => {
+            bump_persistent_ttl(env, &key);
+            count
+        }
+        None => 0,
     }
 }
 
-fn store_service_list(env: &Env, list: &soroban_sdk::Vec<soroban_sdk::String>) {
-    let key = DataKey::ServiceList;
-    env.storage().persistent().set(&key, list);
-    bump_persistent_ttl(env, &key);
-}
+/// Appends `lease_id` to `consumer`'s index: one new position entry plus the
+/// updated count. Runs inside `create_lease`, so it commits or rolls back
+/// together with the lease itself.
+fn append_consumer_lease(env: &Env, consumer: &Address, lease_id: u64) -> Result<(), Error> {
+    let position = consumer_lease_count(env, consumer);
+    let next = position.checked_add(1).ok_or(Error::InvalidAmount)?;
 
-/// Calculates the provider payout and consumer refund for a lease.
-///
-/// Truncation remainder (rounding dust) is awarded to the consumer refund:
-/// `payable = price_paid * calls_used / calls_limit`
-/// `refund = price_paid - payable`
-///
-/// This guarantees `payable + refund == price_paid` in all cases.
-pub fn calculate_payout(price_paid: i128, calls_used: u32, calls_limit: u32) -> (i128, i128) {
-    if calls_limit == 0 {
-        return (0, price_paid);
-    }
-    let payable = price_paid.checked_mul(calls_used as i128).unwrap_or(0) / (calls_limit as i128);
-    let refund = price_paid.saturating_sub(payable);
-    (payable, refund)
+    let entry = DataKey::ConsumerLease(consumer.clone(), position);
+    env.storage().persistent().set(&entry, &lease_id);
+    bump_persistent_ttl(env, &entry);
+
+    let count = DataKey::ConsumerLeases(consumer.clone());
+    env.storage().persistent().set(&count, &next);
+    bump_persistent_ttl(env, &count);
+    Ok(())
 }
 
 #[contractimpl]
@@ -291,7 +325,41 @@ impl KeyleaseCore {
         Ok(())
     }
 
-    /// Provider-only: register or update a priced service.
+    /// Admin-only: replace this contract's wasm with `new_wasm_hash`.
+    ///
+    /// The contract address, its instance storage (config, pending admin) and
+    /// every persistent entry (services, leases, consumer lease indexes, and
+    /// the escrowed token balance) stay where they are: only the executable
+    /// changes. The new wasm must already be uploaded to the ledger, otherwise
+    /// the host traps and nothing changes. The swap takes effect once this
+    /// invocation completes successfully, so the `contract_updated` event
+    /// (`(contract_updated, admin)` topics, `new_wasm_hash` data) is only ever
+    /// observed for an upgrade that actually happened.
+    ///
+    /// Only a plain wasm hash is accepted: executable references are not, so
+    /// an upgrade can never hand control of the code to another account.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        env.deployer()
+            .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
+        ContractUpdated {
+            admin: config.admin,
+            new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Provider-only: register a new priced service or re-price your own.
+    ///
+    /// A service id belongs to the provider that first registered it. Calling
+    /// this for an id registered by a *different* provider fails with
+    /// `Unauthorized` and leaves the stored service untouched, so nobody can
+    /// take over another provider's name, price or future lease payouts. The
+    /// owner may call it again to update the price (which also marks the
+    /// service active, as before). Existing leases are never touched: each one
+    /// snapshots its provider and escrowed price at creation.
     pub fn register_service(
         env: Env,
         provider: Address,
@@ -300,17 +368,23 @@ impl KeyleaseCore {
     ) -> Result<Service, Error> {
         load_config(&env)?;
         provider.require_auth();
+        validate_service_id(&service)?;
         if price_per_call <= 0 {
             return Err(Error::InvalidPrice);
+        }
+        let key = DataKey::Service(service.clone());
+        if let Some(existing) = env.storage().persistent().get::<_, Service>(&key) {
+            if existing.provider != provider {
+                return Err(Error::Unauthorized);
+            }
         }
         let stored = Service {
             provider: provider.clone(),
             service: service.clone(),
             price_per_call,
             active: true,
+            lease_count,
         };
-        let key = DataKey::Service(service.clone());
-        let is_new = !env.storage().persistent().has(&key);
         env.storage().persistent().set(&key, &stored);
         bump_persistent_ttl(&env, &key);
 
@@ -357,6 +431,7 @@ impl KeyleaseCore {
         service: soroban_sdk::String,
         active: bool,
     ) -> Result<Service, Error> {
+        load_config(&env)?;
         provider.require_auth();
         let mut stored = load_service(&env, &service)?;
         if stored.provider != provider {
@@ -404,15 +479,24 @@ impl KeyleaseCore {
         if calls == 0 || calls > MAX_CALLS {
             return Err(Error::InvalidCalls);
         }
-        if duration == 0 || duration > MAX_DURATION {
+        if duration == 0 || duration > MAX_LEASE_DURATION {
             return Err(Error::InvalidDuration);
         }
+        let expires_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(duration)
+            .ok_or(Error::InvalidDuration)?;
 
         let mut config = load_config(&env)?;
-        let stored = load_service(&env, &service)?;
+        let mut stored = load_service(&env, &service)?;
         if !stored.active {
             return Err(Error::ServiceInactive);
         }
+        stored.lease_count = stored.lease_count.saturating_add(1);
+        let service_key = DataKey::Service(service.clone());
+        env.storage().persistent().set(&service_key, &stored);
+        bump_persistent_ttl(&env, &service_key);
 
         let amount = stored
             .price_per_call
@@ -433,12 +517,13 @@ impl KeyleaseCore {
             consumer: consumer.clone(),
             calls_limit: calls,
             calls_used: 0,
-            expires_at: env.ledger().timestamp() + duration,
+            expires_at,
             active: true,
             settled: false,
             price_paid: amount,
         };
         store_lease(&env, &lease);
+        append_consumer_lease(&env, &consumer, id)?;
 
         env.events().publish(
             (Symbol::new(&env, "lease_created"), consumer, id),
@@ -560,6 +645,27 @@ impl KeyleaseCore {
         Ok(lease)
     }
 
+    /// Permissionless: settle a batch of expired or exhausted leases.
+    ///
+    /// Bounded by `MAX_SETTLE_BATCH = 50`. Returns a list of settled leases.
+    /// Leases that are not yet settleable (active and unexpired) or already
+    /// settled are skipped so valid settlements in the batch still succeed.
+    pub fn settle_many(
+        env: Env,
+        ids: soroban_sdk::Vec<u64>,
+    ) -> Result<soroban_sdk::Vec<Lease>, Error> {
+        if ids.len() > MAX_SETTLE_BATCH {
+            return Err(Error::BatchTooLarge);
+        }
+        let mut settled = soroban_sdk::Vec::new(&env);
+        for id in ids.iter() {
+            if let Ok(lease) = Self::settle(env.clone(), id) {
+                settled.push_back(lease);
+            }
+        }
+        Ok(settled)
+    }
+
     /// Live lease state.
     pub fn get_lease(env: Env, lease_id: u64) -> Result<Lease, Error> {
         load_lease(&env, lease_id)
@@ -568,6 +674,35 @@ impl KeyleaseCore {
     /// Registered service, including its price per call.
     pub fn get_service(env: Env, service: soroban_sdk::String) -> Result<Service, Error> {
         load_service(&env, &service)
+    }
+
+    /// One page of the lease ids `consumer` created, oldest first.
+    ///
+    /// * Ordering: ascending creation order, which is also ascending lease id.
+    ///   The index is append-only, so a page never shifts once written.
+    /// * `start` is a zero-based offset into that list; `limit` is the page
+    ///   size. A `limit` above `MAX_CONSUMER_LEASES_PAGE` is clamped to it, and
+    ///   `limit == 0` or a `start` at or past the end returns an empty page.
+    ///   To walk everything, keep calling with `start += page.len()` until a
+    ///   page comes back shorter than the requested (clamped) limit.
+    /// * Settled and revoked leases stay listed; read `get_lease` for status.
+    pub fn get_consumer_leases(env: Env, consumer: Address, start: u32, limit: u32) -> Vec<u64> {
+        let mut page = Vec::new(&env);
+        let total = consumer_lease_count(&env, &consumer);
+        if start >= total {
+            return page;
+        }
+        let end = start
+            .saturating_add(limit.min(MAX_CONSUMER_LEASES_PAGE))
+            .min(total);
+        for position in start..end {
+            let key = DataKey::ConsumerLease(consumer.clone(), position);
+            if let Some(id) = env.storage().persistent().get::<_, u64>(&key) {
+                bump_persistent_ttl(&env, &key);
+                page.push_back(id);
+            }
+        }
+        page
     }
 
     /// Contract configuration plus the number of leases ever created.

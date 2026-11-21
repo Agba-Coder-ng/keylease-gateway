@@ -719,7 +719,10 @@ code 5 for an unknown lease, 6 for an inactive lease, 7 for an expired lease and
 [docs/troubleshooting.md](./docs/troubleshooting.md#contract-errors-errorcontract-n).
 
 Escrow invariant: the contract only ever pays out `price_paid` once per lease,
-split as `used/total` to the provider and `(total-used)/total` to the consumer.
+split as `used/total` to the provider and `price_paid - payable` to the consumer.
+Both `settle` and `revoke` share the same `calculate_payout` helper; any rounding
+dust from integer division truncation is awarded to the consumer refund,
+guaranteeing `payable + refund == price_paid`.
 
 ---
 

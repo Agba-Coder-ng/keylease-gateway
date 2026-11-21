@@ -567,3 +567,22 @@ describe('ContractCallError', () => {
     expect(error.method).toBe('get_lease');
   });
 });
+
+describe('SorobanClient.listServices', () => {
+  it('unwraps returned array of service strings', async () => {
+    const fakeServer = {
+      simulateTransaction: async () => ({
+        result: {
+          retval: nativeToScVal(['service-a', 'service-b']),
+        },
+      }),
+    } as unknown as SorobanRpc;
+    const client = new SorobanClient({
+      server: fakeServer,
+      contractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4',
+      networkPassphrase: 'Test SDF Network ; September 2015',
+    });
+    const services = await client.listServices(0, 10);
+    expect(services).toEqual(['service-a', 'service-b']);
+  });
+});

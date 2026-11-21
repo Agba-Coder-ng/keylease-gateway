@@ -596,6 +596,17 @@ export class SorobanClient {
     return parseServiceState(retval);
   }
 
+  /** Returns a page of registered service IDs by simulating `list_services`. */
+  async listServices(start = 0, limit = 50): Promise<string[]> {
+    const retval = await this.simulate('list_services', [
+      nativeToScVal(start, { type: 'u32' }),
+      nativeToScVal(limit, { type: 'u32' }),
+    ]);
+    const native = scValToNative(retval);
+    if (!Array.isArray(native)) return [];
+    return native.map((s) => String(s));
+  }
+
   /** Price of `calls` calls on `service`, in token smallest units. */
   async quote(service: string, calls: number): Promise<number> {
     if (!Number.isInteger(calls) || calls <= 0) {

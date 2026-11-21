@@ -337,6 +337,36 @@ describe('parseArgv', () => {
         ]),
       'invalid_option',
     );
+    expectCliError(
+      () =>
+        parseArgv([
+          'acquire',
+          '--service',
+          'x',
+          '--calls',
+          '1000001',
+          '--duration',
+          '60',
+          '--secret',
+          SECRET,
+        ]),
+      'invalid_option',
+    );
+    expectCliError(
+      () =>
+        parseArgv([
+          'acquire',
+          '--service',
+          'x',
+          '--calls',
+          '5',
+          '--duration',
+          '31536001',
+          '--secret',
+          SECRET,
+        ]),
+      'invalid_option',
+    );
     // A negative value in token position is read as flags, still a usage error.
     expectCliError(
       () =>

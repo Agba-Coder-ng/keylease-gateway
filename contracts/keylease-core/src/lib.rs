@@ -155,7 +155,9 @@ fn bump_instance_ttl(env: &Env) {
 }
 
 fn bump_persistent_ttl(env: &Env, key: &DataKey) {
-    env.storage().persistent().extend_ttl(key, MIN_TTL, EXTEND_TO);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, MIN_TTL, EXTEND_TO);
 }
 
 fn load_config(env: &Env) -> Result<Config, Error> {
@@ -267,10 +269,8 @@ impl KeyleaseCore {
                 lease_count: 0,
             },
         );
-        env.events().publish(
-            (Symbol::new(&env, "init"), admin),
-            env.ledger().timestamp(),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "init"), admin), env.ledger().timestamp());
         Ok(())
     }
 
@@ -280,8 +280,10 @@ impl KeyleaseCore {
         config.admin.require_auth();
         config.gateway = gateway.clone();
         store_config(&env, &config);
-        env.events()
-            .publish((Symbol::new(&env, "gateway"), gateway), env.ledger().timestamp());
+        env.events().publish(
+            (Symbol::new(&env, "gateway"), gateway),
+            env.ledger().timestamp(),
+        );
         Ok(())
     }
 
@@ -385,11 +387,41 @@ impl KeyleaseCore {
         };
         env.storage().persistent().set(&key, &stored);
         bump_persistent_ttl(&env, &key);
+
+        if is_new {
+            let mut list = load_service_list(&env);
+            list.push_back(service.clone());
+            store_service_list(&env, &list);
+        }
+
         env.events().publish(
             (Symbol::new(&env, "service_registered"), provider),
             (service, price_per_call),
         );
         Ok(stored)
+    }
+
+    /// Returns a paginated list of registered service IDs.
+    ///
+    /// Service IDs are append-only and returned in registration order.
+    /// The page size is clamped to `MAX_SERVICE_PAGE_SIZE = 50`.
+    pub fn list_services(
+        env: Env,
+        start: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<soroban_sdk::String> {
+        let list = load_service_list(&env);
+        let limit = limit.min(MAX_SERVICE_PAGE_SIZE);
+        let total = list.len();
+        let mut result = soroban_sdk::Vec::new(&env);
+        if start >= total || limit == 0 {
+            return result;
+        }
+        let end = (start + limit).min(total);
+        for i in start..end {
+            result.push_back(list.get(i).unwrap());
+        }
+        result
     }
 
     /// Provider-only: pause or resume a service.
@@ -444,7 +476,7 @@ impl KeyleaseCore {
             return Err(Error::InvalidConsumer);
         }
         consumer.require_auth();
-        if calls == 0 {
+        if calls == 0 || calls > MAX_CALLS {
             return Err(Error::InvalidCalls);
         }
         if duration == 0 || duration > MAX_LEASE_DURATION {
@@ -521,11 +553,18 @@ impl KeyleaseCore {
             return Err(Error::LeaseExpired);
         }
 
-        lease.calls_used = lease.calls_used.saturating_add(count).min(lease.calls_limit);
+        lease.calls_used = lease
+            .calls_used
+            .saturating_add(count)
+            .min(lease.calls_limit);
         store_lease(&env, &lease);
         let remaining = lease.calls_limit.saturating_sub(lease.calls_used);
         env.events().publish(
-            (Symbol::new(&env, "calls_committed"), lease.consumer.clone(), lease_id),
+            (
+                Symbol::new(&env, "calls_committed"),
+                lease.consumer.clone(),
+                lease_id,
+            ),
             (lease.calls_used, remaining),
         );
         Ok(lease)
@@ -539,9 +578,8 @@ impl KeyleaseCore {
             return Err(Error::AlreadySettled);
         }
         let config = load_config(&env)?;
-        let refund = lease.price_paid
-            * (lease.calls_limit.saturating_sub(lease.calls_used) as i128)
-            / (lease.calls_limit as i128);
+        let (_payable, refund) =
+            calculate_payout(lease.price_paid, lease.calls_used, lease.calls_limit);
 
         if refund > 0 {
             let contract_address = env.current_contract_address();
@@ -556,7 +594,11 @@ impl KeyleaseCore {
         lease.settled = true;
         store_lease(&env, &lease);
         env.events().publish(
-            (Symbol::new(&env, "lease_revoked"), lease.consumer.clone(), lease_id),
+            (
+                Symbol::new(&env, "lease_revoked"),
+                lease.consumer.clone(),
+                lease_id,
+            ),
             refund,
         );
         Ok(lease)
@@ -579,8 +621,8 @@ impl KeyleaseCore {
         let token_client = token::Client::new(&env, &config.token);
         let escrow = env.current_contract_address();
 
-        let payable = lease.price_paid * (lease.calls_used as i128) / (lease.calls_limit as i128);
-        let refund = lease.price_paid - payable;
+        let (payable, refund) =
+            calculate_payout(lease.price_paid, lease.calls_used, lease.calls_limit);
 
         if payable > 0 {
             token_client.transfer(&escrow, &lease.provider, &payable);
@@ -593,7 +635,11 @@ impl KeyleaseCore {
         lease.settled = true;
         store_lease(&env, &lease);
         env.events().publish(
-            (Symbol::new(&env, "lease_settled"), lease.provider.clone(), lease_id),
+            (
+                Symbol::new(&env, "lease_settled"),
+                lease.provider.clone(),
+                lease_id,
+            ),
             (payable, refund),
         );
         Ok(lease)

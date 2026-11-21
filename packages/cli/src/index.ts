@@ -45,6 +45,9 @@ import { renderError } from './error-renderer.js';
 
 export { CliError, redactToken } from './errors.js';
 
+export const MAX_CALLS = 1_000_000;
+export const MAX_DURATION = 31_536_000;
+
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
 
@@ -316,6 +319,17 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
       const secret = optionalString(values, 'secret');
       if (!dryRun && secret === undefined) {
         throw new CliError('--secret is required unless --dry-run is set', 'missing_option');
+      }
+      const calls = requirePositiveInt(values, 'calls');
+      if (calls > MAX_CALLS) {
+        throw new CliError(`--calls cannot exceed ${MAX_CALLS}, got ${calls}`, 'invalid_option');
+      }
+      const duration = requirePositiveInt(values, 'duration');
+      if (duration > MAX_DURATION) {
+        throw new CliError(
+          `--duration cannot exceed ${MAX_DURATION} seconds (365 days), got ${duration}`,
+          'invalid_option',
+        );
       }
       const args: AcquireArgs = {
         ...transactionArgs(values),

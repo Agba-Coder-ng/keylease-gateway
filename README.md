@@ -873,6 +873,7 @@ real SAC instance registered in the Soroban test environment.
 ```rust
 init(admin: Address, token: Address, gateway: Address)
 register_service(provider: Address, service: String, price_per_call: i128) -> Service
+set_service_active(provider: Address, service: String, active: bool) -> Service
 create_lease(consumer: Address, service: String, calls: u32, duration: u64) -> u64
 extend_lease(lease_id: u64, extra_calls: u32, extra_duration: u64) -> Lease
 use_call(lease_id: u64, count: u32) -> Lease
@@ -884,6 +885,8 @@ upgrade(new_wasm_hash: BytesN<32>)
 
 `Lease` struct: `id, service, provider, consumer, calls_limit, calls_used,
 expires_at (unix seconds), active, settled, price_paid (i128)`.
+
+`Service` struct: `service, provider, price_per_call, active, lease_count`.
 
 ## Contributing
 

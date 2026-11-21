@@ -38,7 +38,10 @@ function sessionRows(sessions: Record<string, LeaseSession[]>, now: number): Ses
         status,
       };
     })
-    .sort((left, right) => left.service.localeCompare(right.service) || left.lease_id.localeCompare(right.lease_id));
+    .sort(
+      (left, right) =>
+        left.service.localeCompare(right.service) || left.lease_id.localeCompare(right.lease_id),
+    );
 }
 
 function formatExpiry(expiresAt: number): string {
@@ -78,14 +81,12 @@ export async function sessionsCommand(
   const now = Math.floor((deps.now ?? Date.now)() / 1000);
 
   if (args.prune) {
-    let removed = 0;
     const remaining: Record<string, LeaseSession[]> = {};
-    for (const [service, list] of Object.entries(sessions)) {
-      const unexpired = list.filter((s) => s.expiresAt > now);
-      removed += list.length - unexpired.length;
-      if (unexpired.length > 0) {
-        remaining[service] = unexpired;
-      }
+    let removed = 0;
+    for (const [service, leases] of Object.entries(sessions)) {
+      const live = leases.filter((session) => session.expiresAt > now);
+      removed += leases.length - live.length;
+      if (live.length > 0) remaining[service] = live;
     }
     if (removed > 0) await store.saveAll(remaining);
 

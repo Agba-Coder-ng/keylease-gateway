@@ -243,6 +243,7 @@ export async function statusCommand(
         io.out('Session token is valid');
         io.out(`  lease id   : ${payload.lease_id}`);
         io.out(`  consumer   : ${payload.consumer}`);
+        if (payload.service !== undefined) io.out(`  service    : ${payload.service}`);
         io.out(`  expires at : ${new Date(payload.exp * 1000).toISOString()} (${expiresIn}s left)`);
       }
       return 0;

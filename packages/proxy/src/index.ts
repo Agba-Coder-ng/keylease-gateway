@@ -15,6 +15,8 @@
  *   KEYLEASE_QUOTA_BATCH     calls buffered before a commit (default: 50)
  *   KEYLEASE_QUOTA_FLUSH_MS  periodic commit interval (default: 10000)
  *   KEYLEASE_CACHE_TTL_MS    lease-state cache TTL (default: 30000)
+ *   KEYLEASE_UPSTREAM_TIMEOUT_MS per-request upstream timeout in ms; 0 disables
+ *                            (default: 15000)
  *   KEYLEASE_MAX_BODY_BYTES  maximum request body size in bytes (default: 33554432)
  *   KEYLEASE_TRUST_PROXY     trusted edge proxies for x-forwarded-*: "true", a hop count or
  *                            a comma-separated IP/CIDR list (default: false)
@@ -29,7 +31,12 @@
 import { pathToFileURL } from 'node:url';
 import { Keypair } from '@stellar/stellar-sdk';
 import { SorobanClient } from '@keylease/cli/soroban';
-import { buildProxyServer, DEFAULT_MAX_IN_FLIGHT, drainProxyServer } from './server.js';
+import {
+  buildProxyServer,
+  DEFAULT_MAX_IN_FLIGHT,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  drainProxyServer,
+} from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
 import { OnChainQuota, QuotaCapacityWarning, type QuotaSink } from './quota.js';
 
@@ -47,6 +54,7 @@ export interface ProxyEnv {
   KEYLEASE_QUOTA_BATCH?: string | undefined;
   KEYLEASE_QUOTA_FLUSH_MS?: string | undefined;
   KEYLEASE_CACHE_TTL_MS?: string | undefined;
+  KEYLEASE_UPSTREAM_TIMEOUT_MS?: string | undefined;
   KEYLEASE_TRUST_PROXY?: string | undefined;
   KEYLEASE_FORWARD_AUTH?: string | undefined;
   KEYLEASE_FORWARD_HEADERS?: string | undefined;
@@ -54,6 +62,10 @@ export interface ProxyEnv {
   KEYLEASE_SHUTDOWN_TIMEOUT_MS?: string | undefined;
   KEYLEASE_MAX_BODY_BYTES?: string | undefined;
   KEYLEASE_MAX_INFLIGHT?: string | undefined;
+  KEYLEASE_SERVICE_ID?: string | undefined;
+  KEYLEASE_RATE_LIMIT_PER_MINUTE?: string | undefined;
+  KEYLEASE_CIRCUIT_BREAKER_THRESHOLD?: string | undefined;
+  KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS?: string | undefined;
   PORT?: string | undefined;
   HOST?: string | undefined;
 }
@@ -70,6 +82,8 @@ export interface ResolvedConfig {
   host: string;
   port: number;
   cacheTtlMs: number;
+  /** Per-request upstream timeout in milliseconds; 0 disables it. */
+  requestTimeoutMs: number;
   forwardAuthorization: boolean;
   forwardHeaders: string[];
   trustProxy: boolean | number | string[];
@@ -80,6 +94,10 @@ export interface ResolvedConfig {
   quotaFlushMs: number;
   maxBodyBytes: number;
   maxInFlight: number;
+  serviceId?: string | undefined;
+  rateLimitPerMinute: number;
+  circuitBreakerThreshold: number;
+  circuitBreakerCooldownMs: number;
 }
 
 export const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024; // 32 MiB
@@ -90,6 +108,15 @@ function positiveInt(raw: string | undefined, fallback: number, name: string): n
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) {
     throw new ProxyConfigError(`${name} "${raw}" must be a positive integer`);
+  }
+  return value;
+}
+
+function nonNegativeInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined) return fallback;
+  const value = raw.trim() === '' ? Number.NaN : Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new ProxyConfigError(`${name} "${raw}" must be a non-negative integer (0 disables it)`);
   }
   return value;
 }
@@ -164,11 +191,37 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     );
   }
 
+  const rawServiceId = env.KEYLEASE_SERVICE_ID?.trim();
+  const serviceId = rawServiceId && rawServiceId.length > 0 ? rawServiceId : undefined;
+
+  const rateLimitPerMinute = nonNegativeInt(
+    env.KEYLEASE_RATE_LIMIT_PER_MINUTE,
+    0,
+    'KEYLEASE_RATE_LIMIT_PER_MINUTE',
+  );
+
+  const circuitBreakerThreshold = nonNegativeInt(
+    env.KEYLEASE_CIRCUIT_BREAKER_THRESHOLD,
+    5,
+    'KEYLEASE_CIRCUIT_BREAKER_THRESHOLD',
+  );
+
+  const circuitBreakerCooldownMs = positiveInt(
+    env.KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS,
+    30_000,
+    'KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS',
+  );
+
   return {
     upstream,
     host: env.HOST ?? '0.0.0.0',
     port,
     cacheTtlMs,
+    requestTimeoutMs: nonNegativeInt(
+      env.KEYLEASE_UPSTREAM_TIMEOUT_MS,
+      DEFAULT_REQUEST_TIMEOUT_MS,
+      'KEYLEASE_UPSTREAM_TIMEOUT_MS',
+    ),
     forwardAuthorization: env.KEYLEASE_FORWARD_AUTH === 'true',
     forwardHeaders: parseForwardHeaders(env.KEYLEASE_FORWARD_HEADERS),
     trustProxy: parseTrustProxy(env.KEYLEASE_TRUST_PROXY),
@@ -183,6 +236,10 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     quotaFlushMs: positiveInt(env.KEYLEASE_QUOTA_FLUSH_MS, 10_000, 'KEYLEASE_QUOTA_FLUSH_MS'),
     maxBodyBytes,
     maxInFlight,
+    serviceId,
+    rateLimitPerMinute,
+    circuitBreakerThreshold,
+    circuitBreakerCooldownMs,
   };
 }
 
@@ -198,6 +255,7 @@ export function describeConfig(config: ResolvedConfig): Record<string, unknown> 
     host: config.host,
     port: config.port,
     cacheTtlMs: config.cacheTtlMs,
+    requestTimeoutMs: config.requestTimeoutMs,
     forwardAuthorization: config.forwardAuthorization,
     forwardHeaders: config.forwardHeaders,
     trustProxy: config.trustProxy,
@@ -208,6 +266,10 @@ export function describeConfig(config: ResolvedConfig): Record<string, unknown> 
     quotaFlushMs: config.quotaFlushMs,
     maxBodyBytes: config.maxBodyBytes,
     maxInFlight: config.maxInFlight,
+    serviceId: config.serviceId ?? null,
+    rateLimitPerMinute: config.rateLimitPerMinute,
+    circuitBreakerThreshold: config.circuitBreakerThreshold,
+    circuitBreakerCooldownMs: config.circuitBreakerCooldownMs,
   };
 }
 
@@ -311,6 +373,8 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
   const verifier = new LeaseVerifier({
     provider: providerFromClient(client),
     cacheTtlMs: config.cacheTtlMs,
+    serviceId: config.serviceId,
+    rateLimitPerMinute: config.rateLimitPerMinute,
     ...(quotaSink === undefined ? {} : { quotaSink }),
   });
   const app = buildProxyServer({
@@ -320,8 +384,11 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
     forwardHeaders: config.forwardHeaders,
     trustProxy: config.trustProxy,
     metricsEnabled: config.metricsEnabled,
+    requestTimeoutMs: config.requestTimeoutMs,
     maxBodyBytes: config.maxBodyBytes,
     maxInFlight: config.maxInFlight,
+    circuitBreakerThreshold: config.circuitBreakerThreshold,
+    circuitBreakerCooldownMs: config.circuitBreakerCooldownMs,
     logger: true,
   });
   app.log.info({ config: describeConfig(config) }, 'configuration');

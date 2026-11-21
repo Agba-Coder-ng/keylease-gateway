@@ -100,6 +100,21 @@ function memoryStore(initial: Record<string, LeaseSession[]> = {}) {
   };
 }
 
+function session(overrides: Partial<LeaseSession> = {}): LeaseSession {
+  return {
+    service: 'weather-api',
+    leaseId: '42',
+    consumer: consumer.publicKey(),
+    token: 'kls1.abc.def',
+    callsLimit: 3,
+    issuedAt: NOW,
+    expiresAt: NOW + 600,
+    txHash: null,
+    network: 'testnet',
+    ...overrides,
+  };
+}
+
 describe('parseConsumerSecret', () => {
   it('accepts a valid stellar secret seed', () => {
     expect(parseConsumerSecret(consumer.secret()).publicKey()).toBe(consumer.publicKey());
@@ -920,6 +935,40 @@ describe('envCommand', () => {
     const written = await readFile(target, 'utf8');
     expect(written).toContain('EXISTING=value');
     expect(written).toContain('KEYLEASE_SERVICE=weather-api');
+  });
+
+  it('tightens an existing 0644 .env to 0600 on write', async () => {
+    const target = join(dir, '.env');
+    const { io } = captureIo();
+    const store = memoryStore({ 'weather-api': session() });
+    await writeFile(target, 'EXISTING=value\n', { mode: 0o644 });
+    const { chmod } = await import('node:fs/promises');
+    await chmod(target, 0o644);
+
+    expect(await envCommand({ service: 'weather-api', file: target, json: false }, io, { store })).toBe(0);
+
+    const mode = (await stat(target)).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  it('does not fail the command when chmod is unsupported', async () => {
+    const target = join(dir, '.env');
+    const { io } = captureIo();
+    const store = memoryStore({ 'weather-api': session() });
+
+    const code = await envCommand(
+      { service: 'weather-api', file: target, json: false },
+      io,
+      {
+        store,
+        chmod: async () => {
+          throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+        },
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(await readFile(target, 'utf8')).toContain('KEYLEASE_LEASE_ID=42');
   });
 
   it('fails when no lease exists for the service', async () => {

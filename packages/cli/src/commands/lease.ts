@@ -296,13 +296,11 @@ export function selectLease(
  *
  * File permissions:
  *   Created with mode 0o600 (owner read/write only) to protect sensitive tokens.
- */
-/**
- * File-backed store, one JSON document keyed by service id.
  *
- * This is a local cache, not a database. Writes are serialized per path within
- * the process, guarded across processes by a best-effort `<path>.lock` file,
- * and land via an atomic temp-file rename so readers never see a torn file.
+ * Concurrency:
+ *   This is a local cache, not a database. Writes are serialized per path within
+ *   the process, guarded across processes by a best-effort `<path>.lock` file,
+ *   and land via an atomic temp-file rename so readers never see a torn file.
  */
 export function fileSessionStore(
   cwd: string = process.cwd(),
@@ -374,17 +372,14 @@ export function fileSessionStore(
         }
 
         // Add or update lease in array (idempotent: replace if same leaseId exists)
-        if (!sessions[session.service]) {
-          sessions[session.service] = [];
-        }
-        const list = sessions[session.service]!;
+        const list = sessions[session.service] ?? [];
         const idx = list.findIndex((s) => s.leaseId === session.leaseId);
         if (idx >= 0) {
           list[idx] = session;
         } else {
           list.push(session);
         }
-
+        sessions[session.service] = list;
         await writeSessions(sessions);
       });
     },
@@ -562,7 +557,8 @@ function renderDryRunOutput(summary: DryRunSummary, io: CliIo, json: boolean): v
  *   - Same leaseId: replaced in-place (e.g., on retry or renewal with tx hash update)
  *   - env command: automatically selects newest unexpired lease
  * Invokes `create_lease` on `keylease-core`, then mints an ed25519-signed
- * session bearer token bound to `(lease_id, consumer)`.
+ * session bearer token bound to `(lease_id, consumer)` that also carries the
+ * `--service` id as its `service` claim.
  *
  * With `--dry-run` the price is read through `quote` instead: nothing is signed,
  * no lease is created, and no session is written to the local store.
@@ -623,11 +619,14 @@ export async function acquireCommand(
 
   const issuedAt = Math.floor(now() / 1000);
   const expiresAt = issuedAt + args.duration;
+  // `args.service` is exactly the id `createLease` was invoked with, so the
+  // claim names the service the on-chain lease was bought for.
   const token = mintSessionToken({
     leaseId: result.leaseId,
     consumerSecret: secret,
     issuedAt,
     expiresAt,
+    service: args.service,
   });
 
   const session: LeaseSession = {
@@ -692,9 +691,7 @@ export function mergeEnv(existing: string, entries: Record<string, string>): str
     const rawVal = match[3] ?? '';
     if (key in entries && !emitted.has(key)) {
       emitted.add(key);
-      const commentMatch = /\s+(#.*)$/.exec(rawVal);
-      const comment = commentMatch ? ` ${commentMatch[1]}` : '';
-      return `${exportPrefix}${key}=${quoteEnvValue(entries[key] as string)}${comment}`;
+      return `${exportPrefix}${key}=${quoteEnvValue(entries[key] as string)}`;
     }
     if (key in entries) return null; // drop duplicates
     return line;
@@ -756,9 +753,13 @@ export async function envCommand(
   }
 
   const entries = envEntriesFor(session);
+  // Tighten permissions on the read path too, in case the file already exists
+  // wider than 0600 before new secrets are merged into it.
+  await restrictEnvFile(args.file, chmodFile);
   const existing = await read(args.file).catch(() => '');
   const merged = mergeEnv(existing, entries);
   await write(args.file, merged);
+  await restrictEnvFile(args.file, chmodFile);
 
   const keys = Object.keys(entries);
   if (args.json) {

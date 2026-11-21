@@ -12,9 +12,13 @@ concurrency:
 
 jobs:
   quality:
-    name: lint · typecheck · test
+    name: lint · typecheck · test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24]
 
     steps:
       - name: Checkout
@@ -27,7 +31,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: pnpm
 
       - name: Install dependencies
@@ -56,6 +60,77 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  pr-title:
+    name: PR title · conventional commits
+    # Dependabot PRs carry generated titles; their content is reviewed like any
+    # other change. Every contributor PR, including forks, is validated.
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # pnpm version comes from the "packageManager" field in package.json
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The pull request title is the message that lands on main for a squash
+      # merge, so it is what this check validates. The rules live in
+      # commitlint.config.mjs and scripts/conventional-commits.mjs.
+      - name: Validate the pull request title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          # Titles generated from merge commits are not authored messages.
+          if [[ "$PR_TITLE" == Merge\ * ]]; then
+            echo "Skipping: merge-commit title."
+            exit 0
+          fi
+
+          if [[ -z "${PR_TITLE//[[:space:]]/}" ]]; then
+            echo "::error::The pull request title is empty; use '<type>(<scope>): <subject>'."
+            exit 1
+          fi
+
+          status=0
+          printf '%s\n' "$PR_TITLE" | pnpm exec commitlint --config commitlint.config.mjs || status=$?
+          if [[ $status -eq 0 ]]; then
+            echo "PR title follows Conventional Commits."
+            exit 0
+          fi
+
+          suggestion="$(node scripts/pr-title-suggestion.mjs "$PR_TITLE" 2>/dev/null || echo 'feat: describe the change')"
+          echo "::error::PR title must follow Conventional Commits. Suggested title: $suggestion"
+          {
+            echo '### PR title does not follow Conventional Commits'
+            echo
+            echo 'The pull request title is validated by CI. Use this title instead:'
+            echo
+            echo '```text'
+            echo "$suggestion"
+            echo '```'
+            echo
+            echo 'See [CONTRIBUTING.md](https://github.com/${{ github.repository }}/blob/main/CONTRIBUTING.md#commit-messages-and-pr-titles).'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
   contract:
     name: contract · test · wasm
     runs-on: ubuntu-latest
@@ -69,11 +144,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32v1-none
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: contracts/keylease-core
+
+      - name: Cargo fmt check
+        run: cargo fmt --manifest-path contracts/keylease-core/Cargo.toml --check
+
+      - name: Cargo clippy
+        run: cargo clippy --manifest-path contracts/keylease-core/Cargo.toml --all-targets -- -D warnings
 
       # soroban-sdk 29 requires stellar-cli to produce a deployable wasm
       - name: Install stellar-cli
@@ -97,3 +179,24 @@ jobs:
           path: contracts/keylease-core/target/wasm32v1-none/release/keylease_core.wasm
           if-no-files-found: error
           retention-days: 30
+
+  actionlint:
+    name: workflows · actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.7"
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" | tar -xz -C /tmp actionlint
+          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Run actionlint
+        run: actionlint

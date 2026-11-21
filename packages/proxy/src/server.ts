@@ -23,6 +23,95 @@ export const HOP_BY_HOP_HEADERS: ReadonlySet<string> = new Set([
   'content-length',
 ]);
 
+export type CircuitState = 'closed' | 'open' | 'half-open';
+
+export interface CircuitBreakerOptions {
+  /** Consecutive failures before the circuit opens. Defaults to 5; 0 disables. */
+  threshold?: number;
+  /** Cooldown in milliseconds before probing half-open. Defaults to 30s. */
+  cooldownMs?: number;
+  /** Injected clock in milliseconds. Defaults to Date.now. */
+  clock?: () => number;
+}
+
+export class CircuitBreaker {
+  readonly threshold: number;
+  readonly cooldownMs: number;
+  private readonly clock: () => number;
+
+  private state: CircuitState = 'closed';
+  private consecutiveFailures = 0;
+  private openedAt = 0;
+  private probeInFlight = false;
+
+  constructor(options: CircuitBreakerOptions = {}) {
+    this.threshold = options.threshold ?? 5;
+    this.cooldownMs = options.cooldownMs ?? 30_000;
+    this.clock = options.clock ?? Date.now;
+  }
+
+  get consecutiveFailureCount(): number {
+    return this.consecutiveFailures;
+  }
+
+  currentState(): CircuitState {
+    if (this.threshold <= 0) return 'closed';
+    if (this.state === 'open') {
+      const now = this.clock();
+      if (now - this.openedAt >= this.cooldownMs) {
+        this.state = 'half-open';
+        this.probeInFlight = false;
+        return 'half-open';
+      }
+    }
+    return this.state;
+  }
+
+  canAttempt(): boolean {
+    if (this.threshold <= 0) return true;
+    const current = this.currentState();
+    if (current === 'closed') return true;
+    if (current === 'half-open') {
+      if (!this.probeInFlight) {
+        this.probeInFlight = true;
+        return true;
+      }
+      return false;
+    }
+    return false;
+  }
+
+  getRetryAfterSeconds(): number {
+    const now = this.clock();
+    const remainingMs = Math.max(0, this.openedAt + this.cooldownMs - now);
+    return Math.max(1, Math.ceil(remainingMs / 1000));
+  }
+
+  recordSuccess(): void {
+    if (this.threshold <= 0) return;
+    this.consecutiveFailures = 0;
+    this.state = 'closed';
+    this.probeInFlight = false;
+  }
+
+  recordFailure(): void {
+    if (this.threshold <= 0) return;
+    this.consecutiveFailures += 1;
+    this.probeInFlight = false;
+    if (this.state === 'half-open' || this.consecutiveFailures >= this.threshold) {
+      this.state = 'open';
+      this.openedAt = this.clock();
+    }
+  }
+
+  reset(): void {
+    this.state = 'closed';
+    this.consecutiveFailures = 0;
+    this.openedAt = 0;
+    this.probeInFlight = false;
+  }
+}
+
 export interface ProxyOptions {
   /** Base URL of the protected API, e.g. `https://api.example.com`. */
   upstream: string;
@@ -35,6 +124,8 @@ export interface ProxyOptions {
   logger?: boolean;
   /** Forward the caller's lease token upstream. Defaults to `false`. */
   forwardAuthorization?: boolean;
+  /** Additional request headers to forward upstream. */
+  forwardHeaders?: Iterable<string> | undefined;
   /** Per-request upstream timeout in milliseconds. Defaults to 15s; 0 disables it. */
   requestTimeoutMs?: number;
   /** Expose Prometheus metrics on /metrics. Defaults to `false`. */
@@ -53,9 +144,19 @@ export interface ProxyOptions {
    * `Retry-After`. Defaults to 1024; 0 disables the cap.
    */
   maxInFlight?: number;
+  /** Consecutive failures before opening the upstream circuit breaker (default: 5, 0 disables). */
+  circuitBreakerThreshold?: number;
+  /** Cooldown in ms before circuit breaker transitions to half-open (default: 30000). */
+  circuitBreakerCooldownMs?: number;
+  /** Pre-built CircuitBreaker instance. */
+  circuitBreaker?: CircuitBreaker;
+  /** Injected clock for testing. */
+  clock?: () => number;
 }
 
 export const DEFAULT_MAX_IN_FLIGHT = 1024;
+/** Default per-request upstream timeout; `0` disables it. */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 const REQUEST_ID_HEADER = 'x-request-id';
 const VALID_REQUEST_ID = /^[A-Za-z0-9._:~+=/-]{1,128}$/;
@@ -73,6 +174,7 @@ export interface ForwardedRequestInit {
   headers: Record<string, string>;
   body?: Buffer | undefined;
   signal?: AbortSignal | undefined;
+  redirect?: 'error' | 'follow' | 'manual' | undefined;
 }
 
 /** Normalises a relative request URL against the configured upstream. */
@@ -83,8 +185,34 @@ export function resolveUpstreamUrl(upstream: string, rawUrl: string): string {
   return new URL(`${basePath}${path}`, base.origin).toString();
 }
 
+/** Default allowlist of request headers forwarded upstream. */
+export const DEFAULT_FORWARDED_HEADERS: ReadonlySet<string> = new Set([
+  'accept',
+  'accept-charset',
+  'accept-encoding',
+  'accept-language',
+  'content-type',
+  'content-encoding',
+  'content-language',
+  'range',
+  'user-agent',
+]);
+
+/** Returns whether an incoming header name is allowed to be forwarded upstream. */
+export function isAllowedForwardHeader(
+  name: string,
+  extraHeaders?: ReadonlySet<string> | undefined,
+): boolean {
+  const lower = name.toLowerCase();
+  if (DEFAULT_FORWARDED_HEADERS.has(lower)) return true;
+  if (lower.startsWith('if-')) return true;
+  if (extraHeaders?.has(lower)) return true;
+  return false;
+}
+
 /**
- * Copies request headers, dropping hop-by-hop entries (and auth by default).
+ * Copies request headers, allowing only default allowlisted headers, conditional
+ * `if-*` headers, and explicitly configured `forwardHeaders` (and auth when enabled).
  * Multi-valued headers are folded onto a single field line: `; ` for cookies
  * (RFC 6265), `, ` for everything else.
  */
@@ -92,9 +220,12 @@ export function buildUpstreamHeaders(
   headers: Record<string, string | string[] | undefined>,
   options: {
     forwardAuthorization?: boolean;
-    allowedHeaders?: ReadonlySet<string> | string[];
+    forwardHeaders?: Iterable<string> | undefined;
   } = {},
 ): Record<string, string> {
+  const extraHeaders = options.forwardHeaders
+    ? new Set(Array.from(options.forwardHeaders, (h) => h.toLowerCase().trim()).filter(Boolean))
+    : undefined;
   const out: Record<string, string> = {};
   const allowlist = options.allowedHeaders
     ? new Set(Array.from(options.allowedHeaders).map((h) => h.toLowerCase()))
@@ -103,12 +234,18 @@ export function buildUpstreamHeaders(
     if (value === undefined) continue;
     const lower = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
-    if (lower === 'authorization' && options.forwardAuthorization !== true) continue;
     if (lower.startsWith('x-keylease-')) continue;
     // Forwarding metadata is rebuilt by the proxy from trusted values only.
     if (lower.startsWith('x-forwarded-')) continue;
-    if (allowlist !== undefined && !allowlist.has(lower) && lower !== 'authorization') continue;
-    out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
+    if (lower === 'authorization') {
+      if (options.forwardAuthorization === true) {
+        out[lower] = Array.isArray(value) ? value.join(', ') : value;
+      }
+      continue;
+    }
+    if (isAllowedForwardHeader(lower, extraHeaders)) {
+      out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
+    }
   }
   return out;
 }
@@ -152,7 +289,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   const { verifier, upstream } = options;
   const fetchImpl: typeof fetch = options.fetchImpl ?? globalThis.fetch;
   const forwardAuthorization = options.forwardAuthorization === true;
-  const requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+  const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const verificationRetryAfterSeconds = Math.max(
     1,
     Math.ceil(Math.min(verifier.cacheTtlMs, 30_000) / 1_000),
@@ -293,6 +430,22 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
           message: 'protocol upgrades (e.g. WebSocket) are not supported by this proxy',
         });
     }
+
+    if (!circuitBreaker.canAttempt()) {
+      metrics.requestsDenied.set(
+        'upstream_unavailable',
+        (metrics.requestsDenied.get('upstream_unavailable') ?? 0) + 1,
+      );
+      return reply
+        .code(503)
+        .header('retry-after', String(circuitBreaker.getRetryAfterSeconds()))
+        .type('application/json; charset=utf-8')
+        .send({
+          error: 'upstream_unavailable',
+          message: 'upstream circuit breaker is open',
+        });
+    }
+
     const decision = await verifier.verifyAuthorization(request.headers.authorization);
     if (!decision.ok) {
       metrics.requestsDenied.set(
@@ -306,6 +459,8 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
       const deniedReply = reply.code(decision.status).type('application/json; charset=utf-8');
       if (decision.status === 503) {
         deniedReply.header('retry-after', String(verificationRetryAfterSeconds));
+      } else if (decision.status === 429 && decision.retryAfter !== undefined) {
+        deniedReply.header('retry-after', String(decision.retryAfter));
       }
       return deniedReply.send({ error: decision.reason, message: decision.message });
     }
@@ -316,7 +471,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
     const method = request.method;
     const headers = buildUpstreamHeaders(request.headers, {
       forwardAuthorization,
-      allowedHeaders: options.allowedHeaders,
+      forwardHeaders,
     });
     const payload =
       allowsBody(method) && Buffer.isBuffer(request.body) && request.body.length > 0
@@ -350,6 +505,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
         timeoutSignal === undefined
           ? clientAbortController.signal
           : AbortSignal.any([timeoutSignal, clientAbortController.signal]),
+      redirect: 'manual',
     };
 
     try {
@@ -359,7 +515,15 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
       let response: Response;
       try {
         response = await fetchImpl(target, init);
+        if (response.status >= 500) {
+          circuitBreaker.recordFailure();
+        } else {
+          circuitBreaker.recordSuccess();
+        }
       } catch (error) {
+        if (!clientAbortController.signal.aborted) {
+          circuitBreaker.recordFailure();
+        }
         recordLatency((performance.now() - startTime) / 1000);
         if (clientAbortController.signal.aborted) return reply;
         const timedOut =

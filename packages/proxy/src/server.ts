@@ -120,6 +120,8 @@ export interface ProxyOptions {
   logger?: boolean;
   /** Forward the caller's lease token upstream. Defaults to `false`. */
   forwardAuthorization?: boolean;
+  /** Additional request headers to forward upstream. */
+  forwardHeaders?: Iterable<string> | undefined;
   /** Per-request upstream timeout in milliseconds. Defaults to 15s; 0 disables it. */
   requestTimeoutMs?: number;
   /** Expose Prometheus metrics on /metrics. Defaults to `false`. */
@@ -168,6 +170,7 @@ export interface ForwardedRequestInit {
   headers: Record<string, string>;
   body?: Buffer | undefined;
   signal?: AbortSignal | undefined;
+  redirect?: 'error' | 'follow' | 'manual' | undefined;
 }
 
 /** Normalises a relative request URL against the configured upstream. */
@@ -178,25 +181,64 @@ export function resolveUpstreamUrl(upstream: string, rawUrl: string): string {
   return new URL(`${basePath}${path}`, base.origin).toString();
 }
 
+/** Default allowlist of request headers forwarded upstream. */
+export const DEFAULT_FORWARDED_HEADERS: ReadonlySet<string> = new Set([
+  'accept',
+  'accept-charset',
+  'accept-encoding',
+  'accept-language',
+  'content-type',
+  'content-encoding',
+  'content-language',
+  'range',
+  'user-agent',
+]);
+
+/** Returns whether an incoming header name is allowed to be forwarded upstream. */
+export function isAllowedForwardHeader(
+  name: string,
+  extraHeaders?: ReadonlySet<string> | undefined,
+): boolean {
+  const lower = name.toLowerCase();
+  if (DEFAULT_FORWARDED_HEADERS.has(lower)) return true;
+  if (lower.startsWith('if-')) return true;
+  if (extraHeaders?.has(lower)) return true;
+  return false;
+}
+
 /**
- * Copies request headers, dropping hop-by-hop entries (and auth by default).
+ * Copies request headers, allowing only default allowlisted headers, conditional
+ * `if-*` headers, and explicitly configured `forwardHeaders` (and auth when enabled).
  * Multi-valued headers are folded onto a single field line: `; ` for cookies
  * (RFC 6265), `, ` for everything else.
  */
 export function buildUpstreamHeaders(
   headers: Record<string, string | string[] | undefined>,
-  options: { forwardAuthorization?: boolean } = {},
+  options: {
+    forwardAuthorization?: boolean;
+    forwardHeaders?: Iterable<string> | undefined;
+  } = {},
 ): Record<string, string> {
+  const extraHeaders = options.forwardHeaders
+    ? new Set(Array.from(options.forwardHeaders, (h) => h.toLowerCase().trim()).filter(Boolean))
+    : undefined;
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(headers)) {
     if (value === undefined) continue;
     const lower = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
-    if (lower === 'authorization' && options.forwardAuthorization !== true) continue;
     if (lower.startsWith('x-keylease-')) continue;
     // Forwarding metadata is rebuilt by the proxy from trusted values only.
     if (lower.startsWith('x-forwarded-')) continue;
-    out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
+    if (lower === 'authorization') {
+      if (options.forwardAuthorization === true) {
+        out[lower] = Array.isArray(value) ? value.join(', ') : value;
+      }
+      continue;
+    }
+    if (isAllowedForwardHeader(lower, extraHeaders)) {
+      out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
+    }
   }
   return out;
 }
@@ -414,7 +456,10 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
     const target = resolveUpstreamUrl(upstream, request.raw.url ?? '/');
     const method = request.method;
-    const headers = buildUpstreamHeaders(request.headers, { forwardAuthorization });
+    const headers = buildUpstreamHeaders(request.headers, {
+      forwardAuthorization,
+      forwardHeaders,
+    });
     const payload =
       allowsBody(method) && Buffer.isBuffer(request.body) && request.body.length > 0
         ? request.body
@@ -447,6 +492,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
         timeoutSignal === undefined
           ? clientAbortController.signal
           : AbortSignal.any([timeoutSignal, clientAbortController.signal]),
+      redirect: 'manual',
     };
 
     try {

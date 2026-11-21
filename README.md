@@ -583,7 +583,7 @@ without ever printing the seed. Stored sessions are listed with their expiry.
 | `register_service(provider, service, price_per_call)` | provider | Register a new service, or re-price one you own (`price_per_call > 0`). Another provider's id → `Unauthorized` |
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
-| `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
+| `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself; `duration` must be 1 to 31,536,000 seconds (1 year) |
 | `extend_lease(lease_id, extra_calls, extra_duration)` | consumer | Extends an active, unexpired, unsettled lease. At least one argument must be nonzero; a zero value leaves that dimension unchanged. Pulls `extra_calls × price_per_call` into the same escrow, grows `calls_limit`, `expires_at` and `price_paid`, and emits `lease_extended`. No CLI command is wired up yet |
 | `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
@@ -744,6 +744,7 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `KEYLEASE_CIRCUIT_BREAKER_THRESHOLD` | no | `5` | Consecutive upstream failures before the circuit opens and fails fast with `503 upstream_unavailable` without consuming quota (`0` disables) |
 | `KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS` | no | `30000` | Circuit breaker cooldown in milliseconds before probing upstream recovery (half-open state) |
 | `KEYLEASE_FORWARD_AUTH` | no | `false` | Forward the caller's bearer token upstream |
+| `KEYLEASE_FORWARD_HEADERS` | no | (empty) | Comma-separated additional request header names to forward upstream beyond the default allowlist |
 | `KEYLEASE_METRICS_ENABLED` | no | `false` | Expose Prometheus metrics on `/metrics` |
 | `KEYLEASE_SHUTDOWN_TIMEOUT_MS` | no | `10000` | Graceful shutdown drain timeout in milliseconds |
 | `PORT` / `HOST` | no | `8080` / `0.0.0.0` | Listen address |
@@ -755,6 +756,7 @@ The on-chain quota sink tracks at most 10,000 distinct leases in its pending bat
 | Status | Meaning |
 | --- | --- |
 | `200` | Health check (`/healthz`) or readiness probe (`/readyz`) |
+| `3xx` | Upstream redirect (e.g. 301, 302); forwarded as-is with unmodified `Location` header (`redirect: "manual"` prevents SSRF) |
 | `401 missing_token` / `invalid_token` / `token_expired` | Bearer token absent, malformed, forged or expired |
 | `403 lease_not_found` / `lease_inactive` / `lease_expired` / `consumer_mismatch` | On-chain lease does not permit this call |
 | `403 lease_service_mismatch` | Lease was issued for a different service than the configured `KEYLEASE_SERVICE_ID` |
@@ -767,7 +769,7 @@ The on-chain quota sink tracks at most 10,000 distinct leases in its pending bat
 
 Every response carries `x-request-id`: a valid inbound value (1-128 chars of `A-Za-z0-9._:~+=/-`) is reused, anything else is replaced by a generated UUID. It is also forwarded upstream and appears in denial logs.
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
-Forwarded upstream requests also receive these headers set exclusively by the proxy; any client-supplied `x-keylease-*` headers are stripped to prevent spoofing.
+Forwarded upstream requests forward an explicit allowlist of safe request headers (`accept`, `accept-charset`, `accept-encoding`, `accept-language`, `content-type`, `content-encoding`, `content-language`, `range`, `user-agent`, and conditional `if-*` headers), plus `authorization` when `KEYLEASE_FORWARD_AUTH=true`. Additional headers can be forwarded by configuring `KEYLEASE_FORWARD_HEADERS`. Hop-by-hop headers, client-supplied `x-keylease-*` headers, and `x-forwarded-*` headers are stripped to prevent spoofing; proxy metadata is set explicitly.
 Once lease verification succeeds, the call remains consumed even if the client disconnects or the upstream request fails; aborted calls are not refunded.
 `/healthz` and `/readyz` endpoints provide health and readiness probes without requiring bearer tokens and are never forwarded upstream.
 

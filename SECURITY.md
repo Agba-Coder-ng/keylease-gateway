@@ -12,12 +12,16 @@ repository.
 
 A good report includes:
 
-- the affected component (`@keylease/cli`, `@keylease/proxy`)
+- the affected component (`@keylease/cli`, `@keylease/proxy`, the contract)
 - a description of the threat model and the preconditions required
 - steps to reproduce, or a proof of concept
 - the expected failure mode (what the system should have done instead)
 
 ## Scope
+
+The system architecture, assets, trust boundaries and attacker model are
+documented in [docs/architecture.md](./docs/architecture.md); use it to frame a
+report.
 
 In scope:
 
@@ -31,6 +35,7 @@ In scope:
 - Soroban RPC response spoofing / cache poisoning
 - secret leakage (Stellar secret seeds, session tokens) in CLI output, logs or files
 - header injection or request smuggling through the reverse proxy
+- a release artifact that does not verify against its published attestation
 
 Out of scope:
 

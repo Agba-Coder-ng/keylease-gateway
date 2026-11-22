@@ -72,30 +72,9 @@ packages/proxy           →  @keylease/proxy   lease-verifying reverse proxy
            └─────────────────┘
 ```
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant CLI as @keylease/cli
-    participant X as keylease-core (Soroban)
-    participant T as SAC token (XLM)
-    participant P as @keylease/proxy
-    participant U as Upstream API
-
-    C->>CLI: keylease acquire --service weather-api --calls 100 --secret S…
-    CLI->>X: create_lease(consumer, service, 100, 3600)
-    X->>T: transfer(consumer → contract, 100 × price_per_call)
-    X-->>CLI: lease_id = 2
-    CLI-->>C: kls1.<payload>.<ed25519 signature>
-
-    C->>P: GET /v1/weather (Authorization: Bearer kls1.…)
-    P->>P: verify ed25519 signature + expiry (offline)
-    P->>X: simulate get_lease(2)  (cached ≤ 30s)
-    X-->>P: { consumer, calls_limit, calls_used, expires_at, active }
-    P->>U: forwarded request + x-keylease-* headers
-    U-->>P: response
-    P-->>C: response + x-keylease-calls-remaining
-    P->>X: use_call(2, n)   (batched, gateway-signed)
-```
+The sequence of these steps, the trust boundaries between client, proxy,
+RPC, contract and SAC token, and the attacker model are documented in
+**[docs/architecture.md](./docs/architecture.md)**.
 
 ### Why it is shaped this way
 

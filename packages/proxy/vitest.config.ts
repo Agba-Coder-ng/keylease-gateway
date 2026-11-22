@@ -24,9 +24,22 @@ export default defineConfig({
     include: ['src/**/*.test.ts'],
     restoreMocks: true,
     coverage: {
+      enabled: true,
       provider: 'v8',
-      reporter: ['text', 'json', 'json-summary'],
-      reportsDirectory: 'coverage',
+      reporter: ['text', 'json', 'html'],
+      reportsDirectory: './coverage',
+      include: ['src/**/*.ts'],
+      // Explicitly exclude test fixtures and build artifacts
+      exclude: [
+        'src/**/*.test.ts',
+        'dist/**',
+      ],
+      thresholds: {
+        lines: 85,
+        branches: 80,
+        functions: 85,
+        statements: 85,
+      },
     },
   },
 });

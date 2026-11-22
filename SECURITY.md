@@ -26,10 +26,8 @@ In scope:
 - escrow bugs in `contracts/keylease-core`: paying a provider twice, releasing
   more than `price_paid`, settling an active lease, refunding a revoked lease
 - authorisation gaps: `use_call` without the gateway, `revoke` without the
-  consumer, service mutation without its provider, `init` replay,
-  `set_paused` without the admin
-- an emergency pause that does not stop `create_lease`, or one that blocks
-  `use_call`, `revoke` or `settle` for leases that already hold escrow
+  consumer, service mutation or takeover without its provider, `init` replay,
+  `upgrade` without the admin
 - Soroban RPC response spoofing / cache poisoning
 - secret leakage (Stellar secret seeds, session tokens) in CLI output, logs or files
 - header injection or request smuggling through the reverse proxy
@@ -41,85 +39,55 @@ Out of scope:
 - denial of service against the Soroban RPC endpoint itself
 - testnet-only operational issues (friendbot rate limits, unfunded demo keys)
 
-## Emergency pause
+## Contract upgrades
 
-The contract has one admin-only circuit breaker for new exposure:
-`set_paused(bool)`. While paused, `create_lease` fails with `Error::Paused`
-**before** the escrow transfer, so no tokens move and no lease id is allocated.
+`keylease-core` (0.3.0 and later) can replace its own wasm through
+`upgrade(new_wasm_hash)`. This is the most powerful entry point in the contract,
+so its risk model is spelled out here.
 
-The pause deliberately does not freeze existing business:
+**Who can upgrade.** Only the current admin (`Config.admin`), whose
+authorisation the host checks on every call. Nobody else, including the
+gateway, providers and consumers, can call it successfully. Admin rotation is
+two-step (`propose_admin` / `accept_admin`), and the admin key should be a
+multisig or hardware-backed account, never a hot key on a server.
 
-- `use_call` keeps committing served calls for active leases.
-- `revoke` keeps refunding unused calls to the consumer.
-- `settle` keeps paying the provider for consumed calls and refunding the rest.
-- `quote`, `register_service`, `set_service_active` and every view are unaffected.
-- Escrow balances are never modified by pausing.
+**What an upgrade can change.** Everything about behaviour. The new wasm runs at
+the same address, with full access to the escrowed token balance and to all
+storage (config, services, leases, consumer indexes). A malicious or buggy
+wasm can therefore drain escrow, rewrite leases, change the admin or remove
+`upgrade` (freezing the contract for good). Treat an admin-key compromise as a
+compromise of all escrowed funds.
 
-Each transition emits `paused` or `unpaused` with the acting admin in the topic
-and the new state as the payload; `get_config()` exposes `paused`. `Config`
-gained this field in contract 0.3.0, so a deployment built from earlier source
-must be redeployed rather than reused (its stored `Config` shape differs).
+**What it cannot change.** The contract address, and any stored data the new
+code does not touch. Only a plain wasm hash is accepted: executable references,
+which would let another account control the code later, are rejected by the
+entry point's type. The hash must already be uploaded, otherwise the call traps
+and nothing changes. The `contract_updated` event (admin topic, new wasm hash)
+is only published for an upgrade that took effect.
 
-Operationally, treat a pause as an incident-response action: it requires the
-admin key, it is visible on chain, and the reason should be recorded in the
-incident or release notes. A pause is not a substitute for rotating a
-compromised gateway (`set_gateway`) or for settling and revoking affected
-leases.
+**Storage compatibility.** The new wasm must read the existing layout:
+`DataKey` variants and the stored `Config`, `Service` and `Lease` types may
+gain new keys or entries, but must not be removed, renamed, reordered or
+retyped without a migration that runs as part of the upgrade. Incompatible wasm
+fails to decode existing entries, which can strand leases and the escrow behind
+them.
 
-## Security review
+**Operational safeguards before every upgrade.**
 
-Every security-relevant change (contract, auth, quota, escrow, proxy headers,
-CI, release tooling) is reviewed against
-[`.github/security-review.md`](./.github/security-review.md). The checklist is
-also linked from the pull request template; complete it in the PR description
-rather than only in review comments, so the reasoning stays with the change.
+1. Build reproducibly from a reviewed, tagged commit and check that the wasm
+   hash you install is the one you built and reviewed.
+2. Diff the storage types against the deployed version (see the migration note
+   under *Contract reference → Upgrades* in the README).
+3. Rehearse on testnet over a copy of real state: upgrade, then read config,
+   services, leases and consumer indexes, and run a full
+   `create_lease → use_call → settle` cycle.
+4. Announce the upgrade, then confirm `version()` and the `contract_updated`
+   event on chain afterwards. Watch `contract_updated` events: an unexpected
+   one means the admin key is compromised.
 
-Changes that touch `contracts/keylease-core` additionally need a rollback plan:
-how a faulty release is stopped (`set_paused`), which leases remain outstanding,
-and how they are settled or revoked without abandoning escrow.
-
-## Release artifacts and provenance
-
-Tagged releases publish:
-
-| Asset | What it is |
-| --- | --- |
-| `keylease-cli-<version>.tgz`, `keylease-proxy-<version>.tgz` | pnpm-packed workspace packages |
-| `keylease-core.wasm` | contract built for `wasm32v1-none` by the release workflow |
-| `sbom-pnpm.cdx.json` | CycloneDX SBOM of the pnpm workspace |
-| `sbom-rust.cdx.json` | CycloneDX SBOM of the `keylease-core` crate |
-| `keylease-packages.attestation.jsonl`, `keylease-core-wasm.attestation.jsonl` | Sigstore bundles carrying SLSA build provenance for the tarballs and the wasm |
-
-Attestations are generated by `.github/workflows/release.yml` for the exact
-files that job built and that the release publishes. Only those files are
-covered: a locally rebuilt tarball or wasm is not, even when its name matches.
-The SBOMs are attached for inspection and are not themselves attested, so treat
-them as inventory data rather than proof of origin.
-
-Verify a downloaded artifact against the attestation GitHub stored for this
-repository:
-
-```bash
-gh attestation verify keylease-cli-<version>.tgz \
-  --repo KeyLease-Security/keylease-gateway
-gh attestation verify keylease-proxy-<version>.tgz \
-  --repo KeyLease-Security/keylease-gateway
-gh attestation verify keylease-core.wasm \
-  --repo KeyLease-Security/keylease-gateway
-```
-
-`gh attestation verify` succeeds only when the artifact's digest matches the
-attested subject and the attestation was signed by this repository's release
-workflow; it prints the workflow, commit and tag that produced it. To inspect
-the attached bundles offline, they are in-toto/Sigstore JSON and can be read
-with `jq`. To review the SBOM contents:
-
-```bash
-jq '.components[] | {name, version, purl}' sbom-pnpm.cdx.json
-```
-
-If an attestation is missing or fails to verify, do not trust the artifact:
-open a security report instead of using it.
+Report upgrade-path bugs (an upgrade without the admin, a bypass of the hash
+check, storage corruption across an upgrade) through the private channel
+above; they are in scope.
 
 ## Audit status
 

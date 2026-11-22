@@ -62,10 +62,18 @@ function stubFetch(
 }
 
 function okJson(body: unknown, init: ResponseInit = {}): Response {
-  return new Response(JSON.stringify(body), {
+  const json = JSON.stringify(body);
+  const headers = new Headers(init.headers);
+  if (!headers.has('content-type')) {
+    headers.set('content-type', 'application/json');
+  }
+  if (!headers.has('content-length')) {
+    headers.set('content-length', String(Buffer.byteLength(json)));
+  }
+  return new Response(json, {
     status: 200,
-    headers: { 'content-type': 'application/json' },
     ...init,
+    headers,
   });
 }
 
@@ -90,17 +98,24 @@ describe('resolveUpstreamUrl', () => {
 });
 
 describe('buildUpstreamHeaders', () => {
-  it('drops hop-by-hop headers and the lease token by default', () => {
+  it('drops hop-by-hop headers, non-allowlisted headers, and the lease token by default', () => {
     const out = buildUpstreamHeaders({
       host: 'proxy.local',
       connection: 'keep-alive',
       'content-length': '12',
       authorization: 'Bearer kls1.a.b',
       'content-type': 'application/json',
+      accept: 'text/html',
+      'user-agent': 'test-agent',
+      'x-custom-unallowed': 'drop',
       cookie: 'session=1',
     });
 
-    expect(out).toEqual({ 'content-type': 'application/json', cookie: 'session=1' });
+    expect(out).toEqual({
+      'content-type': 'application/json',
+      accept: 'text/html',
+      'user-agent': 'test-agent',
+    });
   });
 
   it('keeps the lease token when explicitly forwarded', () => {
@@ -112,9 +127,40 @@ describe('buildUpstreamHeaders', () => {
   });
 
   it('preserves multi-value headers by folding them onto one field line', () => {
-    const out = buildUpstreamHeaders({ 'x-multi': ['a', 'b'], cookie: ['a=1', 'b=2'] });
+    const out = buildUpstreamHeaders(
+      { 'x-multi': ['a', 'b'], cookie: ['a=1', 'b=2'] },
+      { forwardHeaders: ['x-multi', 'cookie'] },
+    );
     expect(out['x-multi']).toBe('a, b');
     expect(out['cookie']).toBe('a=1; b=2');
+  });
+
+  it('forwards conditional if-* headers by default', () => {
+    const out = buildUpstreamHeaders({
+      'if-none-match': '"xyz"',
+      'if-modified-since': 'yesterday',
+      'if-match': '"abc"',
+    });
+    expect(out).toEqual({
+      'if-none-match': '"xyz"',
+      'if-modified-since': 'yesterday',
+      'if-match': '"abc"',
+    });
+  });
+
+  it('forwards extension headers specified via forwardHeaders', () => {
+    const out = buildUpstreamHeaders(
+      {
+        'x-trace-id': '123',
+        'x-other': 'ignore',
+        cookie: 'user=admin',
+      },
+      { forwardHeaders: ['X-Trace-Id', 'cookie'] },
+    );
+    expect(out).toEqual({
+      'x-trace-id': '123',
+      cookie: 'user=admin',
+    });
   });
 
   it('drops inbound headers starting with x-keylease-', () => {
@@ -122,6 +168,16 @@ describe('buildUpstreamHeaders', () => {
       'x-keylease-calls-remaining': '999999',
       'X-KeyLease-Custom': 'spoofed',
       'x-keylease-lease-id': 'fake',
+      'content-type': 'application/json',
+    });
+    expect(out).toEqual({ 'content-type': 'application/json' });
+  });
+
+  it('drops inbound headers starting with x-forwarded-', () => {
+    const out = buildUpstreamHeaders({
+      'x-forwarded-for': '1.2.3.4',
+      'x-forwarded-host': 'evil.com',
+      'x-forwarded-proto': 'http',
       'content-type': 'application/json',
     });
     expect(out).toEqual({ 'content-type': 'application/json' });
@@ -195,6 +251,7 @@ describe('proxy routing', () => {
       upstream: 'https://api.example.com',
       verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
       fetchImpl: impl,
+      forwardHeaders: ['x-trace-id'],
     });
 
     const res = await app.inject({
@@ -218,6 +275,7 @@ describe('proxy routing', () => {
     expect(calls[0]?.url).toBe('https://api.example.com/v1/weather?city=paris');
     const init = calls[0]?.init as RequestInit & { headers: Record<string, string> };
     expect(init.method).toBe('GET');
+    expect(init.redirect).toBe('manual');
     expect(init.headers['x-trace-id']).toBe('abc');
     expect(init.headers['x-keylease-lease-id']).toBe('lease-1');
     expect(init.headers['host']).toBeUndefined();
@@ -226,6 +284,77 @@ describe('proxy routing', () => {
     expect(init.headers['x-forwarded-for']).toContain('127.0.0.1');
     expect(init.body).toBeUndefined();
 
+    await app.close();
+  });
+
+  it('does not follow upstream redirects: forwards 302 and location header untouched with redirect: manual', async () => {
+    const { impl, calls } = stubFetch(() => {
+      return new Response(null, {
+        status: 302,
+        headers: {
+          location: 'https://other.example.com/target',
+          'content-type': 'text/plain',
+        },
+      });
+    });
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/redirect-me',
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+      },
+    });
+
+    expect(res.statusCode).toBe(302);
+    expect(res.headers['location']).toBe('https://other.example.com/target');
+    expect(res.headers['x-keylease-lease-id']).toBe('lease-1');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init?.redirect).toBe('manual');
+    await app.close();
+  });
+
+  it('forwards only allowlisted headers unless extended via forwardHeaders', async () => {
+    let forwardedHeaders: Record<string, string> = {};
+    const { impl } = stubFetch((_url, init) => {
+      forwardedHeaders = (init?.headers ?? {}) as Record<string, string>;
+      return okJson({ ok: true });
+    });
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+      forwardHeaders: ['x-custom-allowed'],
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/headers-test',
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        accept: 'application/json',
+        'accept-encoding': 'gzip',
+        'user-agent': 'agent/1.0',
+        'if-none-match': '"etag123"',
+        'x-custom-allowed': 'forward-me',
+        'x-secret-internal': 'drop-me',
+        cookie: 'unconfigured-cookie=drop',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(forwardedHeaders['accept']).toBe('application/json');
+    expect(forwardedHeaders['accept-encoding']).toBe('gzip');
+    expect(forwardedHeaders['user-agent']).toBe('agent/1.0');
+    expect(forwardedHeaders['if-none-match']).toBe('"etag123"');
+    expect(forwardedHeaders['x-custom-allowed']).toBe('forward-me');
+    expect(forwardedHeaders['x-secret-internal']).toBeUndefined();
+    expect(forwardedHeaders['cookie']).toBeUndefined();
     await app.close();
   });
 
@@ -848,6 +977,68 @@ describe('proxy routing', () => {
   });
 });
 
+describe('resolveConfig KEYLEASE_UPSTREAM_TIMEOUT_MS', () => {
+  const baseEnv = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
+
+  it('defaults to 15000 ms', () => {
+    expect(resolveConfig(baseEnv).requestTimeoutMs).toBe(15_000);
+  });
+
+  it('parses a positive timeout', () => {
+    expect(
+      resolveConfig({ ...baseEnv, KEYLEASE_UPSTREAM_TIMEOUT_MS: '2500' }).requestTimeoutMs,
+    ).toBe(2_500);
+  });
+
+  it('accepts 0 to disable the timeout', () => {
+    expect(
+      resolveConfig({ ...baseEnv, KEYLEASE_UPSTREAM_TIMEOUT_MS: '0' }).requestTimeoutMs,
+    ).toBe(0);
+  });
+
+  it('rejects negative, fractional or non-numeric values', () => {
+    for (const bad of ['-1', '1.5', 'abc', '']) {
+      expect(() =>
+        resolveConfig({ ...baseEnv, KEYLEASE_UPSTREAM_TIMEOUT_MS: bad }),
+      ).toThrow(ProxyConfigError);
+    }
+  });
+
+  it('reports the timeout in the startup summary', () => {
+    const config = resolveConfig({ ...baseEnv, KEYLEASE_UPSTREAM_TIMEOUT_MS: '900' });
+    expect(describeConfig(config)).toMatchObject({ requestTimeoutMs: 900 });
+  });
+
+  it('maps an upstream abort to 504 using the configured timeout', async () => {
+    const { impl } = stubFetch(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          const abort = () =>
+            reject(Object.assign(new Error('aborted'), { name: 'TimeoutError' }));
+          if (signal?.aborted) abort();
+          else signal?.addEventListener('abort', abort, { once: true });
+        }),
+    );
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+      requestTimeoutMs: 10,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+
+    expect(res.statusCode).toBe(504);
+    expect(res.json()).toMatchObject({ error: 'gateway_timeout' });
+    await app.close();
+  });
+});
+
 describe('resolveConfig KEYLEASE_MAX_BODY_BYTES', () => {
   const baseEnv = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
 
@@ -1128,6 +1319,16 @@ describe('in-flight upstream cap', () => {
       );
     }
   });
+
+  it('parses KEYLEASE_FORWARD_HEADERS', () => {
+    expect(resolveConfig(baseEnv).forwardHeaders).toEqual([]);
+    expect(
+      resolveConfig({
+        ...baseEnv,
+        KEYLEASE_FORWARD_HEADERS: ' X-Trace-Id, Cookie, x-custom-header ,, ',
+      }).forwardHeaders,
+    ).toEqual(['x-trace-id', 'cookie', 'x-custom-header']);
+  });
 });
 
 describe('access log sizes', () => {
@@ -1235,7 +1436,15 @@ describe('buildUpstreamHeaders property test (request-smuggling vectors)', () =>
     'Bearer stolen',
     'x',
   ];
-  const BENIGN = ['accept', 'content-type', 'user-agent', 'x-custom', 'cookie', 'x-request-id'];
+  const ALLOWED = [
+    'accept',
+    'content-type',
+    'user-agent',
+    'range',
+    'if-match',
+    'accept-language',
+    'accept-encoding',
+  ];
 
   it('never forwards hop-by-hop, forwarding or lease headers in any casing', () => {
     const rand = prng(0x5eed);
@@ -1243,7 +1452,7 @@ describe('buildUpstreamHeaders property test (request-smuggling vectors)', () =>
       const input: Record<string, string | string[]> = {};
       const count = 1 + Math.floor(rand() * 12);
       for (let i = 0; i < count; i += 1) {
-        const name = mixCase(rand, rand() < 0.6 ? pick(rand, FORBIDDEN) : pick(rand, BENIGN));
+        const name = mixCase(rand, rand() < 0.6 ? pick(rand, FORBIDDEN) : pick(rand, ALLOWED));
         const value = pick(rand, VALUES);
         input[name] = rand() < 0.2 ? [value, pick(rand, VALUES)] : value;
       }
@@ -1257,10 +1466,10 @@ describe('buildUpstreamHeaders property test (request-smuggling vectors)', () =>
     }
   });
 
-  it('keeps authorization only when forwarding is enabled and preserves benign headers', () => {
+  it('keeps authorization only when forwarding is enabled and preserves allowlisted headers', () => {
     const rand = prng(0xc0ffee);
     for (let run = 0; run < 200; run += 1) {
-      const name = mixCase(rand, pick(rand, BENIGN.filter((n) => n !== 'cookie')));
+      const name = mixCase(rand, pick(rand, ALLOWED));
       const value = pick(rand, VALUES);
       const input = { [name]: value, [mixCase(rand, 'Authorization')]: 'Bearer t' };
       expect(buildUpstreamHeaders(input)[name.toLowerCase()]).toBe(value);
@@ -1271,9 +1480,251 @@ describe('buildUpstreamHeaders property test (request-smuggling vectors)', () =>
     }
   });
 
+  it('filters through allowedHeaders when configured', () => {
+    const out = buildUpstreamHeaders(
+      {
+        accept: 'text/html',
+        'x-custom': 'allowed',
+        'x-other': 'denied',
+        authorization: 'Bearer kls1.a.b',
+      },
+      { allowedHeaders: ['accept', 'x-custom'] },
+    );
+    expect(out).toEqual({
+      accept: 'text/html',
+      'x-custom': 'allowed',
+    });
+  });
+
   it('is deterministic for a given seed', () => {
     const a = prng(42);
     const b = prng(42);
     expect([a(), a(), a()]).toEqual([b(), b(), b()]);
+  });
+});
+
+describe('upstream circuit breaker', () => {
+  it('opens circuit at failure threshold and fails fast with 503 without consuming quota', async () => {
+    let now = NOW * 1000;
+    const clock = () => now;
+
+    let shouldFail = true;
+    const { impl, calls } = stubFetch(() => {
+      if (shouldFail) {
+        throw new Error('ECONNREFUSED');
+      }
+      return okJson({ ok: true });
+    });
+
+    const getLeaseState = vi.fn(async () => leaseState({ callsLimit: 10 }));
+    const verifier = new LeaseVerifier({ provider: { getLeaseState }, clock });
+
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier,
+      fetchImpl: impl,
+      circuitBreakerThreshold: 2,
+      circuitBreakerCooldownMs: 10_000,
+      clock,
+    });
+
+    const token = mintToken();
+
+    // Request 1: upstream failure 1
+    const res1 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res1.statusCode).toBe(502);
+    expect(verifier.localCalls('lease-1')).toBe(1);
+
+    // Request 2: upstream failure 2 -> reaches threshold, circuit opens!
+    const res2 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res2.statusCode).toBe(502);
+    expect(verifier.localCalls('lease-1')).toBe(2);
+
+    // Request 3: circuit is OPEN. Must fail fast with 503 upstream_unavailable
+    // and must NOT consume quota!
+    const res3 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res3.statusCode).toBe(503);
+    expect(res3.headers['retry-after']).toBeDefined();
+    expect(res3.json()).toMatchObject({ error: 'upstream_unavailable' });
+    // Local calls unchanged at 2! Quota untouched!
+    expect(verifier.localCalls('lease-1')).toBe(2);
+    // Fetch was NOT called for request 3!
+    expect(calls).toHaveLength(2);
+
+    // Advance clock past cooldown (10s) -> circuit becomes half-open
+    now += 15_000;
+    shouldFail = false; // upstream recovered
+
+    // Request 4: half-open probe succeeds and closes the circuit
+    const res4 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res4.statusCode).toBe(200);
+    expect(calls).toHaveLength(3);
+    expect(verifier.localCalls('lease-1')).toBe(3);
+
+    // Request 5: circuit is closed, works normally
+    const res5 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res5.statusCode).toBe(200);
+    expect(calls).toHaveLength(4);
+    expect(verifier.localCalls('lease-1')).toBe(4);
+
+    await app.close();
+  });
+
+  it('half-open probe failure re-opens circuit', async () => {
+    let now = NOW * 1000;
+    const clock = () => now;
+
+    const { impl } = stubFetch(() => {
+      throw new Error('ECONNREFUSED');
+    });
+
+    const verifier = new LeaseVerifier({
+      provider: { getLeaseState: async () => leaseState({ callsLimit: 10 }) },
+      clock,
+    });
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier,
+      fetchImpl: impl,
+      circuitBreakerThreshold: 1,
+      circuitBreakerCooldownMs: 5_000,
+      clock,
+    });
+
+    const token = mintToken();
+
+    // Request 1: fails and immediately opens circuit (threshold = 1)
+    const res1 = await app.inject({
+      method: 'GET',
+      url: '/v1/test',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res1.statusCode).toBe(502);
+
+    // Request 2: open -> 503
+    const res2 = await app.inject({
+      method: 'GET',
+      url: '/v1/test',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res2.statusCode).toBe(503);
+
+    // Advance clock into half-open
+    now += 6_000;
+
+    // Request 3: probe fails -> re-opens
+    const res3 = await app.inject({
+      method: 'GET',
+      url: '/v1/test',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res3.statusCode).toBe(502);
+
+    // Request 4: circuit is open again
+    const res4 = await app.inject({
+      method: 'GET',
+      url: '/v1/test',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res4.statusCode).toBe(503);
+
+    await app.close();
+  });
+});
+
+describe('rate limit integration (429 Retry-After)', () => {
+  it('returns 429 with Retry-After header and leaves quota untouched', async () => {
+    const now = NOW * 1000;
+    const clock = () => now;
+    const { impl } = stubFetch(() => okJson({ ok: true }));
+
+    const verifier = new LeaseVerifier({
+      provider: { getLeaseState: async () => leaseState({ callsLimit: 10 }) },
+      rateLimitPerMinute: 1,
+      clock,
+    });
+
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier,
+      fetchImpl: impl,
+      clock,
+    });
+
+    const token = mintToken();
+
+    // 1st request: allowed
+    const res1 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res1.statusCode).toBe(200);
+    expect(verifier.localCalls('lease-1')).toBe(1);
+
+    // 2nd request: 429 rate limited
+    const res2 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res2.statusCode).toBe(429);
+    expect(res2.headers['retry-after']).toBeDefined();
+    expect(Number(res2.headers['retry-after'])).toBeGreaterThanOrEqual(1);
+    expect(res2.json()).toMatchObject({ error: 'rate_limited' });
+    // Quota remains 1
+    expect(verifier.localCalls('lease-1')).toBe(1);
+
+    await app.close();
+  });
+});
+
+describe('resolveConfig for rate limit, service id, and circuit breaker', () => {
+  const baseEnv = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
+
+  it('parses valid KEYLEASE_RATE_LIMIT_PER_MINUTE', () => {
+    expect(resolveConfig(baseEnv).rateLimitPerMinute).toBe(0);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_RATE_LIMIT_PER_MINUTE: '0' }).rateLimitPerMinute).toBe(0);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_RATE_LIMIT_PER_MINUTE: '60' }).rateLimitPerMinute).toBe(60);
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_RATE_LIMIT_PER_MINUTE: '-5' })).toThrow(ProxyConfigError);
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_RATE_LIMIT_PER_MINUTE: 'invalid' })).toThrow(ProxyConfigError);
+  });
+
+  it('parses KEYLEASE_SERVICE_ID', () => {
+    expect(resolveConfig(baseEnv).serviceId).toBeUndefined();
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_SERVICE_ID: ' weather-api ' }).serviceId).toBe('weather-api');
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_SERVICE_ID: '' }).serviceId).toBeUndefined();
+  });
+
+  it('parses KEYLEASE_CIRCUIT_BREAKER_THRESHOLD and KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS', () => {
+    expect(resolveConfig(baseEnv).circuitBreakerThreshold).toBe(5);
+    expect(resolveConfig(baseEnv).circuitBreakerCooldownMs).toBe(30_000);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_THRESHOLD: '10' }).circuitBreakerThreshold).toBe(10);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_THRESHOLD: '0' }).circuitBreakerThreshold).toBe(0);
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_THRESHOLD: '-1' })).toThrow(ProxyConfigError);
+
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS: '5000' }).circuitBreakerCooldownMs).toBe(5000);
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS: '0' })).toThrow(ProxyConfigError);
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS: '-10' })).toThrow(ProxyConfigError);
   });
 });

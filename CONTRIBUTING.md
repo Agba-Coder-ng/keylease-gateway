@@ -20,7 +20,7 @@ pnpm typecheck      # build + tsc --noEmit
 pnpm test:e2e       # scripted end-to-end flow: proxy + simulated soroban network
 
 # contract (needs Rust + stellar-cli)
-pnpm contract:test  # cargo test (22 tests)
+pnpm contract:test  # cargo test (40 tests)
 pnpm contract:build # stellar contract build -> wasm32v1-none
 ```
 

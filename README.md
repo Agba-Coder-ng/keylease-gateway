@@ -551,12 +551,22 @@ without ever printing the seed. Stored sessions are listed with their expiry.
 ## Contract reference
 
 `contracts/keylease-core` is a Soroban contract (`soroban-sdk` 29, built for
-`wasm32v1-none`).
+`wasm32v1-none`, ~15.9 KB wasm, enforced against a 20 KB CI budget).
+
+### Wasm Size Budget
+
+To keep deployment fees low and ensure execution fits safely within Soroban resource limits, CI enforces a hard budget on the compiled contract artifact (`target/wasm32v1-none/release/keylease_core.wasm`):
+
+- **Maximum Allowed Size**: 20 KB (20,480 bytes)
+- **Current Size**: ~15.9 KB (15,912 bytes)
+- **Enforcement**: The `contract` job in `.github/workflows/ci.yml` measures the built `.wasm` after `stellar contract build` and fails the build if the size exceeds 20 KB.
+- **Explicit Override**: For exceptional additions that justify exceeding the budget, applying the `wasm-size-override` label to the pull request with a documented explanation bypasses the size check.
 
 | Entry point | Auth | Description |
 | --- | --- | --- |
 | `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account (`admin != gateway`) |
 | `set_gateway(gateway)` | admin | Rotate the account allowed to commit quota |
+| `set_paused(paused)` | admin | Emergency pause: while `true`, `create_lease` fails with `Paused` before any escrow moves; existing leases keep being served, revoked and settled |
 | `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
 | `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
 | `register_service(provider, service, price_per_call)` | provider | Register a new service, or re-price one you own (`price_per_call > 0`). Another provider's id → `Unauthorized` |
@@ -686,11 +696,34 @@ All contract events are emitted through centralized helpers with `SCHEMA_VERSION
 | `lease_revoked` | `[lease_revoked, consumer, lease_id]` | `(1u32, refund_amount)` | Lease revoked early by consumer |
 | `lease_settled` | `[lease_settled, provider, lease_id]` | `(1u32, provider_payout, consumer_refund)` | Escrow settled after expiry/exhaustion |
 
+Escrow invariant: the contract only ever pays out `price_paid` once per lease,
+split as `used/total` to the provider and `(total-used)/total` to the consumer.
+
+### Emergency pause
+
+`set_paused(true)` is the admin's circuit breaker for new exposure. It is the
+only entry point the flag affects: `create_lease` returns `Error::Paused`
+before the escrow transfer, so no tokens move and no lease id is allocated.
+Everything that unwinds existing exposure keeps working — `use_call`,
+`revoke`, `settle`, `quote`, `register_service`, `set_service_active` and every
+view — and escrow is never touched, so prepaid leases can still be consumed,
+revoked and settled while the contract is paused. Resuming with
+`set_paused(false)` needs no other state change. Each transition emits `paused`
+or `unpaused` with the acting admin in the topic and the new state as the
+payload, and `get_config()` exposes `paused`. The pause is admin-only, so treat
+it as an incident-response action and record why it was taken (see
+[SECURITY.md](./SECURITY.md)).
+
+### Contract errors
+
 Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
-`Error(Contract, #n)`:
+`Error(Contract, #n)`. The numeric codes are part of the ABI and are only ever
+appended, so the table below is stable across additive releases:
 
 | Code | Variant | Meaning |
 | --- | --- | --- |
+| 1 | `AlreadyInitialized` | `init` ran more than once |
+| 2 | `NotInitialized` | `init` has not been called yet |
 | 3 | `UnknownService` | Service id was never registered |
 | 4 | `ServiceInactive` | Service paused by its provider |
 | 5 | `LeaseNotFound` | No lease with that id (proxy → `403 lease_not_found`) |

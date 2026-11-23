@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)]
 //! # keylease-core
 //!
 //! Soroban lease registry that backs the KeyLease gateway. Everything a lease
@@ -65,6 +66,8 @@ pub enum Error {
     Unauthorized = 14,
     /// `create_lease` was called with the contract itself as consumer.
     InvalidConsumer = 15,
+    /// `settle_many` was called with more IDs than `MAX_SETTLE_BATCH`.
+    BatchTooLarge = 16,
 }
 
 #[contracttype]
@@ -76,6 +79,10 @@ pub struct Config {
     /// Account allowed to commit served calls (`use_call`).
     pub gateway: Address,
     pub lease_count: u64,
+    /// Emergency switch for new leases. While `true`, `create_lease` fails
+    /// with [`Error::Paused`]; existing leases keep being served, revoked and
+    /// settled, and escrow is never touched.
+    pub paused: bool,
 }
 
 #[contracttype]
@@ -86,6 +93,8 @@ pub struct Service {
     /// Price of a single API call, in token smallest units.
     pub price_per_call: i128,
     pub active: bool,
+    /// Number of leases ever created for this service.
+    pub lease_count: u64,
 }
 
 #[contracttype]
@@ -170,6 +179,25 @@ fn store_config(env: &Env, config: &Config) {
     bump_instance_ttl(env);
 }
 
+/// Validates that a service identifier is non-empty, at most `MAX_SERVICE_LEN` bytes,
+/// and contains only ASCII alphanumeric characters, hyphens, underscores, or dots.
+pub fn validate_service_id(service: &soroban_sdk::String) -> Result<(), Error> {
+    let len = service.len();
+    if !(MIN_SERVICE_LEN..=MAX_SERVICE_LEN).contains(&len) {
+        return Err(Error::InvalidService);
+    }
+    let mut buf = [0u8; MAX_SERVICE_LEN as usize];
+    let slice = &mut buf[..len as usize];
+    service.copy_into_slice(slice);
+    for &b in slice.iter() {
+        let is_allowed = matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.');
+        if !is_allowed {
+            return Err(Error::InvalidService);
+        }
+    }
+    Ok(())
+}
+
 fn load_service(env: &Env, service: &soroban_sdk::String) -> Result<Service, Error> {
     let key = DataKey::Service(service.clone());
     let stored = env
@@ -235,6 +263,9 @@ impl KeyleaseCore {
         if env.storage().instance().has(&config_key()) {
             return Err(Error::AlreadyInitialized);
         }
+        if admin == gateway {
+            return Err(Error::SameAdminAndGateway);
+        }
         admin.require_auth();
         store_config(
             &env,
@@ -243,6 +274,7 @@ impl KeyleaseCore {
                 token,
                 gateway,
                 lease_count: 0,
+                paused: false,
             },
         );
         env.events()
@@ -263,6 +295,25 @@ impl KeyleaseCore {
         Ok(())
     }
 
+    /// Admin-only: pause or resume new leases.
+    ///
+    /// The pause is deliberately narrow: `create_lease` is rejected with
+    /// `Error::Paused` before any tokens move, while `use_call`, `revoke`,
+    /// `settle` and every view keep working so prepaid leases can still be
+    /// redeemed and paid out. Escrow balances are never modified here.
+    ///
+    /// Emits `paused` or `unpaused`, topic `(event, admin)`, payload `paused`.
+    pub fn set_paused(env: Env, paused: bool) -> Result<bool, Error> {
+        let mut config = load_config(&env)?;
+        config.admin.require_auth();
+        config.paused = paused;
+        store_config(&env, &config);
+        let event = if paused { "paused" } else { "unpaused" };
+        env.events()
+            .publish((Symbol::new(&env, event), config.admin.clone()), paused);
+        Ok(paused)
+    }
+
     /// Admin-only: nominate the next admin. The handover only takes effect
     /// once the nominee calls `accept_admin`, so a typo in the new address
     /// cannot permanently lock out admin rotation.
@@ -273,10 +324,7 @@ impl KeyleaseCore {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
         bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "admin_proposed"), config.admin, new_admin),
-            env.ledger().timestamp(),
-        );
+        events::emit_admin_proposed(&env, &config.admin, &new_admin);
         Ok(())
     }
 
@@ -294,10 +342,7 @@ impl KeyleaseCore {
         config.admin = pending.clone();
         env.storage().instance().remove(&DataKey::PendingAdmin);
         store_config(&env, &config);
-        env.events().publish(
-            (Symbol::new(&env, "admin_changed"), pending),
-            env.ledger().timestamp(),
-        );
+        events::emit_admin_changed(&env, &pending);
         Ok(())
     }
 
@@ -344,6 +389,7 @@ impl KeyleaseCore {
     ) -> Result<Service, Error> {
         load_config(&env)?;
         provider.require_auth();
+        validate_service_id(&service)?;
         if price_per_call <= 0 {
             return Err(Error::InvalidPrice);
         }
@@ -358,14 +404,45 @@ impl KeyleaseCore {
             service: service.clone(),
             price_per_call,
             active: true,
+            lease_count,
         };
         env.storage().persistent().set(&key, &stored);
         bump_persistent_ttl(&env, &key);
+
+        if is_new {
+            let mut list = load_service_list(&env);
+            list.push_back(service.clone());
+            store_service_list(&env, &list);
+        }
+
         env.events().publish(
             (Symbol::new(&env, "service_registered"), provider),
             (service, price_per_call),
         );
         Ok(stored)
+    }
+
+    /// Returns a paginated list of registered service IDs.
+    ///
+    /// Service IDs are append-only and returned in registration order.
+    /// The page size is clamped to `MAX_SERVICE_PAGE_SIZE = 50`.
+    pub fn list_services(
+        env: Env,
+        start: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<soroban_sdk::String> {
+        let list = load_service_list(&env);
+        let limit = limit.min(MAX_SERVICE_PAGE_SIZE);
+        let total = list.len();
+        let mut result = soroban_sdk::Vec::new(&env);
+        if start >= total || limit == 0 {
+            return result;
+        }
+        let end = (start + limit).min(total);
+        for i in start..end {
+            result.push_back(list.get(i).unwrap());
+        }
+        result
     }
 
     /// Provider-only: pause or resume a service.
@@ -375,6 +452,7 @@ impl KeyleaseCore {
         service: soroban_sdk::String,
         active: bool,
     ) -> Result<Service, Error> {
+        load_config(&env)?;
         provider.require_auth();
         let mut stored = load_service(&env, &service)?;
         if stored.provider != provider {
@@ -419,29 +497,35 @@ impl KeyleaseCore {
             return Err(Error::InvalidConsumer);
         }
         consumer.require_auth();
-        if calls == 0 {
+        if calls == 0 || calls > MAX_CALLS {
             return Err(Error::InvalidCalls);
         }
-        if duration == 0 {
+        if duration == 0 || duration > MAX_LEASE_DURATION {
             return Err(Error::InvalidDuration);
         }
+        let expires_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(duration)
+            .ok_or(Error::InvalidDuration)?;
 
         let mut config = load_config(&env)?;
-        let stored = load_service(&env, &service)?;
+        let mut stored = load_service(&env, &service)?;
         if !stored.active {
             return Err(Error::ServiceInactive);
         }
+        stored.lease_count = stored.lease_count.saturating_add(1);
+        let service_key = DataKey::Service(service.clone());
+        env.storage().persistent().set(&service_key, &stored);
+        bump_persistent_ttl(&env, &service_key);
 
         let amount = stored
             .price_per_call
             .checked_mul(calls as i128)
             .ok_or(Error::InvalidAmount)?;
 
-        token::Client::new(&env, &config.token).transfer(
-            &consumer,
-            &env.current_contract_address(),
-            &amount,
-        );
+        let contract_address = env.current_contract_address();
+        token::Client::new(&env, &config.token).transfer(&consumer, &contract_address, &amount);
 
         let id = config.lease_count + 1;
         config.lease_count = id;
@@ -454,7 +538,7 @@ impl KeyleaseCore {
             consumer: consumer.clone(),
             calls_limit: calls,
             calls_used: 0,
-            expires_at: env.ledger().timestamp() + duration,
+            expires_at,
             active: true,
             settled: false,
             price_paid: amount,
@@ -469,93 +553,12 @@ impl KeyleaseCore {
         Ok(id)
     }
 
-    /// Consumer-only: extend an active, unexpired, unsettled lease.
-    ///
-    /// At least one of `extra_calls` and `extra_duration` must be positive;
-    /// both zero is rejected with `InvalidCalls`. A zero value for either
-    /// argument means "leave that dimension unchanged", so a caller can buy
-    /// more calls without changing expiry, or more time without buying calls.
-    /// The service's active flag is not re-checked: this renews an existing
-    /// lease, it does not create a new one.
-    ///
-    /// The added calls are priced exactly like `create_lease`:
-    /// `extra_calls × price_per_call`, with checked arithmetic. The amount is
-    /// pulled into the same escrow, `price_paid` grows with it, and
-    /// `calls_limit` / `expires_at` grow by the requested amounts. The lease id
-    /// and `calls_used` do not change. `AlreadySettled`, `LeaseInactive` and
-    /// `LeaseExpired` reject leases that can no longer be extended.
-    pub fn extend_lease(
-        env: Env,
-        lease_id: u64,
-        extra_calls: u32,
-        extra_duration: u64,
-    ) -> Result<Lease, Error> {
-        if extra_calls == 0 && extra_duration == 0 {
-            return Err(Error::InvalidCalls);
-        }
-
-        let mut lease = load_lease(&env, lease_id)?;
-        lease.consumer.require_auth();
-        if lease.settled {
-            return Err(Error::AlreadySettled);
-        }
-        if !lease.active {
-            return Err(Error::LeaseInactive);
-        }
-        if lease.expires_at <= env.ledger().timestamp() {
-            return Err(Error::LeaseExpired);
-        }
-
-        let config = load_config(&env)?;
-        let stored = load_service(&env, &lease.service)?;
-
-        let amount = stored
-            .price_per_call
-            .checked_mul(extra_calls as i128)
-            .ok_or(Error::InvalidAmount)?;
-        let new_calls_limit = lease
-            .calls_limit
-            .checked_add(extra_calls)
-            .ok_or(Error::InvalidCalls)?;
-        let new_expires_at = lease
-            .expires_at
-            .checked_add(extra_duration)
-            .ok_or(Error::InvalidDuration)?;
-        let new_price_paid = lease
-            .price_paid
-            .checked_add(amount)
-            .ok_or(Error::InvalidAmount)?;
-
-        if amount > 0 {
-            token::Client::new(&env, &config.token).transfer(
-                &lease.consumer,
-                &env.current_contract_address(),
-                &amount,
-            );
-        }
-
-        lease.calls_limit = new_calls_limit;
-        lease.expires_at = new_expires_at;
-        lease.price_paid = new_price_paid;
-        store_lease(&env, &lease);
-
-        env.events().publish(
-            (
-                Symbol::new(&env, "lease_extended"),
-                lease.consumer.clone(),
-                lease_id,
-            ),
-            (extra_calls, extra_duration, amount),
-        );
-        Ok(lease)
-    }
-
     /// Gateway-only: commit `count` served calls against a lease. Committing
     /// more calls than are left clamps at `calls_limit` instead of overflowing.
     ///
     /// The `calls_committed` event keeps its
     /// `(calls_committed, consumer, lease_id)` topic tuple and publishes
-    /// `(calls_used, remaining)` so indexers do not need a second read.
+    /// `(1, calls_used, remaining)` so indexers do not need a second read.
     pub fn use_call(env: Env, lease_id: u64, count: u32) -> Result<Lease, Error> {
         let config = load_config(&env)?;
         config.gateway.require_auth();
@@ -596,13 +599,13 @@ impl KeyleaseCore {
             return Err(Error::AlreadySettled);
         }
         let config = load_config(&env)?;
-        let refund = lease.price_paid
-            * (lease.calls_limit.saturating_sub(lease.calls_used) as i128)
-            / (lease.calls_limit as i128);
+        let (_payable, refund) =
+            calculate_payout(lease.price_paid, lease.calls_used, lease.calls_limit);
 
         if refund > 0 {
+            let contract_address = env.current_contract_address();
             token::Client::new(&env, &config.token).transfer(
-                &env.current_contract_address(),
+                &contract_address,
                 &lease.consumer,
                 &refund,
             );
@@ -622,6 +625,15 @@ impl KeyleaseCore {
         Ok(lease)
     }
 
+    /// Consumer exit for expired leases: refunds unused calls and closes the lease.
+    pub fn revoke_expired_lease(env: Env, lease_id: u64) -> Result<Lease, Error> {
+        let lease = load_lease(&env, lease_id)?;
+        if lease.expires_at > env.ledger().timestamp() {
+            return Err(Error::LeaseNotSettleable);
+        }
+        Self::revoke(env, lease_id)
+    }
+
     /// Permissionless: settle an expired or exhausted lease. The provider is
     /// paid for consumed calls, the consumer gets the remainder back.
     pub fn settle(env: Env, lease_id: u64) -> Result<Lease, Error> {
@@ -639,8 +651,8 @@ impl KeyleaseCore {
         let token_client = token::Client::new(&env, &config.token);
         let escrow = env.current_contract_address();
 
-        let payable = lease.price_paid * (lease.calls_used as i128) / (lease.calls_limit as i128);
-        let refund = lease.price_paid - payable;
+        let (payable, refund) =
+            calculate_payout(lease.price_paid, lease.calls_used, lease.calls_limit);
 
         if payable > 0 {
             token_client.transfer(&escrow, &lease.provider, &payable);
@@ -661,6 +673,27 @@ impl KeyleaseCore {
             (payable, refund),
         );
         Ok(lease)
+    }
+
+    /// Permissionless: settle a batch of expired or exhausted leases.
+    ///
+    /// Bounded by `MAX_SETTLE_BATCH = 50`. Returns a list of settled leases.
+    /// Leases that are not yet settleable (active and unexpired) or already
+    /// settled are skipped so valid settlements in the batch still succeed.
+    pub fn settle_many(
+        env: Env,
+        ids: soroban_sdk::Vec<u64>,
+    ) -> Result<soroban_sdk::Vec<Lease>, Error> {
+        if ids.len() > MAX_SETTLE_BATCH {
+            return Err(Error::BatchTooLarge);
+        }
+        let mut settled = soroban_sdk::Vec::new(&env);
+        for id in ids.iter() {
+            if let Ok(lease) = Self::settle(env.clone(), id) {
+                settled.push_back(lease);
+            }
+        }
+        Ok(settled)
     }
 
     /// Live lease state.
@@ -707,7 +740,7 @@ impl KeyleaseCore {
         load_config(&env)
     }
 
-    /// Contract ABI version (the crate version, e.g. `"0.3.0"`). Works before
+    /// Contract ABI version (the crate version, e.g. `"0.2.0"`). Works before
     /// `init`, so deploy verification can check it in one simulated call.
     pub fn version(env: Env) -> soroban_sdk::String {
         soroban_sdk::String::from_str(&env, CONTRACT_VERSION)

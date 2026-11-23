@@ -13,6 +13,7 @@ import {
 } from './commands/lease.js';
 import { statusCommand, type StatusArgs, type StatusDeps } from './commands/status.js';
 import {
+  releaseCommand,
   revokeCommand,
   settleCommand,
   useCallCommand,
@@ -45,6 +46,9 @@ import { renderError } from './error-renderer.js';
 
 export { CliError, redactToken } from './errors.js';
 
+export const MAX_CALLS = 1_000_000;
+export const MAX_DURATION = 31_536_000;
+
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
 
@@ -62,6 +66,7 @@ export type CommandName =
   | 'status'
   | 'settle'
   | 'revoke'
+  | 'release'
   | 'sessions'
   | 'completions';
 
@@ -74,6 +79,7 @@ export type Invocation =
   | { command: 'status'; args: StatusArgs }
   | { command: 'settle'; args: SettleArgs }
   | { command: 'revoke'; args: RevokeArgs }
+  | { command: 'release'; args: ReleaseArgs }
   | { command: 'sessions'; args: SessionsArgs }
   | { command: 'completions'; args: CompletionsArgs };
 
@@ -223,7 +229,12 @@ function validateRpcUrl(url: string): void {
   // Allow http: only for localhost/127.0.0.1
   if (scheme === 'http:') {
     const hostname = parsed.hostname;
-    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1') {
+    if (
+      hostname !== 'localhost' &&
+      hostname !== '127.0.0.1' &&
+      hostname !== '::1' &&
+      hostname !== '[::1]'
+    ) {
       throw new CliError(
         `invalid --rpc URL "${url}": http: is only allowed for localhost, not ${hostname}`,
         'invalid_option',
@@ -314,6 +325,17 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
       if (!dryRun && secret === undefined) {
         throw new CliError('--secret is required unless --dry-run is set', 'missing_option');
       }
+      const calls = requirePositiveInt(values, 'calls');
+      if (calls > MAX_CALLS) {
+        throw new CliError(`--calls cannot exceed ${MAX_CALLS}, got ${calls}`, 'invalid_option');
+      }
+      const duration = requirePositiveInt(values, 'duration');
+      if (duration > MAX_DURATION) {
+        throw new CliError(
+          `--duration cannot exceed ${MAX_DURATION} seconds (365 days), got ${duration}`,
+          'invalid_option',
+        );
+      }
       const args: AcquireArgs = {
         ...transactionArgs(values),
         service: requireString(values, 'service'),
@@ -402,6 +424,18 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
         },
       };
     }
+    case 'release': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'release',
+        args: {
+          ...networkArgs(values),
+          lease: requireString(values, 'lease'),
+          secret: requireString(values, 'secret'),
+          json: values.json === true,
+        },
+      };
+    }
     case 'sessions': {
       ensureNoPositionals(positionals);
       return {
@@ -429,7 +463,7 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
     }
     default:
       throw new CliError(
-        `unknown command "${rawCommand}" (expected acquire, env, status, settle, revoke, sessions or completions)`,
+        `unknown command "${rawCommand}" (expected acquire, env, status, settle, revoke, release, sessions or completions)`,
         'unknown_command',
       );
   }
@@ -454,6 +488,7 @@ Commands:
   status      Inspect an on-chain lease, or verify a session token offline
   settle      Settle an expired/exhausted lease: pay the provider, refund the consumer
   revoke      End a lease early and refund its unused calls
+  release     Release an expired lease to claim the consumer refund
   sessions    List locally stored leases or prune expired entries
   completions Print a bash, zsh or fish completion script
 

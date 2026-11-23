@@ -23,6 +23,7 @@
  *   KEYLEASE_MAX_INFLIGHT    max concurrent proxied requests; excess get 503 + Retry-After
  *                            (default: 1024, 0 disables)
  *   KEYLEASE_FORWARD_AUTH    "true" to forward the caller's bearer token
+ *   KEYLEASE_FORWARD_HEADERS comma-separated additional request header names to forward
  *   KEYLEASE_METRICS_ENABLED "true" to expose Prometheus metrics on /metrics (default: false)
  *   KEYLEASE_SHUTDOWN_TIMEOUT_MS shutdown drain timeout in ms (default: 10000)
  *   PORT / HOST              listen address (default: 8080 / 0.0.0.0)
@@ -56,10 +57,15 @@ export interface ProxyEnv {
   KEYLEASE_UPSTREAM_TIMEOUT_MS?: string | undefined;
   KEYLEASE_TRUST_PROXY?: string | undefined;
   KEYLEASE_FORWARD_AUTH?: string | undefined;
+  KEYLEASE_FORWARD_HEADERS?: string | undefined;
   KEYLEASE_METRICS_ENABLED?: string | undefined;
   KEYLEASE_SHUTDOWN_TIMEOUT_MS?: string | undefined;
   KEYLEASE_MAX_BODY_BYTES?: string | undefined;
   KEYLEASE_MAX_INFLIGHT?: string | undefined;
+  KEYLEASE_SERVICE_ID?: string | undefined;
+  KEYLEASE_RATE_LIMIT_PER_MINUTE?: string | undefined;
+  KEYLEASE_CIRCUIT_BREAKER_THRESHOLD?: string | undefined;
+  KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS?: string | undefined;
   PORT?: string | undefined;
   HOST?: string | undefined;
 }
@@ -79,6 +85,7 @@ export interface ResolvedConfig {
   /** Per-request upstream timeout in milliseconds; 0 disables it. */
   requestTimeoutMs: number;
   forwardAuthorization: boolean;
+  forwardHeaders: string[];
   trustProxy: boolean | number | string[];
   metricsEnabled: boolean;
   shutdownTimeoutMs: number;
@@ -87,6 +94,10 @@ export interface ResolvedConfig {
   quotaFlushMs: number;
   maxBodyBytes: number;
   maxInFlight: number;
+  serviceId?: string | undefined;
+  rateLimitPerMinute: number;
+  circuitBreakerThreshold: number;
+  circuitBreakerCooldownMs: number;
 }
 
 export const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024; // 32 MiB
@@ -125,6 +136,14 @@ function parseTrustProxy(raw: string | undefined): boolean | number | string[] {
     );
   }
   return entries;
+}
+
+function parseForwardHeaders(raw: string | undefined): string[] {
+  if (raw === undefined || raw.trim() === '') return [];
+  return raw
+    .split(',')
+    .map((name) => name.trim().toLowerCase())
+    .filter((name) => name.length > 0);
 }
 
 export function resolveConfig(env: ProxyEnv): ResolvedConfig {
@@ -172,6 +191,27 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     );
   }
 
+  const rawServiceId = env.KEYLEASE_SERVICE_ID?.trim();
+  const serviceId = rawServiceId && rawServiceId.length > 0 ? rawServiceId : undefined;
+
+  const rateLimitPerMinute = nonNegativeInt(
+    env.KEYLEASE_RATE_LIMIT_PER_MINUTE,
+    0,
+    'KEYLEASE_RATE_LIMIT_PER_MINUTE',
+  );
+
+  const circuitBreakerThreshold = nonNegativeInt(
+    env.KEYLEASE_CIRCUIT_BREAKER_THRESHOLD,
+    5,
+    'KEYLEASE_CIRCUIT_BREAKER_THRESHOLD',
+  );
+
+  const circuitBreakerCooldownMs = positiveInt(
+    env.KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS,
+    30_000,
+    'KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS',
+  );
+
   return {
     upstream,
     host: env.HOST ?? '0.0.0.0',
@@ -183,6 +223,7 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
       'KEYLEASE_UPSTREAM_TIMEOUT_MS',
     ),
     forwardAuthorization: env.KEYLEASE_FORWARD_AUTH === 'true',
+    forwardHeaders: parseForwardHeaders(env.KEYLEASE_FORWARD_HEADERS),
     trustProxy: parseTrustProxy(env.KEYLEASE_TRUST_PROXY),
     metricsEnabled: env.KEYLEASE_METRICS_ENABLED === 'true',
     shutdownTimeoutMs: positiveInt(
@@ -195,6 +236,10 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     quotaFlushMs: positiveInt(env.KEYLEASE_QUOTA_FLUSH_MS, 10_000, 'KEYLEASE_QUOTA_FLUSH_MS'),
     maxBodyBytes,
     maxInFlight,
+    serviceId,
+    rateLimitPerMinute,
+    circuitBreakerThreshold,
+    circuitBreakerCooldownMs,
   };
 }
 
@@ -212,6 +257,7 @@ export function describeConfig(config: ResolvedConfig): Record<string, unknown> 
     cacheTtlMs: config.cacheTtlMs,
     requestTimeoutMs: config.requestTimeoutMs,
     forwardAuthorization: config.forwardAuthorization,
+    forwardHeaders: config.forwardHeaders,
     trustProxy: config.trustProxy,
     metricsEnabled: config.metricsEnabled,
     shutdownTimeoutMs: config.shutdownTimeoutMs,
@@ -220,6 +266,10 @@ export function describeConfig(config: ResolvedConfig): Record<string, unknown> 
     quotaFlushMs: config.quotaFlushMs,
     maxBodyBytes: config.maxBodyBytes,
     maxInFlight: config.maxInFlight,
+    serviceId: config.serviceId ?? null,
+    rateLimitPerMinute: config.rateLimitPerMinute,
+    circuitBreakerThreshold: config.circuitBreakerThreshold,
+    circuitBreakerCooldownMs: config.circuitBreakerCooldownMs,
   };
 }
 
@@ -323,17 +373,22 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
   const verifier = new LeaseVerifier({
     provider: providerFromClient(client),
     cacheTtlMs: config.cacheTtlMs,
+    serviceId: config.serviceId,
+    rateLimitPerMinute: config.rateLimitPerMinute,
     ...(quotaSink === undefined ? {} : { quotaSink }),
   });
   const app = buildProxyServer({
     upstream: config.upstream,
     verifier,
     forwardAuthorization: config.forwardAuthorization,
+    forwardHeaders: config.forwardHeaders,
     trustProxy: config.trustProxy,
     metricsEnabled: config.metricsEnabled,
     requestTimeoutMs: config.requestTimeoutMs,
     maxBodyBytes: config.maxBodyBytes,
     maxInFlight: config.maxInFlight,
+    circuitBreakerThreshold: config.circuitBreakerThreshold,
+    circuitBreakerCooldownMs: config.circuitBreakerCooldownMs,
     logger: true,
   });
   app.log.info({ config: describeConfig(config) }, 'configuration');

@@ -21,8 +21,8 @@ Everything the system depends on is Soroban:
 | Layer | What it does on Stellar |
 | --- | --- |
 | [`contracts/keylease-core`](./contracts/keylease-core) | Soroban registry: services, prepaid leases, **escrow**, on-chain quota, provider payout + consumer refund |
-| [`@keylease/cli`](./packages/cli) | Signs `create_lease` (paying the SAC token) and mints ed25519 session tokens; `settle`/`revoke` release escrow |
-| [`@keylease/proxy`](./packages/proxy) | Verifies session tokens offline, reads lease state by **simulating** `get_lease`, and commits served calls with `use_call` |
+| [`@keylease/cli`](./packages/cli) | Signs `create_lease` (paying the SAC token) and mints ed25519 session tokens; `settle`/`revoke`/`release` release escrow |
+| [`@keylease/proxy`](./packages/proxy) | Verifies session tokens offline, reads lease state by **simulating** `get_lease`, streams responses, and commits served calls with `use_call` |
 
 ```
 contracts/keylease-core  →  Soroban contract (Rust, soroban-sdk 29)
@@ -72,30 +72,9 @@ packages/proxy           →  @keylease/proxy   lease-verifying reverse proxy
            └─────────────────┘
 ```
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant CLI as @keylease/cli
-    participant X as keylease-core (Soroban)
-    participant T as SAC token (XLM)
-    participant P as @keylease/proxy
-    participant U as Upstream API
-
-    C->>CLI: keylease acquire --service weather-api --calls 100 --secret S…
-    CLI->>X: create_lease(consumer, service, 100, 3600)
-    X->>T: transfer(consumer → contract, 100 × price_per_call)
-    X-->>CLI: lease_id = 2
-    CLI-->>C: kls1.<payload>.<ed25519 signature>
-
-    C->>P: GET /v1/weather (Authorization: Bearer kls1.…)
-    P->>P: verify ed25519 signature + expiry (offline)
-    P->>X: simulate get_lease(2)  (cached ≤ 30s)
-    X-->>P: { consumer, calls_limit, calls_used, expires_at, active }
-    P->>U: forwarded request + x-keylease-* headers
-    U-->>P: response
-    P-->>C: response + x-keylease-calls-remaining
-    P->>X: use_call(2, n)   (batched, gateway-signed)
-```
+The sequence of these steps, the trust boundaries between client, proxy,
+RPC, contract and SAC token, and the attacker model are documented in
+**[docs/architecture.md](./docs/architecture.md)**.
 
 ### Why it is shaped this way
 
@@ -124,6 +103,91 @@ sequenceDiagram
   entries whose TTL is extended on every write **and** every read, so a lease
   does not disappear from state while it is still payable, even if it is only
   ever read (the proxy's `get_lease` path).
+
+---
+
+## Quota batching and on-chain reconciliation
+
+The proxy has two quota views:
+
+- **Locally observed usage** is maintained in memory by `LeaseVerifier`. Each
+  served, accepted request increments that process's counter immediately.
+- **On-chain committed usage** is maintained by the Soroban contract as
+  `calls_used`. A configured gateway key is required for batched `use_call`
+  commits.
+
+The local counter is the fast path: it admits traffic without waiting for an
+RPC round trip. It is not durable and is not a substitute for the lease's
+on-chain state.
+
+When a gateway secret is configured, the proxy queues one count per lease.
+The queue flushes when the **total pending count across leases reaches 50**,
+after a **10-second interval**, when the tracked-lease bound triggers an early
+flush, or during shutdown's `close()` drain. Operators can override the batch
+size and interval with `KEYLEASE_QUOTA_BATCH` and `KEYLEASE_QUOTA_FLUSH_MS`.
+Each flush snapshots pending counts and issues a separate `use_call(lease_id,
+count)` for each lease. Commits are serialized and are fire-and-forget from
+the client request path: the request has already been admitted and returned
+without waiting for commit success.
+
+If an RPC commit fails, that lease's count is returned to the pending map and
+`onError` logs it. The implementation schedules jittered exponential retry
+backoff (1-second base, 30-second cap by default) and makes at most five total
+commit attempts per pending batch. Later local traffic is added to requeued
+pending usage, so a later successful commit can include both earlier and newly
+observed calls. Repeated failure does not turn local usage into an HTTP 5xx,
+and the on-chain lease remains authoritative for settlement.
+
+There is an explicit crash window: the verifier counter and quota batch map
+live only in process memory. Calls observed since the last successful commit
+can be lost if the process exits unexpectedly or restarts; pending usage is
+not guaranteed to survive. Graceful close attempts to flush remaining counts,
+but a forced process termination or unavailable RPC may leave committed usage
+behind. The new process starts with an empty local counter and reads the
+lease's last committed on-chain state, so a restart may temporarily permit
+usage that is not yet reflected in a newly started or rebuilt counter.
+
+Multiple proxy instances do not share a local counter or in-process retry
+queue. Each instance admits from `max(on-chain calls_used, local_calls)` and
+its own counter only. They can therefore have independent over-admission
+windows and may batch separate `use_call` calls for the same lease. The contract
+receives and applies gateway-authorized commits; concurrent instances are
+not assigned disjoint call ranges. Operators should use the on-chain
+`calls_used` value and reconciliation procedures as the source of truth.
+
+An operator can reconcile usage with `use_call`. This is typically done with
+the gateway account configured for the proxy and the count representing usage
+known to be missing from `calls_used`. Before invoking it, obtain the observed
+request usage and check the lease's on-chain state; avoid resubmitting a batch
+that may already have committed. An already-observed call that was later
+committed by one or more proxies must not be counted twice. The contract's
+settlement calculation uses on-chain `calls_used`, while local counters affect
+only each proxy process's admission decisions until their commits succeed.
+
+```mermaid
+sequenceDiagram
+    participant C as Client/request path
+    participant V as Proxy local quota counter
+    participant B as Batch/flush mechanism
+    participant RPC as Stellar RPC / keylease-core
+
+    C->>V: Accepted verified request
+    V->>V: Increment local lease count
+    V->>B: Record lease call
+    alt total pending reaches batch size or interval expires
+        B->>B: Snapshot pending counts
+        B->>RPC: use_call(lease_id, count)
+        alt commit succeeds
+            RPC-->>B: Success
+            B->>B: Clear retried batch
+        else RPC commit fails
+            RPC-->>B: Error
+            B->>B: Requeue count and schedule bounded jittered retry
+        end
+    else shutdown
+        B->>RPC: Close: flush remaining counts
+    end
+```
 
 ---
 
@@ -572,21 +636,32 @@ without ever printing the seed. Stored sessions are listed with their expiry.
 ## Contract reference
 
 `contracts/keylease-core` is a Soroban contract (`soroban-sdk` 29, built for
-`wasm32v1-none`).
+`wasm32v1-none`, ~15.9 KB wasm, enforced against a 20 KB CI budget).
+
+### Wasm Size Budget
+
+To keep deployment fees low and ensure execution fits safely within Soroban resource limits, CI enforces a hard budget on the compiled contract artifact (`target/wasm32v1-none/release/keylease_core.wasm`):
+
+- **Maximum Allowed Size**: 20 KB (20,480 bytes)
+- **Current Size**: ~15.9 KB (15,912 bytes)
+- **Enforcement**: The `contract` job in `.github/workflows/ci.yml` measures the built `.wasm` after `stellar contract build` and fails the build if the size exceeds 20 KB.
+- **Explicit Override**: For exceptional additions that justify exceeding the budget, applying the `wasm-size-override` label to the pull request with a documented explanation bypasses the size check.
 
 | Entry point | Auth | Description |
 | --- | --- | --- |
-| `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account |
+| `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account (`admin != gateway`) |
 | `set_gateway(gateway)` | admin | Rotate the account allowed to commit quota |
+| `set_paused(paused)` | admin | Emergency pause: while `true`, `create_lease` fails with `Paused` before any escrow moves; existing leases keep being served, revoked and settled |
 | `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
 | `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
 | `register_service(provider, service, price_per_call)` | provider | Register a new service, or re-price one you own (`price_per_call > 0`). Another provider's id → `Unauthorized` |
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
-| `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
+| `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself; `duration` must be 1 to 31,536,000 seconds (1 year) |
 | `extend_lease(lease_id, extra_calls, extra_duration)` | consumer | Extends an active, unexpired, unsettled lease. At least one argument must be nonzero; a zero value leaves that dimension unchanged. Pulls `extra_calls × price_per_call` into the same escrow, grows `calls_limit`, `expires_at` and `price_paid`, and emits `lease_extended`. No CLI command is wired up yet |
 | `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
+| `revoke_expired_lease(lease_id)` | consumer | Refunds unused calls on expired leases |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
 | `upgrade(new_wasm_hash)` | admin | Replace the contract wasm in place (same address, same storage); emits `contract_updated`. See [Upgrades](#upgrades) |
 | `get_lease(id)` · `get_service(id)` · `get_config()` · `remaining_calls(id)` | – | Views used by the CLI and proxy |
@@ -690,16 +765,50 @@ Events: `init`, `gateway`, `admin_proposed`, `admin_changed`,
 `(extra_calls, extra_duration, amount)` so indexers can price the top-up without
 a second read.
 
-`calls_committed` keeps its `(calls_committed, consumer, lease_id)` topic
-tuple, so existing topic filters still match, but its payload is now the pair
-`(calls_used, remaining)`. Both fields are `u32`; indexers that decoded a bare
-`calls_used` value must read the pair (or the first element).
+### Event catalogue
+
+All contract events are emitted through centralized helpers with `SCHEMA_VERSION = 1` as the first field of the data payload:
+
+| Event | Topics | Data Payload | Description |
+| --- | --- | --- | --- |
+| `init` | `[init, admin]` | `(1u32, timestamp)` | Contract initialized |
+| `gateway` | `[gateway, new_gateway]` | `(1u32, timestamp)` | Gateway account rotated |
+| `admin_proposed` | `[admin_proposed, current_admin, pending_admin]` | `(1u32, timestamp)` | Admin nomination proposed |
+| `admin_changed` | `[admin_changed, old_admin, new_admin]` | `(1u32, timestamp)` | Admin nomination accepted |
+| `service_registered` | `[service_registered, provider]` | `(1u32, service_id, price_per_call)` | Service registered or re-priced |
+| `lease_created` | `[lease_created, consumer, lease_id]` | `(1u32, service_id, calls_limit, price_paid)` | New lease created and escrow funded |
+| `calls_committed` | `[calls_committed, consumer, lease_id]` | `(1u32, calls_used, remaining)` | Calls committed by gateway |
+| `lease_revoked` | `[lease_revoked, consumer, lease_id]` | `(1u32, refund_amount)` | Lease revoked early by consumer |
+| `lease_settled` | `[lease_settled, provider, lease_id]` | `(1u32, provider_payout, consumer_refund)` | Escrow settled after expiry/exhaustion |
+
+Escrow invariant: the contract only ever pays out `price_paid` once per lease,
+split as `used/total` to the provider and `(total-used)/total` to the consumer.
+
+### Emergency pause
+
+`set_paused(true)` is the admin's circuit breaker for new exposure. It is the
+only entry point the flag affects: `create_lease` returns `Error::Paused`
+before the escrow transfer, so no tokens move and no lease id is allocated.
+Everything that unwinds existing exposure keeps working — `use_call`,
+`revoke`, `settle`, `quote`, `register_service`, `set_service_active` and every
+view — and escrow is never touched, so prepaid leases can still be consumed,
+revoked and settled while the contract is paused. Resuming with
+`set_paused(false)` needs no other state change. Each transition emits `paused`
+or `unpaused` with the acting admin in the topic and the new state as the
+payload, and `get_config()` exposes `paused`. The pause is admin-only, so treat
+it as an incident-response action and record why it was taken (see
+[SECURITY.md](./SECURITY.md)).
+
+### Contract errors
 
 Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
-`Error(Contract, #n)`:
+`Error(Contract, #n)`. The numeric codes are part of the ABI and are only ever
+appended, so the table below is stable across additive releases:
 
 | Code | Variant | Meaning |
 | --- | --- | --- |
+| 1 | `AlreadyInitialized` | `init` ran more than once |
+| 2 | `NotInitialized` | `init` has not been called yet |
 | 3 | `UnknownService` | Service id was never registered |
 | 4 | `ServiceInactive` | Service paused by its provider |
 | 5 | `LeaseNotFound` | No lease with that id (proxy → `403 lease_not_found`) |
@@ -712,6 +821,7 @@ Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 | 9 | `AlreadySettled` | Escrow already paid out; also rejects `extend_lease` |
 | 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation; `extend_lease` uses 10 when both extension arguments are zero or `calls_limit` would overflow, 11 when expiry would overflow and 13 when the top-up price would overflow |
 | 15 | `InvalidConsumer` | `create_lease` consumer is the contract's own address |
+| 16 | `SameAdminAndGateway` | `init` rejects identical admin and gateway addresses |
 
 `extend_lease` reuses the existing typed errors rather than adding a variant:
 code 5 for an unknown lease, 6 for an inactive lease, 7 for an expired lease and
@@ -719,7 +829,10 @@ code 5 for an unknown lease, 6 for an inactive lease, 7 for an expired lease and
 [docs/troubleshooting.md](./docs/troubleshooting.md#contract-errors-errorcontract-n).
 
 Escrow invariant: the contract only ever pays out `price_paid` once per lease,
-split as `used/total` to the provider and `(total-used)/total` to the consumer.
+split as `used/total` to the provider and `price_paid - payable` to the consumer.
+Both `settle` and `revoke` share the same `calculate_payout` helper; any rounding
+dust from integer division truncation is awarded to the consumer refund,
+guaranteeing `payable + refund == price_paid`.
 
 ---
 
@@ -739,7 +852,12 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `KEYLEASE_MAX_BODY_BYTES` | no | `33554432` (32 MiB) | Maximum allowed request body size in bytes |
 | `KEYLEASE_TRUST_PROXY` | no | `false` | Trusted edge proxies for `x-forwarded-*`: `true`, a hop count, or a comma-separated IP/CIDR list. When off, inbound `x-forwarded-*` headers are dropped and rebuilt from the socket |
 | `KEYLEASE_MAX_INFLIGHT` | no | `1024` | Maximum concurrent proxied requests. Excess requests get `503` with `Retry-After: 1` before any quota is charged; `0` disables the cap |
+| `KEYLEASE_SERVICE_ID` | no | – | Optional upstream service identifier. When set, verifies that the lease was issued for this service (mismatches get `403 lease_service_mismatch`). Omitting this variable restores permissive behavior |
+| `KEYLEASE_RATE_LIMIT_PER_MINUTE` | no | `0` | Optional per-lease token-bucket rate limit in requests per minute (`0` disables). Denied requests get `429 rate_limited` with `Retry-After` without consuming quota |
+| `KEYLEASE_CIRCUIT_BREAKER_THRESHOLD` | no | `5` | Consecutive upstream failures before the circuit opens and fails fast with `503 upstream_unavailable` without consuming quota (`0` disables) |
+| `KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS` | no | `30000` | Circuit breaker cooldown in milliseconds before probing upstream recovery (half-open state) |
 | `KEYLEASE_FORWARD_AUTH` | no | `false` | Forward the caller's bearer token upstream |
+| `KEYLEASE_FORWARD_HEADERS` | no | (empty) | Comma-separated additional request header names to forward upstream beyond the default allowlist |
 | `KEYLEASE_METRICS_ENABLED` | no | `false` | Expose Prometheus metrics on `/metrics` |
 | `KEYLEASE_SHUTDOWN_TIMEOUT_MS` | no | `10000` | Graceful shutdown drain timeout in milliseconds |
 | `PORT` / `HOST` | no | `8080` / `0.0.0.0` | Listen address |
@@ -751,10 +869,14 @@ The on-chain quota sink tracks at most 10,000 distinct leases in its pending bat
 | Status | Meaning |
 | --- | --- |
 | `200` | Health check (`/healthz`) or readiness probe (`/readyz`) |
+| `3xx` | Upstream redirect (e.g. 301, 302); forwarded as-is with unmodified `Location` header (`redirect: "manual"` prevents SSRF) |
 | `401 missing_token` / `invalid_token` / `token_expired` | Bearer token absent, malformed, forged or expired |
 | `403 lease_not_found` / `lease_inactive` / `lease_expired` / `consumer_mismatch` | On-chain lease does not permit this call |
+| `403 lease_service_mismatch` | Lease was issued for a different service than the configured `KEYLEASE_SERVICE_ID` |
 | `403 quota_exhausted` | The lease's call limit has been spent (on chain, locally, or both) |
+| `429 rate_limited` | Per-lease token bucket rate limit exceeded. Includes `Retry-After` header indicating wait seconds until refill; quota is untouched |
 | `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) or `/readyz` has no reachable state. Includes `Retry-After`, rounded up from the configured cache TTL and capped at 30 seconds |
+| `503 upstream_unavailable` | Upstream circuit breaker is open due to consecutive failures. Fails fast with `Retry-After` without consuming lease quota |
 | `426 upgrade_required` | `Connection: upgrade` requests (e.g. WebSocket) are not supported; rejected before verification, so no call is consumed. The response carries `Upgrade: HTTP/1.1` |
 | `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed); `504` is produced when `KEYLEASE_UPSTREAM_TIMEOUT_MS` elapses |
 
@@ -769,7 +891,7 @@ receive encoding metadata that disagrees with the body.
 
 Every response carries `x-request-id`: a valid inbound value (1-128 chars of `A-Za-z0-9._:~+=/-`) is reused, anything else is replaced by a generated UUID. It is also forwarded upstream and appears in denial logs.
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
-Forwarded upstream requests also receive these headers set exclusively by the proxy; any client-supplied `x-keylease-*` headers are stripped to prevent spoofing.
+Forwarded upstream requests forward an explicit allowlist of safe request headers (`accept`, `accept-charset`, `accept-encoding`, `accept-language`, `content-type`, `content-encoding`, `content-language`, `range`, `user-agent`, and conditional `if-*` headers), plus `authorization` when `KEYLEASE_FORWARD_AUTH=true`. Additional headers can be forwarded by configuring `KEYLEASE_FORWARD_HEADERS`. Hop-by-hop headers, client-supplied `x-keylease-*` headers, and `x-forwarded-*` headers are stripped to prevent spoofing; proxy metadata is set explicitly.
 Once lease verification succeeds, the call remains consumed even if the client disconnects or the upstream request fails; aborted calls are not refunded.
 `/healthz` and `/readyz` endpoints provide health and readiness probes without requiring bearer tokens and are never forwarded upstream.
 
@@ -875,6 +997,7 @@ real SAC instance registered in the Soroban test environment.
 ```rust
 init(admin: Address, token: Address, gateway: Address)
 register_service(provider: Address, service: String, price_per_call: i128) -> Service
+set_service_active(provider: Address, service: String, active: bool) -> Service
 create_lease(consumer: Address, service: String, calls: u32, duration: u64) -> u64
 extend_lease(lease_id: u64, extra_calls: u32, extra_duration: u64) -> Lease
 use_call(lease_id: u64, count: u32) -> Lease
@@ -886,6 +1009,8 @@ upgrade(new_wasm_hash: BytesN<32>)
 
 `Lease` struct: `id, service, provider, consumer, calls_limit, calls_used,
 expires_at (unix seconds), active, settled, price_paid (i128)`.
+
+`Service` struct: `service, provider, price_per_call, active, lease_count`.
 
 ## Contributing
 

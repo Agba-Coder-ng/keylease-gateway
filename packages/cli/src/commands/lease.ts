@@ -698,6 +698,7 @@ export function mergeEnv(existing: string, entries: Record<string, string>): str
     if (!match) return line;
     const exportPrefix = match[1] ?? '';
     const key = match[2] as string;
+    const rawVal = match[3] ?? '';
     if (key in entries && !emitted.has(key)) {
       emitted.add(key);
       return `${exportPrefix}${key}=${quoteEnvValue(entries[key] as string)}`;
@@ -738,9 +739,11 @@ export async function envCommand(
   const read = deps.readFile ?? ((path: string) => readFile(path, 'utf8'));
   const write =
     deps.writeFile ?? ((path: string, contents: string) => writeFile(path, contents, { mode: 0o600 }));
-  const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
+  const now = deps.now ?? (() => Date.now());
+  const currentSeconds = Math.floor(now() > 1e11 ? now() / 1000 : now());
 
-  const allSessions = await store.load();
+  const rawSessions = await store.load();
+  const allSessions = migrateSessionsV1ToV2(rawSessions);
   const sessions = allSessions[args.service];
   if (!sessions || sessions.length === 0) {
     io.err(`no lease found for service "${args.service}"`);
@@ -748,7 +751,7 @@ export async function envCommand(
     return 1;
   }
 
-  const session = selectLease(sessions, now(), args.lease);
+  const session = selectLease(sessions, currentSeconds, args.lease);
   if (!session) {
     io.err(`no valid lease found for service "${args.service}"`);
     if (args.lease) {

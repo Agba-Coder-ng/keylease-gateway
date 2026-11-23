@@ -19,6 +19,9 @@ pnpm lint           # eslint
 pnpm typecheck      # build + tsc --noEmit
 pnpm test:e2e       # scripted end-to-end flow: proxy + simulated soroban network
 
+# prose and identifiers (typos-cli 1.52.2)
+typos --config _typos.toml
+
 # contract (needs Rust + stellar-cli)
 pnpm contract:test  # cargo test (40 tests)
 pnpm contract:build # stellar contract build -> wasm32v1-none
